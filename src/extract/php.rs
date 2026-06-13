@@ -25,7 +25,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -72,8 +74,9 @@ impl Extractor for PhpExtractor {
         let mut symbols = Vec::new();
         collect_defs(&root, &namespaces, bytes, file, &mut symbols);
 
-        let references =
+        let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -316,6 +319,70 @@ fn is_public(node: &Node, bytes: &[u8]) -> bool {
     true
 }
 
+/// Strips PHP namespace segments (backslash-delimited) to yield the simple type
+/// name.
+///
+/// `\App\Models\Base` → `Base`, `Base` → `Base`.
+fn simple_type_name(text: &str) -> &str {
+    text.rsplit_once('\\')
+        .map_or(text, |(_, after)| after)
+        .trim()
+}
+
+/// Recursively walk `node` collecting `Inherit` references for every
+/// `class_declaration` and `interface_declaration` in the tree (including nested
+/// and namespaced classes).
+///
+/// For each such node, the following named children are inspected:
+/// - `base_clause` — `class extends Parent` (single parent) or
+///   `interface extends A, B` (multiple parents).
+/// - `class_interface_clause` — `class implements A, B` (multiple interfaces).
+///
+/// Within those clause nodes, children of kind `name`, `qualified_name`, or
+/// `relative_name` are the actual parent/interface type nodes.
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if matches!(node.kind(), "class_declaration" | "interface_declaration") {
+        for child in node.children(&mut node.walk()) {
+            if matches!(child.kind(), "base_clause" | "class_interface_clause") {
+                for type_node in child.children(&mut child.walk()) {
+                    if matches!(
+                        type_node.kind(),
+                        "name" | "qualified_name" | "relative_name"
+                    ) {
+                        push_inherit_ref(&type_node, bytes, file, out);
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into all children so nested classes are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Push one `Inherit` reference for a parent type node.
+///
+/// Uses the node's byte position (which lies inside the containing class/interface
+/// symbol span) so the resolver can attribute SOURCE by span containment.
+fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(type_node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (type_node.start_position().row + 1) as u32,
+            col: type_node.start_position().column as u32,
+            byte: type_node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
 /// Build a [`Symbol`] and push it onto `out`.
 fn push_symbol(
     out: &mut Vec<Symbol>,
@@ -442,6 +509,62 @@ function format_date($d) {}
         assert_eq!(
             format_date.id.to_scip_string(),
             "codegraph    helpers/format_date()."
+        );
+    }
+
+    #[test]
+    fn extracts_class_extends_and_implements() {
+        let src = "<?php\nclass Foo extends Bar implements Baz {}";
+        let facts = PhpExtractor.extract(src, "src/Foo.php").unwrap();
+
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Bar"),
+            "expected 'Bar' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"Baz"),
+            "expected 'Baz' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_interface_extends_reference() {
+        let src = "<?php\ninterface I extends J {}";
+        let facts = PhpExtractor.extract(src, "src/I.php").unwrap();
+
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"J"),
+            "expected 'J' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn strips_namespace_from_parent_name() {
+        let src = r"<?php
+class C extends \App\Base {}";
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Base"),
+            "expected 'Base' (leaf of \\App\\Base) in {inherit_names:?}"
         );
     }
 

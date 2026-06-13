@@ -104,10 +104,7 @@ impl Descriptor {
 /// Render an identifier per SCIP rules: bare if it is a simple identifier,
 /// otherwise backtick-escaped (backticks inside doubled).
 fn push_ident(out: &mut String, ident: &str) {
-    let simple = !ident.is_empty()
-        && ident
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '-' || c == '$');
+    let simple = !ident.is_empty() && ident.chars().all(is_simple_ident_char);
     if simple {
         out.push_str(ident);
     } else {
@@ -119,6 +116,113 @@ fn push_ident(out: &mut String, ident: &str) {
             out.push(c);
         }
         out.push('`');
+    }
+}
+
+/// A character is part of a *simple* (bare) identifier per SCIP rules.
+fn is_simple_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '+' || c == '-' || c == '$'
+}
+
+/// Parse one identifier from the front of `s`, inverting [`push_ident`].
+///
+/// Handles both the bare form (a maximal run of simple chars) and the
+/// backtick-quoted form (doubled `` `` `` decodes to a literal `` ` ``).
+/// Returns the decoded name and the remaining slice.
+pub(crate) fn parse_ident(s: &str) -> Result<(String, &str), super::id::SymbolParseError> {
+    use super::id::SymbolParseError;
+    if let Some(quoted) = s.strip_prefix('`') {
+        // Quoted: scan char-by-char over a moving slice; a `` ` `` followed by
+        // another `` ` `` is a literal backtick, a lone `` ` `` closes the ident.
+        let mut name = String::new();
+        let mut rest = quoted;
+        loop {
+            let mut chars = rest.char_indices();
+            match chars.next() {
+                None => return Err(SymbolParseError::UnterminatedQuote),
+                Some((_, '`')) => {
+                    // `chars.as_str()` is everything after this backtick.
+                    let after = chars.as_str();
+                    if let Some(next) = after.strip_prefix('`') {
+                        // Doubled backtick → literal backtick; keep scanning.
+                        name.push('`');
+                        rest = next;
+                    } else {
+                        // Closing backtick.
+                        return Ok((name, after));
+                    }
+                }
+                Some((_, c)) => {
+                    name.push(c);
+                    rest = chars.as_str();
+                }
+            }
+        }
+    } else {
+        // Bare: maximal run of simple chars.
+        let end = s
+            .char_indices()
+            .find(|&(_, c)| !is_simple_ident_char(c))
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        if end == 0 {
+            return Err(SymbolParseError::ExpectedIdent);
+        }
+        let (name, rest) = s.split_at(end);
+        Ok((name.to_owned(), rest))
+    }
+}
+
+/// Parse one descriptor from the front of `s`, inverting [`Descriptor::render`].
+///
+/// Returns the descriptor and the remaining slice. Each successful call
+/// consumes at least one character, so a parse loop always terminates.
+pub(crate) fn parse_descriptor(s: &str) -> Result<(Descriptor, &str), super::id::SymbolParseError> {
+    use super::id::SymbolParseError;
+    // Structured forms first: their leading delimiter is unambiguous.
+    if let Some(rest) = s.strip_prefix('[') {
+        let (name, rest) = parse_ident(rest)?;
+        let rest = rest
+            .strip_prefix(']')
+            .ok_or(SymbolParseError::UnknownDescriptor)?;
+        return Ok((Descriptor::TypeParameter(name), rest));
+    }
+    if let Some(rest) = s.strip_prefix('(') {
+        let (name, rest) = parse_ident(rest)?;
+        let rest = rest
+            .strip_prefix(')')
+            .ok_or(SymbolParseError::UnknownDescriptor)?;
+        return Ok((Descriptor::Parameter(name), rest));
+    }
+
+    // Remaining forms lead with an identifier, then a suffix char decides.
+    let (name, rest) = parse_ident(s)?;
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some('(') => {
+            // Method: read raw disambiguator until ')', then '.'.
+            let (disambiguator, after_close) = chars
+                .as_str()
+                .split_once(')')
+                .ok_or(SymbolParseError::UnknownDescriptor)?;
+            let disambiguator = disambiguator.to_owned();
+            let rest = after_close
+                .strip_prefix('.')
+                .ok_or(SymbolParseError::UnknownDescriptor)?;
+            Ok((
+                Descriptor::Method {
+                    name,
+                    disambiguator,
+                },
+                rest,
+            ))
+        }
+        Some('/') => Ok((Descriptor::Namespace(name), chars.as_str())),
+        Some('#') => Ok((Descriptor::Type(name), chars.as_str())),
+        Some('.') => Ok((Descriptor::Term(name), chars.as_str())),
+        Some(':') => Ok((Descriptor::Meta(name), chars.as_str())),
+        Some('!') => Ok((Descriptor::Macro(name), chars.as_str())),
+        _ => Err(SymbolParseError::UnknownDescriptor),
     }
 }
 

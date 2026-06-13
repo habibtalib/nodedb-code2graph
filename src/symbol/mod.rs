@@ -6,4 +6,4 @@ pub mod descriptor;
 pub mod id;
 
 pub use descriptor::Descriptor;
-pub use id::{Package, SCHEME, SymbolId};
+pub use id::{Package, SCHEME, SymbolId, SymbolParseError};

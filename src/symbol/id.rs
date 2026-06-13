@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use super::descriptor::Descriptor;
+use super::descriptor::{Descriptor, parse_descriptor};
 
 /// Package coordinates (SCIP `<manager> <package-name> <version>`). Any field
 /// may be empty when unknown — codegraph leaves these to the consumer.
@@ -48,6 +48,36 @@ impl Package {
 
 /// Default scheme tag for codegraph-produced symbols.
 pub const SCHEME: &str = "codegraph";
+
+/// Errors from parsing a SCIP symbol string (the inverse of
+/// [`SymbolId::to_scip_string`]). Surfaced via [`std::str::FromStr`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SymbolParseError {
+    /// The input was empty.
+    #[error("empty symbol string")]
+    Empty,
+
+    /// The header had too few space-separated tokens (a global symbol needs
+    /// scheme + 3 package fields + descriptors; `local` needs an id).
+    #[error("malformed symbol header: not enough tokens")]
+    MalformedHeader,
+
+    /// A backtick-quoted identifier was never closed.
+    #[error("unterminated backtick-quoted identifier")]
+    UnterminatedQuote,
+
+    /// An identifier was expected but none was found.
+    #[error("expected an identifier")]
+    ExpectedIdent,
+
+    /// A descriptor had an unknown or missing suffix.
+    #[error("unknown or missing descriptor suffix")]
+    UnknownDescriptor,
+
+    /// A global symbol carried zero descriptors.
+    #[error("global symbol has no descriptors")]
+    NoDescriptors,
+}
 
 /// A symbol's identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -115,6 +145,75 @@ impl SymbolId {
             }
         }
         s
+    }
+
+    /// Parse a SCIP symbol string — the inverse of [`SymbolId::to_scip_string`].
+    ///
+    /// Note `lang` (Global) and `file` (Local) are not encoded in the string,
+    /// so they are parsed back as empty; only the string round-trips exactly.
+    pub fn from_scip_string(s: &str) -> Result<Self, SymbolParseError> {
+        if s.is_empty() {
+            return Err(SymbolParseError::Empty);
+        }
+
+        // `local <id>` — the id is the whole remainder after the single space.
+        if let Some(id) = s.strip_prefix("local ") {
+            return Ok(SymbolId::Local {
+                file: String::new(),
+                id: id.to_owned(),
+            });
+        }
+        if !s.contains(' ') {
+            // No space at all: cannot be a valid header.
+            return Err(SymbolParseError::MalformedHeader);
+        }
+
+        // Global: scheme manager name version descriptors (exactly 5 tokens).
+        let mut parts = s.splitn(5, ' ');
+        let scheme = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
+        let manager = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
+        let name = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
+        let version = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
+        let descriptors_str = parts.next().ok_or(SymbolParseError::MalformedHeader)?;
+
+        let unfield = |t: &str| {
+            if t == "." {
+                String::new()
+            } else {
+                t.to_owned()
+            }
+        };
+        let package = Package {
+            manager: unfield(manager),
+            name: unfield(name),
+            version: unfield(version),
+        };
+
+        let mut descriptors = Vec::new();
+        let mut cursor = descriptors_str;
+        while !cursor.is_empty() {
+            let (desc, rest) = parse_descriptor(cursor)?;
+            descriptors.push(desc);
+            cursor = rest;
+        }
+        if descriptors.is_empty() {
+            return Err(SymbolParseError::NoDescriptors);
+        }
+
+        Ok(SymbolId::Global {
+            scheme: scheme.to_owned(),
+            package,
+            lang: String::new(),
+            descriptors,
+        })
+    }
+}
+
+impl std::str::FromStr for SymbolId {
+    type Err = SymbolParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_scip_string(s)
     }
 }
 
@@ -206,5 +305,187 @@ mod tests {
             descriptors: vec![Descriptor::Namespace("src".into())],
         };
         assert_eq!(id.to_scip_string(), "codegraph npm . . src/");
+    }
+
+    // ── Parser round-trip tests ───────────────────────────────────────────────
+
+    /// Assert that parsing then re-rendering reproduces the input string exactly.
+    /// (`lang`/`file` are not encoded, so only the string can round-trip.)
+    fn assert_roundtrip(s: &str) {
+        let parsed = SymbolId::from_scip_string(s).expect("should parse");
+        assert_eq!(parsed.to_scip_string(), s);
+    }
+
+    #[test]
+    fn roundtrip_namespace() {
+        assert_roundtrip("codegraph . . . auth/");
+    }
+
+    #[test]
+    fn roundtrip_nested_type() {
+        assert_roundtrip("codegraph . . . auth/session/Session#");
+    }
+
+    #[test]
+    fn roundtrip_term() {
+        assert_roundtrip("codegraph . . . config/MAX_CONN.");
+    }
+
+    #[test]
+    fn roundtrip_method_empty_disambiguator() {
+        assert_roundtrip("codegraph . . . auth/validate_token().");
+    }
+
+    #[test]
+    fn roundtrip_method_with_namespace_and_type() {
+        assert_roundtrip("codegraph . . . pkg/MyClass#method().");
+    }
+
+    #[test]
+    fn roundtrip_macro() {
+        assert_roundtrip("codegraph . . . MY_MACRO!");
+    }
+
+    #[test]
+    fn roundtrip_meta() {
+        assert_roundtrip("codegraph . . . attrs:");
+    }
+
+    #[test]
+    fn roundtrip_type_parameter() {
+        assert_roundtrip("codegraph . . . [T]");
+    }
+
+    #[test]
+    fn roundtrip_parameter() {
+        assert_roundtrip("codegraph . . . (param)");
+    }
+
+    #[test]
+    fn roundtrip_partial_package() {
+        assert_roundtrip("codegraph npm . . src/");
+    }
+
+    #[test]
+    fn roundtrip_full_package() {
+        assert_roundtrip("codegraph cargo serde 1.0.0 de/Deserialize#");
+    }
+
+    #[test]
+    fn roundtrip_quoted_ident_with_space() {
+        // Derive the exact rendered form from the renderer, then round-trip it.
+        let id = SymbolId::global("rust", vec![Descriptor::Type("Foo Bar".into())]);
+        let s = id.to_scip_string();
+        assert_roundtrip(&s);
+        // Sanity: the parsed descriptor recovers the original name.
+        let parsed = SymbolId::from_scip_string(&s).unwrap();
+        match parsed {
+            SymbolId::Global { descriptors, .. } => {
+                assert_eq!(descriptors, vec![Descriptor::Type("Foo Bar".into())]);
+            }
+            _ => panic!("expected Global"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_quoted_ident_with_backtick() {
+        // Embedded backtick → doubled by the renderer; derive, don't hand-write.
+        let id = SymbolId::global("rust", vec![Descriptor::Type("Foo`Bar".into())]);
+        let s = id.to_scip_string();
+        assert_roundtrip(&s);
+        let parsed = SymbolId::from_scip_string(&s).unwrap();
+        match parsed {
+            SymbolId::Global { descriptors, .. } => {
+                assert_eq!(descriptors, vec![Descriptor::Type("Foo`Bar".into())]);
+            }
+            _ => panic!("expected Global"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_quoted_empty_ident() {
+        // Empty name is non-simple → renders as two backticks; must round-trip.
+        let id = SymbolId::global("rust", vec![Descriptor::Type(String::new())]);
+        let s = id.to_scip_string();
+        assert_eq!(s, "codegraph . . . ``#");
+        assert_roundtrip(&s);
+    }
+
+    #[test]
+    fn roundtrip_local_x0() {
+        let parsed = SymbolId::from_scip_string("local x0").unwrap();
+        assert_eq!(
+            parsed,
+            SymbolId::Local {
+                file: String::new(),
+                id: "x0".into()
+            }
+        );
+        assert_eq!(parsed.to_scip_string(), "local x0");
+    }
+
+    #[test]
+    fn roundtrip_local_numeric() {
+        let parsed = SymbolId::from_scip_string("local 42").unwrap();
+        match &parsed {
+            SymbolId::Local { id, .. } => assert_eq!(id, "42"),
+            _ => panic!("expected Local"),
+        }
+        assert_eq!(parsed.to_scip_string(), "local 42");
+    }
+
+    // ── Negative tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn err_empty_string() {
+        assert_eq!(SymbolId::from_scip_string(""), Err(SymbolParseError::Empty));
+    }
+
+    #[test]
+    fn err_too_few_header_tokens() {
+        // Only scheme + two package fields, no descriptors token.
+        assert_eq!(
+            SymbolId::from_scip_string("codegraph . ."),
+            Err(SymbolParseError::MalformedHeader)
+        );
+    }
+
+    #[test]
+    fn err_no_space_header() {
+        assert_eq!(
+            SymbolId::from_scip_string("codegraph"),
+            Err(SymbolParseError::MalformedHeader)
+        );
+    }
+
+    #[test]
+    fn err_unknown_suffix() {
+        assert_eq!(
+            SymbolId::from_scip_string("codegraph . . . foo?"),
+            Err(SymbolParseError::UnknownDescriptor)
+        );
+    }
+
+    #[test]
+    fn err_trailing_garbage() {
+        // `auth/` parses, then `?` cannot begin a descriptor identifier.
+        assert_eq!(
+            SymbolId::from_scip_string("codegraph . . . auth/?"),
+            Err(SymbolParseError::ExpectedIdent)
+        );
+    }
+
+    #[test]
+    fn err_unterminated_quote() {
+        assert_eq!(
+            SymbolId::from_scip_string("codegraph . . . `unclosed"),
+            Err(SymbolParseError::UnterminatedQuote)
+        );
+    }
+
+    #[test]
+    fn fromstr_parses() {
+        let id: SymbolId = "codegraph . . . auth/".parse().unwrap();
+        assert_eq!(id.to_scip_string(), "codegraph . . . auth/");
     }
 }

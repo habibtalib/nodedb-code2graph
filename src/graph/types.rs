@@ -111,7 +111,8 @@ pub struct Reference {
 pub enum Confidence {
     /// Type/scope-precise (e.g. stack-graphs or type inference): exactly one binding.
     Exact,
-    /// Narrowed by lexical scope / imports but not type-checked.
+    /// Narrowed by lexical scope / imports, or the referenced name has a unique
+    /// global candidate — not type-checked.
     Scoped,
     /// Matched by name only — may be one of several same-named symbols.
     NameOnly,

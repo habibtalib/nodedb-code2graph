@@ -4,10 +4,12 @@
 //!
 //! Builds a `leaf-name → definitions` table across all files, attributes each
 //! reference to the symbol whose span encloses it (the caller), and links it to
-//! every definition sharing the callee's name. Matches are tagged
-//! [`Confidence::NameOnly`] — this is the recall-first baseline that works for
-//! every language without per-language binding rules. A precise resolver tags
-//! its edges [`Confidence::Scoped`]/[`Confidence::Exact`] instead.
+//! every definition sharing the callee's name. An ambiguous name that fans out
+//! to several definitions tags each edge [`Confidence::NameOnly`]; a name with a
+//! single global candidate is tagged [`Confidence::Scoped`]. This is the
+//! recall-first baseline that works for every language without per-language
+//! binding rules — no edges are dropped, only the confidence varies. A precise
+//! resolver tags its edges [`Confidence::Exact`] instead.
 //!
 //! It returns neutral [`Edge`]s and never writes to storage.
 
@@ -72,15 +74,23 @@ impl Resolver for SymbolTableResolver {
                     continue; // unresolved: no definition with this name
                 };
 
-                for &to_idx in targets {
-                    if to_idx == from_idx {
-                        continue; // skip self-reference
-                    }
+                // Count non-self candidates first to determine confidence,
+                // then iterate the same filtered set to emit edges — no
+                // intermediate Vec needed.
+                let non_self_count = targets.iter().filter(|&&i| i != from_idx).count();
+
+                let confidence = if non_self_count == 1 {
+                    Confidence::Scoped
+                } else {
+                    Confidence::NameOnly
+                };
+
+                for &to_idx in targets.iter().filter(|&&i| i != from_idx) {
                     edges.push(Edge {
                         from: symbols[from_idx].id.clone(),
                         to: symbols[to_idx].id.clone(),
                         kind: edge_kind(r.role),
-                        confidence: Confidence::NameOnly,
+                        confidence,
                         occ: r.occ.clone(),
                     });
                 }
@@ -119,7 +129,7 @@ mod tests {
         let e = calls[0];
         assert!(e.from.to_scip_string().ends_with("run()."));
         assert!(e.to.to_scip_string().ends_with("util/helper()."));
-        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.confidence, Confidence::Scoped);
         assert_eq!(e.occ.file, "src/main.rs");
     }
 
@@ -164,7 +174,7 @@ mod tests {
             "to was: {}",
             e.to.to_scip_string()
         );
-        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.confidence, Confidence::Scoped);
         assert_eq!(e.occ.file, "src/p/Sub.java");
     }
 
@@ -205,7 +215,7 @@ mod tests {
             "unexpected to: {}",
             e.to.to_scip_string()
         );
-        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.confidence, Confidence::Scoped);
         assert_eq!(e.occ.file, "src/p.rs");
     }
 
@@ -248,7 +258,7 @@ mod tests {
             "to was: {}",
             e.to.to_scip_string()
         );
-        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.confidence, Confidence::Scoped);
     }
 
     #[test]
@@ -299,6 +309,63 @@ mod tests {
             "to was: {}",
             e.to.to_scip_string()
         );
-        assert_eq!(e.confidence, Confidence::NameOnly);
+        assert_eq!(e.confidence, Confidence::Scoped);
+    }
+
+    #[test]
+    fn ambiguous_name_fan_out_stays_name_only() {
+        // Two files each define a function with the same leaf name "process".
+        // A third file calls "process" — the resolver must emit edges to BOTH
+        // definitions and tag them NameOnly (ambiguous fan-out, not Scoped).
+        let a = RustExtractor
+            .extract("pub fn process() -> u32 { 1 }", "src/mod_a.rs")
+            .unwrap();
+        let b = RustExtractor
+            .extract("pub fn process() -> u32 { 2 }", "src/mod_b.rs")
+            .unwrap();
+        let caller = RustExtractor
+            .extract("pub fn run() { process() }", "src/main.rs")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b, caller]);
+
+        // Filter to Calls edges only (exclude any Inherits/Imports noise).
+        let calls: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+
+        // Recall preserved: both definitions must be reachable.
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected 2 fan-out edges, got {}",
+            calls.len()
+        );
+
+        // Every fan-out edge must stay NameOnly — not promoted to Scoped.
+        for e in &calls {
+            assert_eq!(
+                e.confidence,
+                Confidence::NameOnly,
+                "ambiguous fan-out edge should be NameOnly, got {:?}",
+                e.confidence
+            );
+        }
+
+        // Both targets should be the two "process" definitions.
+        let targets: std::collections::HashSet<String> =
+            calls.iter().map(|e| e.to.to_scip_string()).collect();
+        assert!(
+            targets.iter().any(|s| s.ends_with("mod_a/process().")),
+            "missing mod_a target; got: {:?}",
+            targets
+        );
+        assert!(
+            targets.iter().any(|s| s.ends_with("mod_b/process().")),
+            "missing mod_b target; got: {:?}",
+            targets
+        );
     }
 }

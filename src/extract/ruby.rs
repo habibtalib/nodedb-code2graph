@@ -21,7 +21,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -66,8 +68,9 @@ impl Extractor for RubyExtractor {
         let mut symbols = Vec::new();
         walk(&root, &namespaces, bytes, file, &mut symbols);
 
-        let references =
+        let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Ruby, bytes, file)?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -194,6 +197,58 @@ fn push_symbol(
     });
 }
 
+/// Strip Ruby namespace qualification to yield just the simple type name.
+///
+/// `A::B::Bar` → `Bar`, `Bar` → `Bar`.
+fn simple_type_name(text: &str) -> &str {
+    text.rsplit_once("::")
+        .map_or(text, |(_, after)| after)
+        .trim()
+}
+
+/// Recursively walk `node` collecting `Inherit` references for every `class`
+/// node in the tree (including nested classes).
+///
+/// `module` nodes are skipped — Ruby modules have no superclass.
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "class" {
+        if let Some(superclass_node) = node.child_by_field_name("superclass") {
+            // The `superclass` node's first named child is the parent type
+            // expression (`constant` or `scope_resolution`).
+            if let Some(type_node) = superclass_node
+                .children(&mut superclass_node.walk())
+                .find(|c| c.is_named())
+            {
+                push_inherit_ref(&type_node, bytes, file, out);
+            }
+        }
+    }
+
+    // Recurse into all children so nested classes are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Push one `Inherit` reference for a parent type node (simple name + byte
+/// position, which lies inside the subclass's symbol span).
+fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(type_node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (type_node.start_position().row + 1) as u32,
+            col: type_node.start_position().column as u32,
+            byte: type_node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +353,47 @@ end
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validate"));
         assert!(names.contains(&"process"));
+    }
+
+    #[test]
+    fn extracts_simple_inheritance() {
+        let src = "class Foo < Bar\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/foo.rb").unwrap();
+        let inherit: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(inherit, vec!["Bar"], "expected [Bar], got {inherit:?}");
+    }
+
+    #[test]
+    fn extracts_qualified_inheritance_simple_name() {
+        let src = "class Foo < A::Bar\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/foo.rb").unwrap();
+        let inherit: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(inherit, vec!["Bar"], "expected [Bar], got {inherit:?}");
+    }
+
+    #[test]
+    fn module_emits_no_inheritance_refs() {
+        let src = "module M\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/m.rb").unwrap();
+        let inherit: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit.is_empty(),
+            "expected no Inherit refs, got {inherit:?}"
+        );
     }
 }

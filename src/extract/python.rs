@@ -71,6 +71,7 @@ impl Extractor for PythonExtractor {
             file,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -208,6 +209,51 @@ fn const_of<'a>(
         SymbolKind::Const,
         Descriptor::Term(name),
     ))
+}
+
+/// Recursively walk `node` collecting `Import` references for every
+/// `import_statement` and `import_from_statement` in the tree (covers top-level
+/// and function-local imports; both attribute correctly via span-containment in
+/// the resolver).
+///
+/// Rules:
+/// - `import_statement`'s `name` field children are the imported names.
+/// - `import_from_statement`'s `name` field children are the *imported symbols*
+///   (not the `module_name` of the from-clause).
+/// - For a `dotted_name` child: emit the leaf segment (last `.`-separated part).
+/// - For an `aliased_import` child: emit the leaf of its `name` field (the real
+///   name), ignoring the `alias` field.
+/// - `wildcard_import` children (`from x import *`) produce no reference.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "import_statement" | "import_from_statement" => {
+            for child in node.children_by_field_name("name", &mut node.walk()) {
+                match child.kind() {
+                    "dotted_name" => {
+                        let text = node_text(&child, bytes);
+                        let leaf = super::simple_type_name(text, ".");
+                        super::push_ref(out, leaf, &child, file, RefRole::Import);
+                    }
+                    "aliased_import" => {
+                        // Take the real `name` field (a `dotted_name`), ignore `alias`.
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let text = node_text(&name_node, bytes);
+                            let leaf = super::simple_type_name(text, ".");
+                            super::push_ref(out, leaf, &name_node, file, RefRole::Import);
+                        }
+                    }
+                    // wildcard_import and anything else produce nothing.
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into all children to cover nested/local imports.
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
 }
 
 /// Recursively walk `node` collecting `Inherit` references for every
@@ -363,6 +409,103 @@ MAX_RETRIES = 3
             inherit_names,
             vec!["Base"],
             "expected ['Base'] in {inherit_names:?}"
+        );
+    }
+
+    // --- import extraction tests ---
+
+    #[test]
+    fn import_from_statement_emits_leaf_name() {
+        let src = "from pkg.models import Config\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Config"],
+            "expected ['Config'] in {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_statement_emits_module_leaf() {
+        // `import os` → leaf "os"; `import foo.bar` → leaf "bar"
+        let src = "import os\nimport foo.bar\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"os"),
+            "expected 'os' in {import_names:?}"
+        );
+        assert!(
+            import_names.contains(&"bar"),
+            "expected 'bar' in {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_from_statement_multiple_names() {
+        let src = "from x import A, B\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"A"),
+            "expected 'A' in {import_names:?}"
+        );
+        assert!(
+            import_names.contains(&"B"),
+            "expected 'B' in {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_alias_emits_real_name_not_alias() {
+        // `from pkg import Thing as T` → ref "Thing", not "T"
+        let src = "from pkg import Thing as T\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"Thing"),
+            "expected 'Thing' in {import_names:?}"
+        );
+        assert!(
+            !import_names.contains(&"T"),
+            "alias 'T' must NOT appear in {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn wildcard_import_emits_nothing() {
+        let src = "from x import *\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let import_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_refs.is_empty(),
+            "expected no Import refs for wildcard, got {import_refs:?}"
         );
     }
 }

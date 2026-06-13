@@ -210,6 +210,48 @@ mod tests {
     }
 
     #[test]
+    fn resolves_cross_file_python_import_edge() {
+        use crate::extract::PythonExtractor;
+
+        // File A: src/pkg/models.py defines class Config.
+        let a = PythonExtractor
+            .extract("class Config:\n    pass\n", "src/pkg/models.py")
+            .unwrap();
+
+        // File B: src/app.py imports Config from pkg.models.
+        let b = PythonExtractor
+            .extract("from pkg.models import Config\n", "src/app.py")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b]);
+
+        // Exactly one Imports edge: module(app) → Config
+        let imports: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect();
+        assert_eq!(
+            imports.len(),
+            1,
+            "expected one Imports edge, got {:?}",
+            imports.len()
+        );
+        let e = imports[0];
+        assert!(
+            e.from.to_scip_string().ends_with("app/"),
+            "from (module) was: {}",
+            e.from.to_scip_string()
+        );
+        assert!(
+            e.to.to_scip_string().ends_with("Config#"),
+            "to was: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(e.confidence, Confidence::NameOnly);
+    }
+
+    #[test]
     fn resolves_import_edge_from_module() {
         use crate::graph::types::{Occurrence, RefRole, Reference};
 

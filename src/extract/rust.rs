@@ -65,6 +65,7 @@ impl Extractor for RustExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -248,6 +249,74 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+/// Recursively collect leaf import names from a use-tree node and push an
+/// [`RefRole::Import`] reference for each one.
+///
+/// The leaf is always the concrete identifier being imported:
+/// - `identifier`         → its own text.
+/// - `scoped_identifier`  → the `name` field (final segment after `::`.
+/// - `use_as_clause`      → recurse into the `path` field (alias is ignored).
+/// - `scoped_use_list`    → recurse into the `list` field.
+/// - `use_list`           → recurse into every named child.
+/// - `use_wildcard` / `crate` / `self` / `super` / anything else → skip.
+fn collect_use_leaves(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "identifier" => {
+            super::push_ref(
+                out,
+                super::node_text(node, bytes),
+                node,
+                file,
+                RefRole::Import,
+            );
+        }
+        "scoped_identifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                super::push_ref(
+                    out,
+                    super::node_text(&name_node, bytes),
+                    &name_node,
+                    file,
+                    RefRole::Import,
+                );
+            }
+        }
+        "use_as_clause" => {
+            if let Some(path_node) = node.child_by_field_name("path") {
+                collect_use_leaves(&path_node, bytes, file, out);
+            }
+        }
+        "scoped_use_list" => {
+            if let Some(list_node) = node.child_by_field_name("list") {
+                collect_use_leaves(&list_node, bytes, file, out);
+            }
+        }
+        "use_list" => {
+            for child in node.named_children(&mut node.walk()) {
+                collect_use_leaves(&child, bytes, file, out);
+            }
+        }
+        // use_wildcard, crate, self, super, metavariable → skip
+        _ => {}
+    }
+}
+
+/// Walk the full tree and emit [`RefRole::Import`] references for every
+/// `use_declaration`. Recurses into `mod` blocks and function bodies so nested
+/// `use` items are also captured.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "use_declaration" {
+        if let Some(arg) = node.child_by_field_name("argument") {
+            collect_use_leaves(&arg, bytes, file, out);
+        }
+        // No need to recurse further inside a use_declaration.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +433,98 @@ impl std::fmt::Display for Point {
         assert!(
             inherit_names.contains(&"Display"),
             "expected 'Display' in {inherit_names:?}"
+        );
+    }
+
+    // ── Import reference tests ────────────────────────────────────────────────
+
+    #[test]
+    fn import_scoped_identifier_emits_leaf() {
+        // `use a::b::Config;` → one Import ref `Config`
+        let src = "use a::b::Config;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Config"],
+            "expected ['Config'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_use_list_emits_all_leaves() {
+        // `use std::collections::{HashMap, HashSet};` → Import refs `HashMap` and `HashSet`
+        let src = "use std::collections::{HashMap, HashSet};";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let mut import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        import_names.sort_unstable();
+        assert_eq!(
+            import_names,
+            vec!["HashMap", "HashSet"],
+            "expected ['HashMap', 'HashSet'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_use_as_clause_emits_real_leaf_not_alias() {
+        // `use a::b as c;` → Import ref `b` (not `c`)
+        let src = "use a::b as c;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["b"],
+            "expected ['b'], got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_wildcard_emits_nothing() {
+        // `use a::*;` → NO Import refs
+        let src = "use a::*;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.is_empty(),
+            "expected no Import refs, got {import_names:?}"
+        );
+    }
+
+    #[test]
+    fn import_simple_scoped_path_emits_leaf() {
+        // `use std::io::Result;` → Import ref `Result`
+        let src = "use std::io::Result;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Result"],
+            "expected ['Result'], got {import_names:?}"
         );
     }
 }

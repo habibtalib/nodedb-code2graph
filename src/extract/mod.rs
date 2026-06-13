@@ -22,6 +22,7 @@ pub mod php;
 pub mod python;
 pub mod ruby;
 pub mod rust;
+pub mod shell;
 pub mod typescript;
 
 pub use c::CExtractor;
@@ -32,6 +33,7 @@ pub use php::PhpExtractor;
 pub use python::PythonExtractor;
 pub use ruby::RubyExtractor;
 pub use rust::RustExtractor;
+pub use shell::ShellExtractor;
 pub use typescript::TypeScriptExtractor;
 
 /// A per-language source-to-facts extractor.
@@ -58,6 +60,7 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Python => PythonExtractor.extract(source, file),
         Language::Ruby => RubyExtractor.extract(source, file),
         Language::Rust => RustExtractor.extract(source, file),
+        Language::Shell => ShellExtractor.extract(source, file),
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
         other => Err(CodegraphError::UnsupportedLanguage(
             other.as_str().to_owned(),

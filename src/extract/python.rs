@@ -13,11 +13,13 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, node_text, one_line_signature};
+use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
 
 /// Tree-sitter query capturing call-callee identifiers.
 const CALL_QUERY: &str = r#"
@@ -56,7 +58,7 @@ impl Extractor for PythonExtractor {
         let namespaces = python_namespaces(file);
 
         let symbols = collect_symbols(&root, bytes, file, &namespaces);
-        let references = collect_call_references(
+        let mut references = collect_call_references(
             &root,
             &ts_language,
             CALL_QUERY,
@@ -64,6 +66,7 @@ impl Extractor for PythonExtractor {
             bytes,
             file,
         )?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -203,6 +206,63 @@ fn const_of<'a>(
     ))
 }
 
+/// Recursively walk `node` collecting `Inherit` references for every
+/// `class_definition` in the tree (including nested classes).
+///
+/// For each class that has a `superclasses` field (an `argument_list`), we
+/// iterate its named children and handle:
+/// - `identifier` — simple base name (e.g. `Base`).
+/// - `attribute`  — dotted base; we take the `attribute` field (leaf segment,
+///   e.g. `mod.Base` → `Base`).
+///
+/// Everything else (`subscript` for `Generic[T]`, `call`, `keyword_argument`
+/// for `metaclass=`) is skipped gracefully.
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "class_definition" {
+        if let Some(superclasses) = node.child_by_field_name("superclasses") {
+            for child in superclasses.children(&mut superclasses.walk()) {
+                if !child.is_named() {
+                    continue;
+                }
+                match child.kind() {
+                    "identifier" => {
+                        push_inherit_ref(&child, node_text(&child, bytes), file, out);
+                    }
+                    "attribute" => {
+                        if let Some(name) = field_text(&child, "attribute", bytes) {
+                            push_inherit_ref(&child, &name, file, out);
+                        }
+                    }
+                    _ => {} // subscript (Generic[T]), call, keyword_argument, etc.
+                }
+            }
+        }
+    }
+
+    // Recurse into all children so nested class definitions are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Push one `Inherit` reference using the position of `pos_node` (the
+/// identifier/attribute node that names the base class).
+fn push_inherit_ref(pos_node: &Node, name: &str, file: &str, out: &mut Vec<Reference>) {
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (pos_node.start_position().row + 1) as u32,
+            col: pos_node.start_position().column as u32,
+            byte: pos_node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +318,59 @@ MAX_RETRIES = 3
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validate_token"));
         assert!(names.contains(&"helper"));
+    }
+
+    #[test]
+    fn extracts_single_base_class_inherit_reference() {
+        let src = "class Sub(Base):\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            inherit_names,
+            vec!["Base"],
+            "expected ['Base'] in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_multiple_base_classes_inherit_references() {
+        let src = "class Multi(A, B):\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"A"),
+            "expected 'A' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"B"),
+            "expected 'B' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn extracts_dotted_base_class_leaf_segment() {
+        let src = "class Dotted(mod.Base):\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            inherit_names,
+            vec!["Base"],
+            "expected ['Base'] in {inherit_names:?}"
+        );
     }
 }

@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The [`Extractor`] trait and the language-dispatching entry points
+//! ([`extract_file`], [`extract_path`]).
+
+use crate::error::{CodegraphError, Result};
+use crate::graph::FileFacts;
+use crate::lang::Language;
+
+use super::{
+    CExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, PhpExtractor, PythonExtractor,
+    RubyExtractor, RustExtractor, ShellExtractor, TypeScriptExtractor,
+};
+
+/// A per-language source-to-facts extractor.
+pub trait Extractor {
+    /// The language this extractor handles.
+    fn lang(&self) -> Language;
+
+    /// Parse `source` (the contents of `file`, a project-relative path) and
+    /// return its definitions and references.
+    fn extract(&self, source: &str, file: &str) -> Result<FileFacts>;
+}
+
+/// Extract facts from a single file, dispatching on its language.
+///
+/// Returns [`CodegraphError::UnsupportedLanguage`] for languages without an
+/// extractor yet. Languages are added one at a time behind the [`Extractor`] trait.
+pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
+    match lang {
+        Language::C => CExtractor.extract(source, file),
+        Language::Go => GoExtractor.extract(source, file),
+        Language::Java => JavaExtractor.extract(source, file),
+        Language::JavaScript => JavaScriptExtractor.extract(source, file),
+        Language::Php => PhpExtractor.extract(source, file),
+        Language::Python => PythonExtractor.extract(source, file),
+        Language::Ruby => RubyExtractor.extract(source, file),
+        Language::Rust => RustExtractor.extract(source, file),
+        Language::Shell => ShellExtractor.extract(source, file),
+        Language::TypeScript => TypeScriptExtractor.extract(source, file),
+        other => Err(CodegraphError::UnsupportedLanguage(
+            other.as_str().to_owned(),
+        )),
+    }
+}
+
+/// Extract facts from a file, inferring the language from its path extension.
+pub fn extract_path(file: &str, source: &str) -> Result<FileFacts> {
+    let lang = Language::from_path(file)
+        .ok_or_else(|| CodegraphError::UnsupportedLanguage(file.to_owned()))?;
+    extract_file(lang, source, file)
+}

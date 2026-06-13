@@ -81,6 +81,7 @@ impl Extractor for PhpExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -323,6 +324,34 @@ fn is_public(node: &Node, bytes: &[u8]) -> bool {
     true
 }
 
+/// Recursively walk `node` collecting `Import` references for every
+/// `namespace_use_clause` in the tree.
+///
+/// Handles both the flat form (`use App\Models\User;`) and the grouped form
+/// (`use App\Models\{User, Post};`) — the recursive walk reaches
+/// `namespace_use_clause` nodes inside `namespace_use_group` automatically.
+///
+/// For each clause the leaf name is derived from the `qualified_name` or `name`
+/// child via [`super::simple_type_name`] with `"\\"` as the separator; any
+/// `alias` field is ignored.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "namespace_use_clause" {
+        // Find the child node that holds the fully-qualified name.
+        for child in node.children(&mut node.walk()) {
+            if matches!(child.kind(), "qualified_name" | "name") {
+                let leaf = super::simple_type_name(node_text(&child, bytes), "\\");
+                super::push_ref(out, leaf, &child, file, RefRole::Import);
+                break;
+            }
+        }
+    }
+
+    // Recurse into all children so grouped use-clauses are reached.
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `class_declaration` and `interface_declaration` in the tree (including nested
 /// and namespaced classes).
@@ -545,6 +574,69 @@ class C extends \App\Base {}";
             inherit_names.contains(&"Base"),
             "expected 'Base' (leaf of \\App\\Base) in {inherit_names:?}"
         );
+    }
+
+    #[test]
+    fn import_simple_use_statement() {
+        let src = "<?php\nuse App\\Models\\User;";
+        let facts = PhpExtractor.extract(src, "src/Foo.php").unwrap();
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"User"),
+            "expected 'User' in {import_names:?}"
+        );
+        assert_eq!(import_names.len(), 1);
+    }
+
+    #[test]
+    fn import_aliased_use_statement_uses_real_name() {
+        let src = "<?php\nuse App\\Models\\User as U;";
+        let facts = PhpExtractor.extract(src, "src/Foo.php").unwrap();
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"User"),
+            "expected 'User' (real name, not alias) in {import_names:?}"
+        );
+        // Alias 'U' must not appear as an import reference.
+        assert!(
+            !import_names.contains(&"U"),
+            "alias 'U' must not appear in {import_names:?}"
+        );
+        assert_eq!(import_names.len(), 1);
+    }
+
+    #[test]
+    fn import_grouped_use_statement() {
+        let src = "<?php\nuse App\\Models\\{User, Post};";
+        let facts = PhpExtractor.extract(src, "src/Foo.php").unwrap();
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_names.contains(&"User"),
+            "expected 'User' in {import_names:?}"
+        );
+        assert!(
+            import_names.contains(&"Post"),
+            "expected 'Post' in {import_names:?}"
+        );
+        assert_eq!(import_names.len(), 2);
     }
 
     #[test]

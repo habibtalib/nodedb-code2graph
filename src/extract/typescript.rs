@@ -18,7 +18,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -75,7 +77,9 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     let namespaces = module_namespaces(file);
 
     let symbols = collect_symbols(&root, bytes, file, &namespaces, lang);
-    let references = collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
+    let mut references =
+        collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
+    collect_inheritance(&root, bytes, file, &mut references);
 
     Ok(FileFacts {
         file: file.to_owned(),
@@ -204,6 +208,106 @@ fn emit_named(
     }
 }
 
+/// Strip generic parameters and namespace qualification to yield a simple type
+/// name. `ns.Foo<T>` → `Foo`, `A.B` → `B`, `Bar` → `Bar`.
+fn simple_type_name(text: &str) -> &str {
+    let base = text.split_once('<').map_or(text, |(b, _)| b);
+    base.rsplit_once('.').map_or(base, |(_, a)| a).trim()
+}
+
+/// Push one `Inherit` reference for a parent-type node (its simple name + byte
+/// position, which lies inside the subclass's symbol span).
+fn push_inherit_ref(type_node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(type_node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (type_node.start_position().row + 1) as u32,
+            col: type_node.start_position().column as u32,
+            byte: type_node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
+/// Recursively walk `node` collecting `Inherit` references for every
+/// `class_declaration` and `interface_declaration` in the tree (including nested
+/// classes).
+///
+/// Tree-sitter node shape (TypeScript / TSX grammar):
+/// - `class_declaration` → optional `class_heritage` child
+///   - `extends_clause` → field `value` (the superclass expression)
+///   - `implements_clause` → named children: `type_identifier | generic_type |
+///     nested_type_identifier`
+/// - `interface_declaration` → optional `extends_type_clause` child
+///   - named children: `type_identifier | generic_type | nested_type_identifier`
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "class_declaration" => {
+            // Locate the `class_heritage` child (if any).
+            if let Some(heritage) = node
+                .children(&mut node.walk())
+                .find(|c| c.kind() == "class_heritage")
+            {
+                for clause in heritage.children(&mut heritage.walk()) {
+                    match clause.kind() {
+                        "extends_clause" => {
+                            // The superclass is the `value` field.
+                            if let Some(value) = clause.child_by_field_name("value") {
+                                push_inherit_ref(&value, bytes, file, out);
+                            }
+                        }
+                        "implements_clause" => {
+                            // Each named child is an implemented interface type.
+                            for type_node in clause.children(&mut clause.walk()) {
+                                if type_node.is_named()
+                                    && matches!(
+                                        type_node.kind(),
+                                        "type_identifier"
+                                            | "generic_type"
+                                            | "nested_type_identifier"
+                                    )
+                                {
+                                    push_inherit_ref(&type_node, bytes, file, out);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        "interface_declaration" => {
+            // Locate the `extends_type_clause` child (if any).
+            if let Some(extends_clause) = node
+                .children(&mut node.walk())
+                .find(|c| c.kind() == "extends_type_clause")
+            {
+                for type_node in extends_clause.children(&mut extends_clause.walk()) {
+                    if type_node.is_named()
+                        && matches!(
+                            type_node.kind(),
+                            "type_identifier" | "generic_type" | "nested_type_identifier"
+                        )
+                    {
+                        push_inherit_ref(&type_node, bytes, file, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into all children so nested classes are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +362,83 @@ function internal() {}
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validateToken"));
         assert!(names.contains(&"helper"));
+    }
+
+    // ── Inheritance tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn ts_class_extends_and_implements() {
+        let src = "class Sub extends Base implements Iface {}";
+        let facts = TypeScriptExtractor.extract(src, "src/sub.ts").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Base"),
+            "expected 'Base' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"Iface"),
+            "expected 'Iface' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn ts_interface_extends_multiple() {
+        let src = "interface I extends A, B {}";
+        let facts = TypeScriptExtractor.extract(src, "src/i.ts").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"A"),
+            "expected 'A' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"B"),
+            "expected 'B' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn ts_class_extends_qualified_name() {
+        let src = "class C extends ns.Base {}";
+        let facts = TypeScriptExtractor.extract(src, "src/c.ts").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Base"),
+            "expected leaf 'Base' from 'ns.Base' in {inherit_names:?}"
+        );
+    }
+
+    #[test]
+    fn js_class_extends_base() {
+        // JavaScript routes through the same extract_ecmascript core; verify
+        // that inheritance edges are emitted for .js files too.
+        use crate::extract::Extractor as _;
+        use crate::extract::JavaScriptExtractor;
+        let src = "class Sub extends Base {}";
+        let facts = JavaScriptExtractor.extract(src, "src/sub.js").unwrap();
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Base"),
+            "expected 'Base' in JS inherit refs: {inherit_names:?}"
+        );
     }
 }

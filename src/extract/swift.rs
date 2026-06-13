@@ -92,6 +92,7 @@ impl Extractor for SwiftExtractor {
             file,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -206,6 +207,31 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+// ── Import reference extraction ─────────────────────────────────────────────
+
+/// Recursively walk `node` and push one `Import` reference for every
+/// `import_declaration` found.  The imported name is the leaf of the
+/// (possibly dotted) module path — `Foundation` → `Foundation`,
+/// `os.log` → `log`.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "import_declaration" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                let leaf = super::simple_type_name(node_text(&child, bytes), ".");
+                super::push_ref(out, leaf, &child, file, RefRole::Import);
+                break;
+            }
+        }
+    }
+
+    // Recurse into all children so any top-level imports are reached.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_imports(&child, bytes, file, out);
     }
 }
 
@@ -847,6 +873,42 @@ func main() {
         assert!(
             inherit.contains(&"Equatable"),
             "expected 'Equatable' in {inherit:?}"
+        );
+    }
+
+    // Test 12: simple module import → one Import ref named after the module
+    #[test]
+    fn import_foundation() {
+        let src = "import Foundation";
+        let facts = extract(src, "Sources/Foo.swift");
+
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            imports.contains(&"Foundation"),
+            "expected 'Foundation' in {imports:?}"
+        );
+    }
+
+    // Test 13: submodule import → leaf name only
+    #[test]
+    fn import_submodule_leaf() {
+        let src = "import os.log";
+        let facts = extract(src, "Sources/Bar.swift");
+
+        let imports: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            imports.contains(&"log"),
+            "expected 'log' (leaf of os.log) in {imports:?}"
         );
     }
 }

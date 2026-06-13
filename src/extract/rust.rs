@@ -9,17 +9,25 @@
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 
-use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{node_text, one_line_signature, Extractor};
+use super::{Extractor, child_text, collect_call_references, node_text, one_line_signature};
 
-/// Minimum callee-name length to record as a reference (drops `ok`, `id`, …).
-const MIN_REF_LEN: usize = 3;
+/// Tree-sitter query capturing call-callee identifiers.
+const CALL_QUERY: &str = r#"
+(call_expression
+  function: [
+    (identifier) @callee
+    (field_expression field: (field_identifier) @callee)
+    (scoped_identifier name: (identifier) @callee)
+  ]
+)
+"#;
 
 /// Extracts Rust symbols and references.
 pub struct RustExtractor;
@@ -30,22 +38,26 @@ impl Extractor for RustExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+        let ts_language = TsLanguage::from(tree_sitter_rust::LANGUAGE);
         let mut parser = Parser::new();
         parser
-            .set_language(&TsLanguage::from(tree_sitter_rust::LANGUAGE))
+            .set_language(&ts_language)
             .map_err(|_| CodegraphError::Parse {
                 path: file.to_owned(),
             })?;
-        let tree = parser.parse(source, None).ok_or_else(|| CodegraphError::Parse {
-            path: file.to_owned(),
-        })?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| CodegraphError::Parse {
+                path: file.to_owned(),
+            })?;
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
         let namespaces = rust_namespaces(file);
 
         let symbols = collect_symbols(&root, bytes, file, &namespaces);
-        let references = collect_references(&root, bytes, file)?;
+        let references =
+            collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -78,7 +90,9 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
     for child in root.children(&mut root.walk()) {
         let (kind, leaf) = match child.kind() {
             "function_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "identifier", bytes) else {
+                    continue;
+                };
                 (
                     SymbolKind::Function,
                     Descriptor::Method {
@@ -88,31 +102,45 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 )
             }
             "struct_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "type_identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "type_identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::Struct, Descriptor::Type(name))
             }
             "enum_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "type_identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "type_identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::Enum, Descriptor::Type(name))
             }
             "trait_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "type_identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "type_identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::Trait, Descriptor::Type(name))
             }
             "type_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "type_identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "type_identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::TypeAlias, Descriptor::Type(name))
             }
             "const_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::Const, Descriptor::Term(name))
             }
             "static_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::Static, Descriptor::Term(name))
             }
             "mod_item" if is_fully_pub(&child, bytes) => {
-                let Some(name) = child_text(&child, "identifier", bytes) else { continue };
+                let Some(name) = child_text(&child, "identifier", bytes) else {
+                    continue;
+                };
                 (SymbolKind::Module, Descriptor::Namespace(name))
             }
             "impl_item" => {
@@ -122,8 +150,11 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             _ => continue,
         };
 
-        let mut descriptors: Vec<Descriptor> =
-            namespaces.iter().cloned().map(Descriptor::Namespace).collect();
+        let mut descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
         descriptors.push(leaf.clone());
 
         out.push(Symbol {
@@ -142,65 +173,12 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
     out
 }
 
-fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Result<Vec<Reference>> {
-    let query_src = r#"
-(call_expression
-  function: [
-    (identifier) @callee
-    (field_expression field: (field_identifier) @callee)
-    (scoped_identifier name: (identifier) @callee)
-  ]
-)
-"#;
-    let lang = TsLanguage::from(tree_sitter_rust::LANGUAGE);
-    let query = Query::new(&lang, query_src).map_err(|e| CodegraphError::Query {
-        lang: "rust".to_owned(),
-        msg: e.to_string(),
-    })?;
-    let callee_idx = query
-        .capture_index_for_name("callee")
-        .ok_or_else(|| CodegraphError::Query {
-            lang: "rust".to_owned(),
-            msg: "missing @callee capture".to_owned(),
-        })?;
-
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, *root, bytes);
-    let mut refs = Vec::new();
-    while let Some(m) = matches.next() {
-        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
-            let name = node_text(&cap.node, bytes).to_owned();
-            if name.len() < MIN_REF_LEN {
-                continue;
-            }
-            refs.push(Reference {
-                name,
-                occ: Occurrence {
-                    file: file.to_owned(),
-                    line: (cap.node.start_position().row + 1) as u32,
-                    col: cap.node.start_position().column as u32,
-                    byte: cap.node.start_byte(),
-                },
-                role: RefRole::Call,
-            });
-        }
-    }
-    Ok(refs)
-}
-
 /// True if the node's first `visibility_modifier` child is bare `pub`.
 fn is_fully_pub(node: &Node, bytes: &[u8]) -> bool {
     node.children(&mut node.walk())
         .find(|c| c.kind() == "visibility_modifier")
         .map(|c| node_text(&c, bytes).trim() == "pub")
         .unwrap_or(false)
-}
-
-/// Text of the first direct child with the given kind.
-fn child_text(node: &Node, kind: &str, bytes: &[u8]) -> Option<String> {
-    node.children(&mut node.walk())
-        .find(|c| c.kind() == kind)
-        .map(|c| node_text(&c, bytes).to_owned())
 }
 
 /// Display name for an `impl` block: the last type identifier before the body.
@@ -235,7 +213,11 @@ pub struct Config { pub value: u32 }
         assert!(names.contains(&"Config"));
         assert!(!names.contains(&"private_helper")); // not `pub`
 
-        let vt = facts.symbols.iter().find(|s| s.name == "validate_token").unwrap();
+        let vt = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "validate_token")
+            .unwrap();
         assert_eq!(
             vt.id.to_scip_string(),
             "codegraph    auth/session/validate_token()."

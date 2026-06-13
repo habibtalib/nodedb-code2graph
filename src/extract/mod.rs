@@ -7,16 +7,23 @@
 //! no I/O, no storage, no resolution.
 //! Cross-file linking is the resolver's job ([`crate::resolve`]).
 
-use tree_sitter::Node;
+use tree_sitter::{Language as TsLanguage, Node, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::FileFacts;
+use crate::graph::types::{Occurrence, RefRole, Reference};
 use crate::lang::Language;
 
+pub mod go;
+pub mod java;
+pub mod javascript;
 pub mod python;
 pub mod rust;
 pub mod typescript;
 
+pub use go::GoExtractor;
+pub use java::JavaExtractor;
+pub use javascript::JavaScriptExtractor;
 pub use python::PythonExtractor;
 pub use rust::RustExtractor;
 pub use typescript::TypeScriptExtractor;
@@ -37,10 +44,15 @@ pub trait Extractor {
 /// extractor yet. Languages are added one at a time behind the [`Extractor`] trait.
 pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
     match lang {
-        Language::Rust => RustExtractor.extract(source, file),
+        Language::Go => GoExtractor.extract(source, file),
+        Language::Java => JavaExtractor.extract(source, file),
+        Language::JavaScript => JavaScriptExtractor.extract(source, file),
         Language::Python => PythonExtractor.extract(source, file),
+        Language::Rust => RustExtractor.extract(source, file),
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
-        other => Err(CodegraphError::UnsupportedLanguage(other.as_str().to_owned())),
+        other => Err(CodegraphError::UnsupportedLanguage(
+            other.as_str().to_owned(),
+        )),
     }
 }
 
@@ -80,4 +92,68 @@ pub(crate) fn one_line_signature(text: &str, stop: &[char]) -> String {
         text.lines().next().unwrap_or(text)
     };
     sig.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Minimum callee-name length to record as a reference (drops `ok`, `id`, …).
+pub(crate) const MIN_REF_LEN: usize = 3;
+
+/// UTF-8 text of the first direct child of `node` whose kind is `kind`.
+pub(crate) fn child_text(node: &Node, kind: &str, bytes: &[u8]) -> Option<String> {
+    node.children(&mut node.walk())
+        .find(|c| c.kind() == kind)
+        .map(|c| node_text(&c, bytes).to_owned())
+}
+
+/// UTF-8 text of the child of `node` at the named `field`.
+pub(crate) fn field_text(node: &Node, field: &str, bytes: &[u8]) -> Option<String> {
+    node.child_by_field_name(field)
+        .map(|n| node_text(&n, bytes).to_owned())
+}
+
+/// Run a tree-sitter call-reference query and collect its `@callee` captures as
+/// [`Reference`]s with [`RefRole::Call`]. The query must expose a capture named
+/// `callee`; captures shorter than [`MIN_REF_LEN`] are dropped. Shared by every
+/// extractor — only the query string and grammar differ per language.
+pub(crate) fn collect_call_references(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    query_src: &str,
+    lang: Language,
+    bytes: &[u8],
+    file: &str,
+) -> Result<Vec<Reference>> {
+    let query = Query::new(ts_lang, query_src).map_err(|e| CodegraphError::Query {
+        lang: lang.as_str().to_owned(),
+        msg: e.to_string(),
+    })?;
+    let callee_idx =
+        query
+            .capture_index_for_name("callee")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: lang.as_str().to_owned(),
+                msg: "missing @callee capture".to_owned(),
+            })?;
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *root, bytes);
+    let mut refs = Vec::new();
+    while let Some(m) = matches.next() {
+        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
+            let name = node_text(&cap.node, bytes).to_owned();
+            if name.len() < MIN_REF_LEN {
+                continue;
+            }
+            refs.push(Reference {
+                name,
+                occ: Occurrence {
+                    file: file.to_owned(),
+                    line: (cap.node.start_position().row + 1) as u32,
+                    col: cap.node.start_position().column as u32,
+                    byte: cap.node.start_byte(),
+                },
+                role: RefRole::Call,
+            });
+        }
+    }
+    Ok(refs)
 }

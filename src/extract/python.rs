@@ -10,17 +10,24 @@
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 
-use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{node_text, one_line_signature, Extractor};
+use super::{Extractor, collect_call_references, node_text, one_line_signature};
 
-/// Minimum callee-name length to record as a reference.
-const MIN_REF_LEN: usize = 3;
+/// Tree-sitter query capturing call-callee identifiers.
+const CALL_QUERY: &str = r#"
+(call
+  function: [
+    (identifier) @callee
+    (attribute attribute: (identifier) @callee)
+  ]
+)
+"#;
 
 /// Extracts Python symbols and references.
 pub struct PythonExtractor;
@@ -31,22 +38,32 @@ impl Extractor for PythonExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+        let ts_language = TsLanguage::from(tree_sitter_python::LANGUAGE);
         let mut parser = Parser::new();
         parser
-            .set_language(&TsLanguage::from(tree_sitter_python::LANGUAGE))
+            .set_language(&ts_language)
             .map_err(|_| CodegraphError::Parse {
                 path: file.to_owned(),
             })?;
-        let tree = parser.parse(source, None).ok_or_else(|| CodegraphError::Parse {
-            path: file.to_owned(),
-        })?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| CodegraphError::Parse {
+                path: file.to_owned(),
+            })?;
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
         let namespaces = python_namespaces(file);
 
         let symbols = collect_symbols(&root, bytes, file, &namespaces);
-        let references = collect_references(&root, bytes, file)?;
+        let references = collect_call_references(
+            &root,
+            &ts_language,
+            CALL_QUERY,
+            Language::Python,
+            bytes,
+            file,
+        )?;
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -102,8 +119,11 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             continue;
         };
 
-        let mut descriptors: Vec<Descriptor> =
-            namespaces.iter().cloned().map(Descriptor::Namespace).collect();
+        let mut descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
         descriptors.push(leaf);
 
         out.push(Symbol {
@@ -167,7 +187,11 @@ fn const_of<'a>(
         .children(&mut assign.walk())
         .find(|c| c.kind() == "identifier")?;
     let name = node_text(&lhs, bytes).to_owned();
-    if name.len() < 3 || !name.chars().all(|c| c.is_uppercase() || c == '_' || c.is_numeric()) {
+    if name.len() < 3
+        || !name
+            .chars()
+            .all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
+    {
         return None;
     }
     Some((
@@ -177,51 +201,6 @@ fn const_of<'a>(
         SymbolKind::Const,
         Descriptor::Term(name),
     ))
-}
-
-fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Result<Vec<Reference>> {
-    let query_src = r#"
-(call
-  function: [
-    (identifier) @callee
-    (attribute attribute: (identifier) @callee)
-  ]
-)
-"#;
-    let lang = TsLanguage::from(tree_sitter_python::LANGUAGE);
-    let query = Query::new(&lang, query_src).map_err(|e| CodegraphError::Query {
-        lang: "python".to_owned(),
-        msg: e.to_string(),
-    })?;
-    let callee_idx = query
-        .capture_index_for_name("callee")
-        .ok_or_else(|| CodegraphError::Query {
-            lang: "python".to_owned(),
-            msg: "missing @callee capture".to_owned(),
-        })?;
-
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, *root, bytes);
-    let mut refs = Vec::new();
-    while let Some(m) = matches.next() {
-        for cap in m.captures.iter().filter(|c| c.index == callee_idx) {
-            let name = node_text(&cap.node, bytes).to_owned();
-            if name.len() < MIN_REF_LEN {
-                continue;
-            }
-            refs.push(Reference {
-                name,
-                occ: Occurrence {
-                    file: file.to_owned(),
-                    line: (cap.node.start_position().row + 1) as u32,
-                    col: cap.node.start_position().column as u32,
-                    byte: cap.node.start_byte(),
-                },
-                role: RefRole::Call,
-            });
-        }
-    }
-    Ok(refs)
 }
 
 #[cfg(test)]
@@ -246,7 +225,10 @@ MAX_RETRIES = 3
         let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
 
         let vt = by_name("validate_token").unwrap();
-        assert_eq!(vt.id.to_scip_string(), "codegraph    auth/jwt/validate_token().");
+        assert_eq!(
+            vt.id.to_scip_string(),
+            "codegraph    auth/jwt/validate_token()."
+        );
         assert_eq!(vt.kind, SymbolKind::Function);
 
         assert_eq!(by_name("Config").unwrap().kind, SymbolKind::Class);
@@ -256,14 +238,22 @@ MAX_RETRIES = 3
 
     #[test]
     fn init_collapses_to_package() {
-        let facts = PythonExtractor.extract("def helper(): pass", "src/auth/__init__.py").unwrap();
-        assert_eq!(facts.symbols[0].id.to_scip_string(), "codegraph    auth/helper().");
+        let facts = PythonExtractor
+            .extract("def helper(): pass", "src/auth/__init__.py")
+            .unwrap();
+        assert_eq!(
+            facts.symbols[0].id.to_scip_string(),
+            "codegraph    auth/helper()."
+        );
     }
 
     #[test]
     fn extracts_call_references() {
         let facts = PythonExtractor
-            .extract("def main():\n    validate_token('t')\n    helper()\n", "src/main.py")
+            .extract(
+                "def main():\n    validate_token('t')\n    helper()\n",
+                "src/main.py",
+            )
             .unwrap();
         let names: Vec<&str> = facts.references.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"validate_token"));

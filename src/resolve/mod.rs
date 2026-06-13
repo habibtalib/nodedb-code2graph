@@ -10,15 +10,10 @@
 //! same trait per language without changing the output shape.
 //!
 //! [`Confidence`]: crate::graph::Confidence
+//! [`FileFacts`]: crate::graph::FileFacts
 
-use crate::graph::{CodeGraph, FileFacts};
-
+mod resolver;
 pub mod symbol_table;
 
+pub use resolver::Resolver;
 pub use symbol_table::SymbolTableResolver;
-
-/// Links references to definitions. Pure: no I/O, deterministic.
-pub trait Resolver {
-    /// Resolve `files` into a graph of symbols and confidence-tagged edges.
-    fn resolve(&self, files: &[FileFacts]) -> CodeGraph;
-}

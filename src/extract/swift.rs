@@ -25,7 +25,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -75,7 +77,7 @@ impl Extractor for SwiftExtractor {
         let mut symbols = Vec::new();
         collect_decls(root, &ns_descriptors, bytes, file, &mut symbols);
 
-        let references = collect_call_references(
+        let mut references = collect_call_references(
             &root,
             &ts_language,
             CALL_QUERY,
@@ -83,6 +85,7 @@ impl Extractor for SwiftExtractor {
             bytes,
             file,
         )?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -165,6 +168,61 @@ fn leaf_type_name(node: Node, bytes: &[u8]) -> Option<String> {
             None
         }
     }
+}
+
+// ── Inheritance reference extraction ────────────────────────────────────────
+
+/// Strip generic parameters and dot-qualified prefixes to yield just the simple
+/// type name.
+///
+/// `Swift.Equatable` → `Equatable`, `Box<T>` → `Box`, `Foo` → `Foo`.
+fn simple_type_name(text: &str) -> &str {
+    let base = text.split_once('<').map_or(text, |(b, _)| b);
+    base.rsplit_once('.').map_or(base, |(_, a)| a).trim()
+}
+
+/// Recursively walk `node` and push one `Inherit` reference for every
+/// `inheritance_specifier` found inside `class_declaration` or
+/// `protocol_declaration` nodes.
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "class_declaration" | "protocol_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "inheritance_specifier" {
+                    if let Some(inherits_from) = child.child_by_field_name("inherits_from") {
+                        push_inherit_ref(&inherits_from, bytes, file, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into all children so nested types are covered.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Push one `Inherit` reference for a parent type node (its simple name + the
+/// node's byte position, which lies inside the subtype's symbol span).
+fn push_inherit_ref(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (node.start_position().row + 1) as u32,
+            col: node.start_position().column as u32,
+            byte: node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
 }
 
 // ── Symbol builder ───────────────────────────────────────────────────────────
@@ -754,5 +812,57 @@ func main() {
     fn lang_tag() {
         let facts = extract("func foo() {}", "Sources/Foo.swift");
         assert_eq!(facts.lang, "swift");
+    }
+
+    // Test 9: class with superclass and protocol conformance
+    #[test]
+    fn class_inheritance_and_conformance() {
+        let src = "class Sub: Base, Proto {}";
+        let facts = extract(src, "Sources/Sub.swift");
+
+        let inherit: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(inherit.contains(&"Base"), "expected 'Base' in {inherit:?}");
+        assert!(
+            inherit.contains(&"Proto"),
+            "expected 'Proto' in {inherit:?}"
+        );
+    }
+
+    // Test 10: protocol inheritance
+    #[test]
+    fn protocol_inheritance() {
+        let src = "protocol P: Q {}";
+        let facts = extract(src, "Sources/P.swift");
+
+        let inherit: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(inherit.contains(&"Q"), "expected 'Q' in {inherit:?}");
+    }
+
+    // Test 11: struct conformance
+    #[test]
+    fn struct_conformance() {
+        let src = "struct S: Equatable {}";
+        let facts = extract(src, "Sources/S.swift");
+
+        let inherit: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit.contains(&"Equatable"),
+            "expected 'Equatable' in {inherit:?}"
+        );
     }
 }

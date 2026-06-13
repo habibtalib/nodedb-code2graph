@@ -96,6 +96,7 @@ impl Extractor for KotlinExtractor {
             file,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -575,6 +576,37 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+// ── Import extraction ────────────────────────────────────────────────────────
+
+/// Recursively walk the tree collecting `Import` references for every
+/// `import` node that is not a wildcard (`import com.x.*`).
+///
+/// For each qualifying `import` node the first child of kind
+/// `qualified_identifier` or `identifier` provides the full import path;
+/// [`super::simple_type_name`] extracts the leaf name (e.g. `com.x.Foo` → `Foo`).
+/// Wildcards are detected by a `*` in the raw node text and silently dropped.
+fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "import" {
+        let raw = node_text(node, bytes);
+        if !raw.contains('*') {
+            // Find the first child that carries the import path.
+            for child in node.children(&mut node.walk()) {
+                if matches!(child.kind(), "qualified_identifier" | "identifier") {
+                    let leaf = super::simple_type_name(node_text(&child, bytes), ".");
+                    super::push_ref(out, leaf, &child, file, RefRole::Import);
+                    break;
+                }
+            }
+        }
+        // Don't recurse into an import node's children further.
+        return;
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out);
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -810,6 +842,59 @@ fun main() {
         assert!(
             inherit_names.contains(&"Service"),
             "expected 'Service' in {inherit_names:?}"
+        );
+    }
+
+    // Test 13: qualified import → Import ref with leaf name only
+    #[test]
+    fn import_qualified_emits_leaf() {
+        let src = "import com.example.Service\nclass C";
+        let facts = extract(src, "src/C.kt");
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Service"],
+            "expected exactly ['Service'], got {import_names:?}"
+        );
+    }
+
+    // Test 14: simple (unqualified) import → Import ref
+    #[test]
+    fn import_simple_emits_name() {
+        let src = "import Foo\nclass C";
+        let facts = extract(src, "src/C.kt");
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            import_names,
+            vec!["Foo"],
+            "expected exactly ['Foo'], got {import_names:?}"
+        );
+    }
+
+    // Test 15: wildcard import → NO Import refs
+    #[test]
+    fn import_wildcard_skipped() {
+        let src = "import com.example.*\nclass C";
+        let facts = extract(src, "src/C.kt");
+        let import_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            import_refs.is_empty(),
+            "expected no Import refs for wildcard, got {import_refs:?}"
         );
     }
 }

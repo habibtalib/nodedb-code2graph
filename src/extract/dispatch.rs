@@ -8,8 +8,8 @@ use crate::graph::FileFacts;
 use crate::lang::Language;
 
 use super::{
-    CExtractor, CppExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, PhpExtractor,
-    PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, SwiftExtractor,
+    CExtractor, CppExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, KotlinExtractor,
+    PhpExtractor, PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, SwiftExtractor,
     TypeScriptExtractor,
 };
 
@@ -40,6 +40,7 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Rust => RustExtractor.extract(source, file),
         Language::Shell => ShellExtractor.extract(source, file),
         Language::Swift => SwiftExtractor.extract(source, file),
+        Language::Kotlin => KotlinExtractor.extract(source, file),
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
         other => Err(CodegraphError::UnsupportedLanguage(
             other.as_str().to_owned(),

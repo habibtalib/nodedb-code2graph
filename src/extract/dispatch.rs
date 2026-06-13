@@ -9,7 +9,8 @@ use crate::lang::Language;
 
 use super::{
     CExtractor, CppExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, PhpExtractor,
-    PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, TypeScriptExtractor,
+    PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, SwiftExtractor,
+    TypeScriptExtractor,
 };
 
 /// A per-language source-to-facts extractor.
@@ -38,6 +39,7 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Ruby => RubyExtractor.extract(source, file),
         Language::Rust => RustExtractor.extract(source, file),
         Language::Shell => ShellExtractor.extract(source, file),
+        Language::Swift => SwiftExtractor.extract(source, file),
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
         other => Err(CodegraphError::UnsupportedLanguage(
             other.as_str().to_owned(),

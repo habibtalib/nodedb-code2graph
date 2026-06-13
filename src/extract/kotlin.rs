@@ -29,7 +29,9 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, Occurrence, RefRole, Reference, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -79,7 +81,7 @@ impl Extractor for KotlinExtractor {
         let mut symbols = Vec::new();
         collect_decls(root, &ns_descriptors, false, bytes, file, &mut symbols);
 
-        let references = collect_call_references(
+        let mut references = collect_call_references(
             &root,
             &ts_language,
             CALL_QUERY,
@@ -87,6 +89,7 @@ impl Extractor for KotlinExtractor {
             bytes,
             file,
         )?;
+        collect_inheritance(&root, bytes, file, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -517,6 +520,77 @@ fn handle_secondary_constructor(
     );
 }
 
+// ── Inheritance extraction ───────────────────────────────────────────────────
+
+/// Strips generics and dotted qualifiers to yield just the simple type name.
+///
+/// `com.x.Base` → `Base`, `List<T>` → `List`, `Base()` text gets passed as the
+/// full `user_type` text so generics are already absent, but the helper is
+/// defensive.
+fn simple_type_name(text: &str) -> &str {
+    let base = text.split_once('<').map_or(text, |(b, _)| b);
+    base.rsplit_once('.').map_or(base, |(_, a)| a).trim()
+}
+
+/// Pre-order search returning the first descendant (or self) whose kind is
+/// `user_type`. Covers all three `delegation_specifier` sub-forms uniformly:
+/// - `constructor_invocation` → `type` child is a `user_type`
+/// - `explicit_delegation`    → `type` child is a `user_type`
+/// - bare `type`              → directly contains a `user_type`
+fn first_user_type<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    if node.kind() == "user_type" {
+        return Some(*node);
+    }
+    for child in node.children(&mut node.walk()) {
+        if let Some(found) = first_user_type(&child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Push one `Inherit` reference for a `user_type` node.
+fn push_inherit_ref(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    let name = simple_type_name(node_text(node, bytes));
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: Occurrence {
+            file: file.to_owned(),
+            line: (node.start_position().row + 1) as u32,
+            col: node.start_position().column as u32,
+            byte: node.start_byte(),
+        },
+        role: RefRole::Inherit,
+    });
+}
+
+/// Recursively walk the tree collecting `Inherit` references for every
+/// `class_declaration` and `object_declaration` that has a `delegation_specifiers`
+/// child.
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if matches!(node.kind(), "class_declaration" | "object_declaration") {
+        for child in node.children(&mut node.walk()) {
+            if child.kind() == "delegation_specifiers" {
+                for spec in child.children(&mut child.walk()) {
+                    if spec.kind() == "delegation_specifier" {
+                        if let Some(user_type_node) = first_user_type(&spec) {
+                            push_inherit_ref(&user_type_node, bytes, file, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into all children so nested classes are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -698,5 +772,60 @@ fun main() {
     fn lang_tag() {
         let facts = extract("fun foo() {}", "src/Foo.kt");
         assert_eq!(facts.lang, "kotlin");
+    }
+
+    // Test 10: class with superclass call + interface → both Inherit refs
+    #[test]
+    fn class_inherits_base_and_interface() {
+        let src = "class Sub : Base(), Iface { }";
+        let facts = extract(src, "src/Sub.kt");
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Base"),
+            "expected 'Base' in {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"Iface"),
+            "expected 'Iface' in {inherit_names:?}"
+        );
+    }
+
+    // Test 11: dotted parent name → leaf only
+    #[test]
+    fn class_inherits_dotted_name_simplified() {
+        let src = "class C : com.x.Base() { }";
+        let facts = extract(src, "src/C.kt");
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Base"),
+            "expected 'Base' in {inherit_names:?}"
+        );
+    }
+
+    // Test 12: object declaration inherits interface → Inherit ref
+    #[test]
+    fn object_inherits_service() {
+        let src = "object O : Service { }";
+        let facts = extract(src, "src/O.kt");
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Inherit)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            inherit_names.contains(&"Service"),
+            "expected 'Service' in {inherit_names:?}"
+        );
     }
 }

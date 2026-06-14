@@ -3,8 +3,15 @@
 //! Tier-B scope-aware resolver (**in progress**).
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
-//! language's name-resolution rules would. It resolves three binding kinds:
+//! language's name-resolution rules would. It resolves four binding kinds:
 //!
+//! * **Path-qualified calls** — a reference with a written qualifier
+//!   (`mod_a::process()`, `a::b::f()`) is resolved as a **path lookup**, entirely
+//!   bypassing the lexical-scope walk. The qualifier segments are matched against
+//!   the namespace suffix of every globally known definition sharing the call's
+//!   leaf name. If exactly one definition matches, a [`Confidence::Exact`] edge is
+//!   emitted. Zero matches or two-or-more matches yield **no** edge — Tier-B never
+//!   fakes precision.
 //! * **Local/param bindings** — a reference that resolves to a local variable or
 //!   parameter within the file's scopes produces a [`Confidence::Scoped`] edge
 //!   whose target is a synthesized [`SymbolId::Local`].
@@ -75,6 +82,46 @@ impl Resolver for ScopeGraphResolver {
             }
 
             for r in &f.references {
+                // Caller attribution — needed by both the qualified and unqualified paths.
+                let Some(from_idx) = syms_by_file
+                    .get(f.file.as_str())
+                    .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
+                else {
+                    continue; // unattributable reference — skip, like Tier-A
+                };
+
+                // QUALIFIED CALL: explicit written path → unique global namespace-suffix match.
+                // Bypasses scope_walk entirely (this is a path lookup, not lexical resolution).
+                //
+                // KNOWN LIMITATION: only MODULE-qualified calls resolve
+                // (`mod_a::process` — where `mod_a` appears as a Namespace descriptor in the
+                // target's SCIP id path). `Type::assoc_fn()` does NOT resolve because:
+                //   (1) `namespaces_end_with` matches only `Namespace` descriptors, not the
+                //       `Type` descriptor used for structs/enums/traits; and
+                //   (2) associated functions inside `impl` blocks are not yet extracted as
+                //       top-level symbols.
+                // This is an intentional, documented gap — resolving it requires type-member
+                // extraction work that is out of scope for this unit. It is NOT a silent miss.
+                // Do NOT widen `namespaces_end_with` to paper over it.
+                if let Some(qual) = &r.qualifier {
+                    let segs = normalize_from_path(qual);
+                    if !segs.is_empty() {
+                        if let Some(to_idx) =
+                            unique_suffix_match(&by_name, &symbols, r.name.as_str(), &segs)
+                        {
+                            edges.push(Edge {
+                                from: symbols[from_idx].id.clone(),
+                                to: symbols[to_idx].id.clone(),
+                                role: r.role,
+                                confidence: Confidence::Exact,
+                                occ: r.occ.clone(),
+                            });
+                        }
+                    }
+                    continue; // qualified ref handled (edge or honest no-op) — never fall through
+                }
+
+                // UNQUALIFIED: existing lexical scope_walk path (needs r.scope).
                 // No scope info on the reference → no Tier-B edge.
                 let Some(start) = r.scope else { continue };
 
@@ -82,15 +129,6 @@ impl Resolver for ScopeGraphResolver {
                     scope_walk(&r.name, r.occ.byte, start, &f.scopes, &bindings_by_scope)
                 else {
                     continue; // name binds to nothing visible — no edge
-                };
-
-                // The caller: innermost symbol in this file enclosing the ref.
-                // Hoisted here so every arm can use it without recomputation.
-                let Some(from_idx) = syms_by_file
-                    .get(f.file.as_str())
-                    .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
-                else {
-                    continue; // unattributable reference — skip, like Tier-A
                 };
 
                 match binding.kind {
@@ -131,18 +169,12 @@ impl Resolver for ScopeGraphResolver {
                                 // Among global symbols sharing the imported name, find the
                                 // UNIQUE one whose namespace chain ends with the import path
                                 // segments.
-                                if let Some(&to_idx) =
-                                    by_name.get(binding.name.as_str()).and_then(|cands| {
-                                        let mut it = cands.iter().filter(|&&i| {
-                                            namespaces_end_with(&symbols[i].id, &segs)
-                                        });
-                                        let first = it.next();
-                                        match (first, it.next()) {
-                                            (Some(only), None) => Some(only), // exactly one match
-                                            _ => None, // zero or ambiguous → no edge
-                                        }
-                                    })
-                                {
+                                if let Some(to_idx) = unique_suffix_match(
+                                    &by_name,
+                                    &symbols,
+                                    binding.name.as_str(),
+                                    &segs,
+                                ) {
                                     edges.push(Edge {
                                         from: symbols[from_idx].id.clone(),
                                         to: symbols[to_idx].id.clone(),
@@ -163,6 +195,26 @@ impl Resolver for ScopeGraphResolver {
 
         CodeGraph { symbols, edges }
     }
+}
+
+/// The unique index into `symbols` whose leaf name is `name` and whose
+/// namespace chain ends with `segs`, or `None` if zero or more than one
+/// candidate matches (Tier-B never fakes precision).
+fn unique_suffix_match(
+    by_name: &HashMap<&str, Vec<usize>>,
+    symbols: &[Symbol],
+    name: &str,
+    segs: &[&str],
+) -> Option<usize> {
+    by_name.get(name).and_then(|cands| {
+        let mut it = cands
+            .iter()
+            .filter(|&&i| namespaces_end_with(&symbols[i].id, segs));
+        match (it.next(), it.next()) {
+            (Some(&only), None) => Some(only), // exactly one match
+            _ => None,                         // zero or ambiguous → no edge
+        }
+    })
 }
 
 /// Walk lexical scopes outward from `start` looking for the binding that the
@@ -600,6 +652,175 @@ mod tests {
         assert!(
             import_edges(&graph).is_empty(),
             "import whose path matches no definition must yield no Tier-B edge"
+        );
+    }
+
+    // ── U8b: Qualified-call resolution ────────────────────────────────────────
+
+    /// Edges from `run` (the caller) that are NOT local edges and NOT Import edges.
+    fn call_edges_from_run(graph: &CodeGraph) -> Vec<&Edge> {
+        graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.from.to_scip_string().ends_with("run().")
+                    && !e.to.to_scip_string().starts_with("local ")
+                    && e.role != crate::graph::types::RefRole::Import
+            })
+            .collect()
+    }
+
+    #[test]
+    fn qualified_call_unique_match_emits_exact_edge() {
+        // `src/mod_a.rs` defines `process` → namespace chain ["mod_a"]
+        //   → SCIP id ends with `mod_a/process().`
+        // `src/mod_b.rs` defines `process` → namespace chain ["mod_b"]
+        //   → SCIP id ends with `mod_b/process().`
+        // `src/caller.rs` defines `run` which calls `mod_a::process()`.
+        //   qualifier = Some("mod_a"), name = "process"
+        //   normalize_from_path("mod_a") = ["mod_a"]
+        //   Only mod_a/process satisfies namespaces_end_with → ONE Exact edge.
+        // Tier-A would fan out to both; this verifies the qualifier disambiguates.
+        let mod_a = RustExtractor
+            .extract("pub fn process() {}", "src/mod_a.rs")
+            .unwrap();
+        let mod_b = RustExtractor
+            .extract("pub fn process() {}", "src/mod_b.rs")
+            .unwrap();
+        let caller = RustExtractor
+            .extract("pub fn run() { mod_a::process() }", "src/caller.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[mod_a, mod_b, caller]);
+
+        let run_edges = call_edges_from_run(&graph);
+        assert_eq!(
+            run_edges.len(),
+            1,
+            "expected exactly one edge from run (qualifier disambiguates), got: {:?}",
+            run_edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let edge = run_edges[0];
+        assert_eq!(
+            edge.confidence,
+            Confidence::Exact,
+            "qualified-call edge must carry Exact confidence"
+        );
+        assert!(
+            edge.to.to_scip_string().ends_with("mod_a/process()."),
+            "edge must target mod_a::process, got: {}",
+            edge.to.to_scip_string()
+        );
+        assert!(
+            !edge.to.to_scip_string().ends_with("mod_b/process()."),
+            "edge must NOT target mod_b::process (the decoy)"
+        );
+    }
+
+    #[test]
+    fn qualified_call_unmatched_qualifier_yields_no_edge() {
+        // `process` is defined in namespace ["conf"] but the caller writes
+        // `missing::process()` → qualifier "missing" does not suffix-match ["conf"]
+        // → no edge (honest no-op).
+        let conf = RustExtractor
+            .extract("pub fn process() {}", "src/conf.rs")
+            .unwrap();
+        let caller = RustExtractor
+            .extract("pub fn run() { missing::process() }", "src/caller.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[conf, caller]);
+
+        let run_edges = call_edges_from_run(&graph);
+        assert!(
+            run_edges.is_empty(),
+            "unmatched qualifier must yield no edge, got: {:?}",
+            run_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unqualified_call_still_resolves_via_scope_walk() {
+        // Regression: restructuring the loop must not break unqualified resolution.
+        // `helper()` has no qualifier → falls through to scope_walk → finds the
+        // same-file Definition binding → Scoped edge.
+        let facts = RustExtractor
+            .extract(
+                "pub fn helper() {} pub fn run() { helper() }",
+                "src/main.rs",
+            )
+            .unwrap();
+        let graph = ScopeGraphResolver.resolve(&[facts]);
+
+        let run_edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.from.to_scip_string().ends_with("run().")
+                    && e.to.to_scip_string().ends_with("helper().")
+                    && !e.to.to_scip_string().starts_with("local ")
+            })
+            .collect();
+
+        assert_eq!(
+            run_edges.len(),
+            1,
+            "unqualified helper() must still resolve via scope_walk, got: {:?}",
+            run_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            run_edges[0].confidence,
+            Confidence::Scoped,
+            "unqualified same-file call must carry Scoped confidence"
+        );
+    }
+
+    #[test]
+    fn nested_qualifier_resolves_to_nested_namespace() {
+        // `src/a/b.rs` → namespaces ["a", "b"] → SCIP id ends with `a/b/process().`
+        // Caller writes `a::b::process()` → qualifier "a::b"
+        //   normalize_from_path("a::b") = ["a", "b"] (splits on ':')
+        //   namespaces_end_with matches ["a", "b"] against ["a", "b"] → true → Exact edge.
+        let nested = RustExtractor
+            .extract("pub fn process() {}", "src/a/b.rs")
+            .unwrap();
+        let caller = RustExtractor
+            .extract("pub fn run() { a::b::process() }", "src/caller.rs")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[nested, caller]);
+
+        let run_edges = call_edges_from_run(&graph);
+        assert_eq!(
+            run_edges.len(),
+            1,
+            "nested qualifier a::b::process() must resolve to src/a/b.rs::process, got: {:?}",
+            run_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+        let edge = run_edges[0];
+        assert_eq!(edge.confidence, Confidence::Exact);
+        assert!(
+            edge.to.to_scip_string().ends_with("a/b/process()."),
+            "nested-namespace edge must target a/b/process, got: {}",
+            edge.to.to_scip_string()
         );
     }
 }

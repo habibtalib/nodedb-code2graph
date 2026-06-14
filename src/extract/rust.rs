@@ -58,7 +58,9 @@ impl Extractor for RustExtractor {
         let bytes = source.as_bytes();
         let namespaces = rust_namespaces(file);
 
-        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Rust, &namespaces, file, source.len());
         let module_id = mod_sym.id.to_scip_string();
         symbols.push(mod_sym);
@@ -69,7 +71,9 @@ impl Extractor for RustExtractor {
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
-        let bindings = collect_bindings(&root, bytes, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -629,6 +633,42 @@ fn collect_params(params_node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut 
             _ => {}
         }
     }
+}
+
+/// Emit a [`BindingKind::Definition`] binding for each top-level definition.
+///
+/// `collect_symbols` only captures top-level items, so each binds in the file
+/// root scope (`scopes[0]`). Definitions nested in `mod`/`impl` blocks are not
+/// yet captured as symbols, so they get no binding here — revisit when
+/// nested-definition extraction lands.
+fn definition_bindings(defs: &[Symbol]) -> Vec<Binding> {
+    defs.iter()
+        .map(|d| Binding {
+            scope: 0, // top-level defs bind in the file root scope
+            name: d.name.clone(),
+            intro: d.span.start,
+            kind: BindingKind::Definition,
+            target: BindingTarget::Def(d.id.clone()),
+        })
+        .collect()
+}
+
+/// Emit a [`BindingKind::Import`] binding for each [`RefRole::Import`] reference.
+///
+/// The binding's target carries the imported-from path as written (empty when
+/// unavailable). `scope` is resolved via [`innermost_scope`] on the reference's
+/// byte offset, defaulting to the file root scope (0) when no scope contains it.
+fn import_bindings(refs: &[Reference], scopes: &[Scope]) -> Vec<Binding> {
+    refs.iter()
+        .filter(|r| r.role == RefRole::Import)
+        .map(|r| Binding {
+            scope: innermost_scope(r.occ.byte, scopes).unwrap_or(0),
+            name: r.name.clone(),
+            intro: r.occ.byte,
+            kind: BindingKind::Import,
+            target: BindingTarget::Import(r.from_path.clone().unwrap_or_default()),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1215,6 +1255,138 @@ impl std::fmt::Display for Point {
             "call() should attribute to the Function scope ({}), got {:?}",
             fn_scope_id,
             call_ref.scope
+        );
+    }
+
+    // ── Definition binding tests ──────────────────────────────────────────────
+
+    #[test]
+    fn pub_fn_emits_definition_binding() {
+        // `pub fn foo() {}` → a Definition binding: name "foo", scope 0,
+        // kind Definition, target Def(_).
+        let src = "pub fn foo() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Definition && b.name == "foo")
+            .expect("expected a Definition binding named 'foo'");
+        assert_eq!(b.scope, 0, "top-level def must bind in scope 0");
+        assert!(
+            matches!(b.target, BindingTarget::Def(_)),
+            "Definition binding target must be Def(_), got {:?}",
+            b.target
+        );
+    }
+
+    #[test]
+    fn pub_struct_emits_definition_binding_in_root_scope() {
+        // `pub struct Bar {}` → a Definition binding named "Bar" in scope 0
+        // (not in the struct body's Type scope).
+        let src = "pub struct Bar {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Definition && b.name == "Bar")
+            .expect("expected a Definition binding named 'Bar'");
+        assert_eq!(b.scope, 0, "struct def must bind in root scope 0");
+        assert!(
+            matches!(b.target, BindingTarget::Def(_)),
+            "Definition binding target must be Def(_)"
+        );
+    }
+
+    #[test]
+    fn use_stmt_emits_import_binding() {
+        // `use std::io::Result;` → an Import binding: name "Result",
+        // kind Import, target Import("std::io").
+        let src = "use std::io::Result;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Import && b.name == "Result")
+            .expect("expected an Import binding named 'Result'");
+        assert_eq!(
+            b.target,
+            BindingTarget::Import("std::io".to_owned()),
+            "import binding target should be Import(\"std::io\"), got {:?}",
+            b.target
+        );
+    }
+
+    #[test]
+    fn module_file_symbol_does_not_produce_definition_binding() {
+        // The synthetic module symbol pushed last in `extract` must NOT get a
+        // Definition binding. Here we have exactly one real top-level def
+        // (`pub fn foo`), so there must be exactly one Definition binding and
+        // its name must be "foo", not the file-stem "lib".
+        let src = "pub fn foo() {}";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let def_bindings: Vec<_> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Definition)
+            .collect();
+        assert_eq!(
+            def_bindings.len(),
+            1,
+            "expected exactly one Definition binding, got {}: {:?}",
+            def_bindings.len(),
+            def_bindings.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            def_bindings[0].name, "foo",
+            "the sole Definition binding must be 'foo', not the module stem"
+        );
+    }
+
+    #[test]
+    fn combined_def_and_use_emit_both_kinds_and_locals_still_work() {
+        // A file with a top-level def + a `use` + a local let:
+        // → a Definition binding for `foo`
+        // → an Import binding for `Result`
+        // → a Param binding (from prior unit) for the function param
+        // → a Local binding for the let variable
+        let src = "use std::io::Result;\npub fn foo(x: u32) { let y = 1; }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        // Definition binding present.
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "foo"),
+            "expected a Definition binding for 'foo'"
+        );
+        // Import binding present.
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Import && b.name == "Result"),
+            "expected an Import binding for 'Result'"
+        );
+        // Param binding from prior unit still works.
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Param && b.name == "x"),
+            "expected a Param binding for 'x' (regression check)"
+        );
+        // Local binding from prior unit still works.
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "y"),
+            "expected a Local binding for 'y' (regression check)"
         );
     }
 }

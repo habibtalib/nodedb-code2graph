@@ -584,6 +584,127 @@ mod tests {
         );
     }
 
+    // ── SQL cross-artifact resolution tests ──────────────────────────────────
+
+    /// Intra-SQL: a query file referencing a table defined in a schema file
+    /// resolves to a TypeRef edge pointing at the table's SCIP symbol, Scoped
+    /// (unique global candidate → Win-1).
+    #[test]
+    fn intra_sql_typeref_edge_from_query_to_table() {
+        use crate::extract::SqlExtractor;
+
+        // File A: defines the `users` table.
+        let schema = SqlExtractor
+            .extract("CREATE TABLE users (id INT);", "db/schema.sql")
+            .unwrap();
+        // File B: SELECT from `users` → emits a TypeRef reference.
+        let query = SqlExtractor
+            .extract("SELECT * FROM users;", "db/query.sql")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[schema, query]);
+
+        // Expect exactly one TypeRef edge whose `to` ends with `users#`.
+        let typeref_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("users#"))
+            .collect();
+
+        assert_eq!(
+            typeref_edges.len(),
+            1,
+            "expected one intra-SQL TypeRef edge to 'users#', got {:?}: {:?}",
+            typeref_edges.len(),
+            graph
+                .edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = typeref_edges[0];
+        // Unique global candidate → Win-1 Scoped.
+        assert_eq!(
+            e.confidence,
+            Confidence::Scoped,
+            "unique table candidate should be Scoped, got {:?}",
+            e.confidence
+        );
+        assert_eq!(e.occ.file, "db/query.sql");
+    }
+
+    /// Code→SQL: a Rust file referencing the type name `users` resolves to the
+    /// SQL `users` table definition.  Confidence is Scoped when `users` is the
+    /// only global candidate (Win-1).
+    #[test]
+    fn code_to_sql_typeref_edge_rust_to_table() {
+        use crate::extract::SqlExtractor;
+
+        // SQL file: defines the `users` table.
+        let schema = SqlExtractor
+            .extract("CREATE TABLE users (id INT);", "db/schema.sql")
+            .unwrap();
+
+        // Rust file: references `users` as a type name in a function signature.
+        // `users` is ≥3 chars so it passes the MIN_REF_LEN filter.
+        let rust_file = RustExtractor
+            .extract("pub fn run(u: users) {}", "src/app.rs")
+            .unwrap();
+
+        // Sanity-check: the Rust extractor must have captured a TypeRef for `users`.
+        assert!(
+            rust_file
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::TypeRef && r.name == "users"),
+            "Rust extractor must emit a TypeRef ref for 'users'; refs: {:?}",
+            rust_file.references
+        );
+
+        let graph = SymbolTableResolver.resolve(&[schema, rust_file]);
+
+        // The edge must resolve to the SQL table's SCIP string (ends with `users#`).
+        let edges_to_sql_table: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("users#"))
+            .collect();
+
+        assert_eq!(
+            edges_to_sql_table.len(),
+            1,
+            "expected one Code→SQL TypeRef edge to 'users#', got {:?}: {:?}",
+            edges_to_sql_table.len(),
+            graph
+                .edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = edges_to_sql_table[0];
+        assert_eq!(
+            e.confidence,
+            Confidence::Scoped,
+            "unique global candidate → Scoped (Win-1), got {:?}",
+            e.confidence
+        );
+        assert_eq!(e.occ.file, "src/app.rs");
+    }
+
     /// Regression: single-candidate import (Win-1) remains Scoped with Win-2 in place.
     #[test]
     fn import_disambiguation_single_candidate_stays_scoped() {

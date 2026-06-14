@@ -19,5 +19,5 @@ pub mod symbol_table;
 
 pub use resolver::Resolver;
 pub use scope_graph::ScopeGraphResolver;
-pub(crate) use support::enclosing_symbol_index;
+pub(crate) use support::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
 pub use symbol_table::SymbolTableResolver;

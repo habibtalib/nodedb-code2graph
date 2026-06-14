@@ -75,11 +75,13 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     let namespaces = module_namespaces(file);
 
     let mut symbols = collect_symbols(&root, bytes, file, &namespaces, lang);
-    symbols.push(super::module_symbol(lang, &namespaces, file, source.len()));
+    let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
+    let module_id = mod_sym.id.to_scip_string();
+    symbols.push(mod_sym);
     let mut references =
         collect_call_references(&root, &ts_language, CALL_QUERY, lang, bytes, file)?;
     collect_inheritance(&root, bytes, file, &mut references);
-    collect_imports(&root, bytes, file, &mut references);
+    collect_imports(&root, bytes, file, &mut references, &module_id);
 
     Ok(FileFacts {
         file: file.to_owned(),
@@ -318,7 +320,13 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
 ///
 /// Only the binding name at the call-site is emitted; module sources and
 /// aliases are deliberately not recorded.
-fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
     if node.kind() == "import_statement" {
         // Locate the `import_clause` child (may be absent for bare `import "x"`).
         if let Some(clause) = node
@@ -329,10 +337,13 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
                 match child.kind() {
                     // Default import: `import Foo from "x"`
                     "identifier" => {
-                        let name = super::node_text(&child, bytes);
-                        if !name.is_empty() {
-                            super::push_ref(out, name, &child, file, RefRole::Import);
-                        }
+                        super::push_import_ref(
+                            out,
+                            super::node_text(&child, bytes),
+                            &child,
+                            file,
+                            module_id,
+                        );
                     }
                     // Named imports: `import { A, B as C } from "x"`
                     "named_imports" => {
@@ -343,16 +354,13 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
                             // `name` field is the real (original) name, not the alias.
                             if let Some(name_node) = specifier.child_by_field_name("name") {
                                 if name_node.kind() == "identifier" {
-                                    let name = super::node_text(&name_node, bytes);
-                                    if !name.is_empty() {
-                                        super::push_ref(
-                                            out,
-                                            name,
-                                            &name_node,
-                                            file,
-                                            RefRole::Import,
-                                        );
-                                    }
+                                    super::push_import_ref(
+                                        out,
+                                        super::node_text(&name_node, bytes),
+                                        &name_node,
+                                        file,
+                                        module_id,
+                                    );
                                 }
                                 // string-named imports (exotic) → skip silently
                             }
@@ -371,7 +379,7 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
 
     // Recurse into all other nodes so top-level and module-scoped imports are covered.
     for child in node.children(&mut node.walk()) {
-        collect_imports(&child, bytes, file, out);
+        collect_imports(&child, bytes, file, out, module_id);
     }
 }
 
@@ -604,5 +612,36 @@ function internal() {}
             import_names.contains(&"thing"),
             "expected 'thing' in JS import refs: {import_names:?}"
         );
+    }
+
+    #[test]
+    fn ts_import_refs_carry_source_module() {
+        // `import { Service } from "./svc";` in src/auth/client.ts → all
+        // Import refs carry the SCIP module id of src/auth/client.
+        let src = r#"import { Service } from "./svc";"#;
+        let file = "src/auth/client.ts";
+        let facts = TypeScriptExtractor.extract(src, file).unwrap();
+
+        let namespaces = module_namespaces(file);
+        let expected_module_id =
+            crate::extract::module_symbol(Language::TypeScript, &namespaces, file, src.len())
+                .id
+                .to_scip_string();
+
+        let import_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .collect();
+        assert!(!import_refs.is_empty(), "expected at least one Import ref");
+        for r in &import_refs {
+            assert_eq!(
+                r.source_module,
+                Some(expected_module_id.clone()),
+                "Import ref '{}' should carry source_module = {:?}",
+                r.name,
+                expected_module_id
+            );
+        }
     }
 }

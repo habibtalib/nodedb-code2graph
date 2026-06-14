@@ -56,12 +56,9 @@ impl Extractor for PythonExtractor {
         let namespaces = python_namespaces(file);
 
         let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
-        symbols.push(super::module_symbol(
-            Language::Python,
-            &namespaces,
-            file,
-            source.len(),
-        ));
+        let mod_sym = super::module_symbol(Language::Python, &namespaces, file, source.len());
+        let module_id = mod_sym.id.to_scip_string();
+        symbols.push(mod_sym);
         let mut references = collect_call_references(
             &root,
             &ts_language,
@@ -71,7 +68,7 @@ impl Extractor for PythonExtractor {
             file,
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
-        collect_imports(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references, &module_id);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -224,7 +221,13 @@ fn const_of<'a>(
 /// - For an `aliased_import` child: emit the leaf of its `name` field (the real
 ///   name), ignoring the `alias` field.
 /// - `wildcard_import` children (`from x import *`) produce no reference.
-fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
     match node.kind() {
         "import_statement" | "import_from_statement" => {
             for child in node.children_by_field_name("name", &mut node.walk()) {
@@ -232,14 +235,14 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
                     "dotted_name" => {
                         let text = node_text(&child, bytes);
                         let leaf = super::simple_type_name(text, ".");
-                        super::push_ref(out, leaf, &child, file, RefRole::Import);
+                        super::push_import_ref(out, leaf, &child, file, module_id);
                     }
                     "aliased_import" => {
                         // Take the real `name` field (a `dotted_name`), ignore `alias`.
                         if let Some(name_node) = child.child_by_field_name("name") {
                             let text = node_text(&name_node, bytes);
                             let leaf = super::simple_type_name(text, ".");
-                            super::push_ref(out, leaf, &name_node, file, RefRole::Import);
+                            super::push_import_ref(out, leaf, &name_node, file, module_id);
                         }
                     }
                     // wildcard_import and anything else produce nothing.
@@ -252,7 +255,7 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
 
     // Recurse into all children to cover nested/local imports.
     for child in node.children(&mut node.walk()) {
-        collect_imports(&child, bytes, file, out);
+        collect_imports(&child, bytes, file, out, module_id);
     }
 }
 
@@ -507,5 +510,56 @@ MAX_RETRIES = 3
             import_refs.is_empty(),
             "expected no Import refs for wildcard, got {import_refs:?}"
         );
+    }
+
+    #[test]
+    fn import_refs_carry_source_module() {
+        // The import refs for `from pkg.models import Config` should all have
+        // `source_module == Some(<module scip id of src/app.py>)`.
+        let src = "from pkg.models import Config\n";
+        let file = "src/app.py";
+        let facts = PythonExtractor.extract(src, file).unwrap();
+
+        // Compute expected module id the same way the extractor does.
+        let namespaces = python_namespaces(file);
+        let expected_module_id =
+            crate::extract::module_symbol(Language::Python, &namespaces, file, src.len())
+                .id
+                .to_scip_string();
+
+        let import_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .collect();
+        assert!(!import_refs.is_empty(), "expected at least one Import ref");
+        for r in &import_refs {
+            assert_eq!(
+                r.source_module,
+                Some(expected_module_id.clone()),
+                "Import ref '{}' should carry source_module = {:?}",
+                r.name,
+                expected_module_id
+            );
+        }
+    }
+
+    #[test]
+    fn call_refs_have_no_source_module() {
+        let src = "def main():\n    helper()\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call)
+            .collect();
+        assert!(!call_refs.is_empty(), "expected at least one Call ref");
+        for r in &call_refs {
+            assert_eq!(
+                r.source_module, None,
+                "Call ref '{}' must have source_module = None",
+                r.name
+            );
+        }
     }
 }

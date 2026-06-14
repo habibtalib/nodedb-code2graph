@@ -103,6 +103,9 @@ pub struct Reference {
     pub occ: Occurrence,
     /// What kind of reference.
     pub role: RefRole,
+    /// For [`RefRole::Import`] references: the SCIP identity string of the
+    /// importing file's module symbol. `None` for all other reference roles.
+    pub source_module: Option<String>,
 }
 
 /// How confident the resolver is in an [`Edge`] — the precision marker that lets

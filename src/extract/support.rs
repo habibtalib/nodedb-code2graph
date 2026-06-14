@@ -115,12 +115,26 @@ pub(crate) fn simple_type_name<'a>(text: &'a str, sep: &str) -> &'a str {
     base.rsplit_once(sep).map_or(base, |(_, a)| a).trim()
 }
 
+/// Build an [`Occurrence`] from a tree-sitter node and file path.
+#[inline]
+fn node_occurrence(node: &Node, file: &str) -> Occurrence {
+    Occurrence {
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        col: node.start_position().column as u32,
+        byte: node.start_byte(),
+    }
+}
+
 /// Push a [`Reference`] for `name` at `node`'s position with the given `role`.
 ///
 /// Shared by the inheritance and import passes (only the `role` and how `name` is
 /// derived differ per language). Empty names are skipped. Unlike
 /// [`collect_call_references`], no [`MIN_REF_LEN`] filter applies — short type
 /// names (e.g. `IO`) are legitimate.
+///
+/// Sets `source_module: None`; use [`push_import_ref`] for [`RefRole::Import`]
+/// references that carry the importing module's SCIP identity.
 pub(crate) fn push_ref(
     out: &mut Vec<Reference>,
     name: &str,
@@ -133,13 +147,33 @@ pub(crate) fn push_ref(
     }
     out.push(Reference {
         name: name.to_owned(),
-        occ: Occurrence {
-            file: file.to_owned(),
-            line: (node.start_position().row + 1) as u32,
-            col: node.start_position().column as u32,
-            byte: node.start_byte(),
-        },
+        occ: node_occurrence(node, file),
         role,
+        source_module: None,
+    });
+}
+
+/// Push an [`RefRole::Import`] [`Reference`] for `name` at `node`'s position,
+/// carrying `module_id` as the SCIP identity of the importing file's module
+/// symbol.
+///
+/// Like [`push_ref`] but sets `source_module: Some(module_id)` and hard-codes
+/// `role: RefRole::Import`. Empty names are skipped.
+pub(crate) fn push_import_ref(
+    out: &mut Vec<Reference>,
+    name: &str,
+    node: &Node,
+    file: &str,
+    module_id: &str,
+) {
+    if name.is_empty() {
+        return;
+    }
+    out.push(Reference {
+        name: name.to_owned(),
+        occ: node_occurrence(node, file),
+        role: RefRole::Import,
+        source_module: Some(module_id.to_owned()),
     });
 }
 
@@ -186,13 +220,9 @@ pub(crate) fn collect_call_references(
             }
             refs.push(Reference {
                 name,
-                occ: Occurrence {
-                    file: file.to_owned(),
-                    line: (cap.node.start_position().row + 1) as u32,
-                    col: cap.node.start_position().column as u32,
-                    byte: cap.node.start_byte(),
-                },
+                occ: node_occurrence(&cap.node, file),
                 role: RefRole::Call,
+                source_module: None,
             });
         }
     }

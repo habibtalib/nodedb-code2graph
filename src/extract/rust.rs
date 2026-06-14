@@ -56,16 +56,13 @@ impl Extractor for RustExtractor {
         let namespaces = rust_namespaces(file);
 
         let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
-        symbols.push(super::module_symbol(
-            Language::Rust,
-            &namespaces,
-            file,
-            source.len(),
-        ));
+        let mod_sym = super::module_symbol(Language::Rust, &namespaces, file, source.len());
+        let module_id = mod_sym.id.to_scip_string();
+        symbols.push(mod_sym);
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Rust, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
-        collect_imports(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references, &module_id);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -259,41 +256,41 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
 /// - `scoped_use_list`    → recurse into the `list` field.
 /// - `use_list`           → recurse into every named child.
 /// - `use_wildcard` / `crate` / `self` / `super` / anything else → skip.
-fn collect_use_leaves(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_use_leaves(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
     match node.kind() {
         "identifier" => {
-            super::push_ref(
-                out,
-                super::node_text(node, bytes),
-                node,
-                file,
-                RefRole::Import,
-            );
+            super::push_import_ref(out, super::node_text(node, bytes), node, file, module_id);
         }
         "scoped_identifier" => {
             if let Some(name_node) = node.child_by_field_name("name") {
-                super::push_ref(
+                super::push_import_ref(
                     out,
                     super::node_text(&name_node, bytes),
                     &name_node,
                     file,
-                    RefRole::Import,
+                    module_id,
                 );
             }
         }
         "use_as_clause" => {
             if let Some(path_node) = node.child_by_field_name("path") {
-                collect_use_leaves(&path_node, bytes, file, out);
+                collect_use_leaves(&path_node, bytes, file, out, module_id);
             }
         }
         "scoped_use_list" => {
             if let Some(list_node) = node.child_by_field_name("list") {
-                collect_use_leaves(&list_node, bytes, file, out);
+                collect_use_leaves(&list_node, bytes, file, out, module_id);
             }
         }
         "use_list" => {
             for child in node.named_children(&mut node.walk()) {
-                collect_use_leaves(&child, bytes, file, out);
+                collect_use_leaves(&child, bytes, file, out, module_id);
             }
         }
         // use_wildcard, crate, self, super, metavariable → skip
@@ -304,16 +301,22 @@ fn collect_use_leaves(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refer
 /// Walk the full tree and emit [`RefRole::Import`] references for every
 /// `use_declaration`. Recurses into `mod` blocks and function bodies so nested
 /// `use` items are also captured.
-fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
     if node.kind() == "use_declaration" {
         if let Some(arg) = node.child_by_field_name("argument") {
-            collect_use_leaves(&arg, bytes, file, out);
+            collect_use_leaves(&arg, bytes, file, out, module_id);
         }
         // No need to recurse further inside a use_declaration.
         return;
     }
     for child in node.children(&mut node.walk()) {
-        collect_imports(&child, bytes, file, out);
+        collect_imports(&child, bytes, file, out, module_id);
     }
 }
 
@@ -526,5 +529,36 @@ impl std::fmt::Display for Point {
             vec!["Result"],
             "expected ['Result'], got {import_names:?}"
         );
+    }
+
+    #[test]
+    fn import_refs_carry_source_module() {
+        // `use std::io::Result;` in src/net/client.rs → Import ref carries
+        // the module SCIP id of net/client.
+        let src = "use std::io::Result;";
+        let file = "src/net/client.rs";
+        let facts = RustExtractor.extract(src, file).unwrap();
+
+        let namespaces = rust_namespaces(file);
+        let expected_module_id =
+            crate::extract::module_symbol(Language::Rust, &namespaces, file, src.len())
+                .id
+                .to_scip_string();
+
+        let import_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .collect();
+        assert!(!import_refs.is_empty(), "expected at least one Import ref");
+        for r in &import_refs {
+            assert_eq!(
+                r.source_module,
+                Some(expected_module_id.clone()),
+                "Import ref '{}' should carry source_module = {:?}",
+                r.name,
+                expected_module_id
+            );
+        }
     }
 }

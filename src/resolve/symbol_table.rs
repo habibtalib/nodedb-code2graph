@@ -276,6 +276,7 @@ mod tests {
                 byte: 0,
             },
             role: RefRole::Import,
+            source_module: None,
         });
 
         let graph = SymbolTableResolver.resolve(&[a, b]);

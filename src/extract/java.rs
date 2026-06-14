@@ -56,16 +56,13 @@ impl Extractor for JavaExtractor {
         let namespaces = java_namespaces(&root, bytes, file);
 
         let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
-        symbols.push(super::module_symbol(
-            Language::Java,
-            &namespaces,
-            file,
-            source.len(),
-        ));
+        let mod_sym = super::module_symbol(Language::Java, &namespaces, file, source.len());
+        let module_id = mod_sym.id.to_scip_string();
+        symbols.push(mod_sym);
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Java, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
-        collect_imports(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references, &module_id);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -364,7 +361,13 @@ fn push_type_list_refs(container: &Node, bytes: &[u8], file: &str, out: &mut Vec
 /// - Static named imports (`import static com.x.Util.helper`) are treated
 ///   identically — only the leaf name matters.
 /// - Bare identifier imports (`import Foo`) use the identifier text directly.
-fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+fn collect_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
     if node.kind() == "import_declaration" {
         // Skip wildcard imports — any child with kind "asterisk" means `.*`.
         let has_wildcard = node
@@ -379,7 +382,7 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
                     // The `name` field is the final leaf (e.g. `Foo` in `com.x.Foo`).
                     if let Some(name_node) = child.child_by_field_name("name") {
                         let name = super::node_text(&name_node, bytes);
-                        super::push_ref(out, name, &name_node, file, RefRole::Import);
+                        super::push_import_ref(out, name, &name_node, file, module_id);
                         found = true;
                     }
                     break;
@@ -390,7 +393,7 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
                 for child in node.children(&mut node.walk()) {
                     if child.kind() == "identifier" {
                         let name = super::node_text(&child, bytes);
-                        super::push_ref(out, name, &child, file, RefRole::Import);
+                        super::push_import_ref(out, name, &child, file, module_id);
                         break;
                     }
                 }
@@ -400,7 +403,7 @@ fn collect_imports(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Referenc
 
     // Recurse — import_declarations are top-level, but recursing everywhere is harmless.
     for child in node.children(&mut node.walk()) {
-        collect_imports(&child, bytes, file, out);
+        collect_imports(&child, bytes, file, out, module_id);
     }
 }
 
@@ -619,5 +622,44 @@ public class Client {
             import_refs.is_empty(),
             "expected no import refs but got: {import_refs:?}"
         );
+    }
+
+    #[test]
+    fn import_refs_carry_source_module() {
+        // `import com.example.Service;` in a file without a package declaration
+        // → Import ref carries the SCIP module id derived from the file path.
+        let src = "import com.example.Service;\nclass A {}";
+        let file = "src/com/example/A.java";
+        let facts = JavaExtractor.extract(src, file).unwrap();
+
+        // Replicate the namespace derivation used by the extractor (no package
+        // declaration → path-derived fallback in java_namespaces).
+        let p = file.strip_suffix(".java").unwrap_or(file);
+        let p = p.strip_prefix("src/").unwrap_or(p);
+        let namespaces: Vec<String> = p
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let expected_module_id =
+            crate::extract::module_symbol(Language::Java, &namespaces, file, src.len())
+                .id
+                .to_scip_string();
+
+        let import_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .collect();
+        assert!(!import_refs.is_empty(), "expected at least one Import ref");
+        for r in &import_refs {
+            assert_eq!(
+                r.source_module,
+                Some(expected_module_id.clone()),
+                "Import ref '{}' should carry source_module = {:?}",
+                r.name,
+                expected_module_id
+            );
+        }
     }
 }

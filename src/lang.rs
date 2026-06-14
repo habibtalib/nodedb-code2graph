@@ -23,6 +23,7 @@ pub enum Language {
     Kotlin,     // .kt, .kts
     Solidity,   // .sol
     Sql,        // .sql
+    Hcl,        // .tf, .hcl, .tfvars
 }
 
 impl Language {
@@ -44,6 +45,7 @@ impl Language {
             Language::Kotlin => "kotlin",
             Language::Solidity => "solidity",
             Language::Sql => "sql",
+            Language::Hcl => "hcl",
         }
     }
 
@@ -65,6 +67,7 @@ impl Language {
             "kt" | "kts" => Some(Self::Kotlin),
             "sol" => Some(Self::Solidity),
             "sql" => Some(Self::Sql),
+            "tf" | "hcl" | "tfvars" => Some(Self::Hcl),
             _ => None,
         }
     }

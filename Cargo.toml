@@ -27,6 +27,7 @@ tree-sitter-swift = "0.7.3"
 tree-sitter-kotlin-ng = "1.1.0"
 tree-sitter-solidity = "1.2.13"
 tree-sitter-sequel = "0.3"
+tree-sitter-hcl = "1.1"
 
 [profile.release]
 opt-level = 3

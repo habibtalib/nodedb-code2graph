@@ -13,7 +13,8 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+    Binding, BindingKind, BindingTarget, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -68,6 +69,7 @@ impl Extractor for RustExtractor {
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
+        let bindings = collect_bindings(&root, bytes, &scopes);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -75,7 +77,7 @@ impl Extractor for RustExtractor {
             symbols,
             references,
             scopes,
-            bindings: Vec::new(),
+            bindings,
         })
     }
 }
@@ -462,20 +464,170 @@ fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
     scopes
 }
 
-/// Attach each reference to the innermost scope that contains its byte offset.
+/// Return the [`ScopeId`] of the innermost scope whose span contains `byte`.
 ///
-/// Ties on span length (e.g. a function whose body spans the whole file, so its
-/// scope equals the root scope) resolve to the higher index: `collect_scopes`
-/// always pushes a parent before its children, so the larger index is the more
-/// deeply nested scope.
+/// Ties on span length resolve to the higher index: `collect_scopes` always
+/// pushes a parent before its children, so the larger index is the more deeply
+/// nested scope.  Returns `None` only when `scopes` is empty (which cannot
+/// happen in practice because the file-root scope is always index 0).
+fn innermost_scope(byte: usize, scopes: &[Scope]) -> Option<ScopeId> {
+    scopes
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.span.contains(byte))
+        .min_by_key(|(id, s)| (s.span.len(), std::cmp::Reverse(*id)))
+        .map(|(id, _)| id)
+}
+
+/// Attach each reference to the innermost scope that contains its byte offset.
 fn attach_reference_scopes(refs: &mut [Reference], scopes: &[Scope]) {
     for r in refs {
-        r.scope = scopes
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.span.contains(r.occ.byte))
-            .min_by_key(|(id, s)| (s.span.len(), std::cmp::Reverse(*id)))
-            .map(|(id, _)| id);
+        r.scope = innermost_scope(r.occ.byte, scopes);
+    }
+}
+
+/// Resolve the bare identifier node for a pattern, unwrapping one level of
+/// `mut_pattern` or `ref_pattern` if necessary.
+///
+/// Returns `None` for destructuring patterns (`tuple_pattern`,
+/// `tuple_struct_pattern`, `struct_pattern`, slice patterns, …).
+///
+/// # NOTE
+/// Destructuring-pattern bindings (tuple, tuple-struct, struct, slice, or-
+/// pattern branches, etc.) are a known gap — this unit handles only simple
+/// identifiers and single-level `mut`/`ref` wrappers.  A later unit should
+/// walk the pattern recursively and emit a `Binding` for each bound leaf name.
+fn resolve_pattern_ident<'tree>(pattern: &Node<'tree>) -> Option<Node<'tree>> {
+    match pattern.kind() {
+        "identifier" => Some(*pattern),
+        "mut_pattern" | "ref_pattern" => {
+            // The inner pattern is a named child (no field name); find the
+            // first child that is itself an identifier.
+            pattern
+                .named_children(&mut pattern.walk())
+                .find(|c| c.kind() == "identifier")
+        }
+        // Destructuring patterns — not handled in this unit (see NOTE above).
+        _ => None,
+    }
+}
+
+/// Push a single [`Binding`] with `target = BindingTarget::Local`, computing
+/// `scope` via [`innermost_scope`].
+#[inline]
+fn push_binding(
+    out: &mut Vec<Binding>,
+    name: String,
+    intro: usize,
+    kind: BindingKind,
+    scopes: &[Scope],
+) {
+    let scope = innermost_scope(intro, scopes).unwrap_or(0);
+    out.push(Binding {
+        scope,
+        name,
+        intro,
+        kind,
+        target: BindingTarget::Local,
+    });
+}
+
+/// Walk `node` recursively, collecting parameter and local-variable [`Binding`]s.
+///
+/// Covers:
+/// - `function_item` / `closure_expression` parameters: `parameter` children
+///   of the `parameters`/`closure_parameters` node, plus `self_parameter`.
+/// - `let_declaration` bindings: the `pattern` field.
+///
+/// All emitted bindings have `target = BindingTarget::Local`.
+///
+/// `intro` is always the start byte of the **identifier token** (the bound
+/// name) — a neutral positional fact; visibility is the resolver's concern.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_item" | "closure_expression" => {
+            // Both node kinds expose their parameter list via the "parameters"
+            // field (function_item → `parameters` node; closure_expression →
+            // `closure_parameters` node).
+            if let Some(params_node) = node.child_by_field_name("parameters") {
+                collect_params(&params_node, bytes, scopes, out);
+            }
+            // Recurse into the body (and any other children).
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "let_declaration" => {
+            if let Some(pattern_node) = node.child_by_field_name("pattern") {
+                if let Some(ident_node) = resolve_pattern_ident(&pattern_node) {
+                    let intro = ident_node.start_byte();
+                    let name = node_text(&ident_node, bytes).to_owned();
+                    push_binding(out, name, intro, BindingKind::Local, scopes);
+                }
+                // NOTE: destructuring patterns (tuple, struct, slice, …) are
+                // not handled in this unit — see `resolve_pattern_ident`.
+            }
+            // Recurse into children (e.g. the value expression may contain
+            // closures with their own params).
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Emit a [`Binding`] for each parameter in a `parameters` or
+/// `closure_parameters` node.
+fn collect_params(params_node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params_node.named_children(&mut params_node.walk()) {
+        match child.kind() {
+            "parameter" => {
+                if let Some(pattern_node) = child.child_by_field_name("pattern") {
+                    // `pattern` field can be `self` (the keyword node) or any `_pattern`.
+                    if pattern_node.kind() == "self" {
+                        // `fn f(self)` — typed self, no `&`.
+                        let intro = pattern_node.start_byte();
+                        push_binding(out, "self".to_owned(), intro, BindingKind::Param, scopes);
+                    } else if let Some(ident_node) = resolve_pattern_ident(&pattern_node) {
+                        let intro = ident_node.start_byte();
+                        let name = node_text(&ident_node, bytes).to_owned();
+                        push_binding(out, name, intro, BindingKind::Param, scopes);
+                    }
+                    // NOTE: destructuring patterns in params not handled — see
+                    // `resolve_pattern_ident`.
+                }
+            }
+            "self_parameter" => {
+                // `&self`, `&mut self`, or `self` with a lifetime — the `self`
+                // keyword is a named child (no field).
+                if let Some(self_node) = child
+                    .named_children(&mut child.walk())
+                    .find(|c| c.kind() == "self")
+                {
+                    let intro = self_node.start_byte();
+                    push_binding(out, "self".to_owned(), intro, BindingKind::Param, scopes);
+                }
+            }
+            // Bare `identifier` directly inside `closure_parameters` (e.g.
+            // `|x| …` where `x` has no explicit type annotation).
+            "identifier" => {
+                let intro = child.start_byte();
+                let name = node_text(&child, bytes).to_owned();
+                push_binding(out, name, intro, BindingKind::Param, scopes);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -872,6 +1024,151 @@ impl std::fmt::Display for Point {
         );
         assert_eq!(scopes[0].kind, ScopeKind::Module);
         assert_eq!(scopes[0].parent, None);
+    }
+
+    // ── Binding tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn fn_params_emit_param_bindings() {
+        // `fn f(a: u32, b: u32) { }` → two Param bindings named `a` and `b`,
+        // both attributed to the Function scope, both targeting Local.
+        let src = "fn f(a: u32, b: u32) { }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("a", fn_scope_id), ("b", fn_scope_id)],
+            "expected Param bindings for a and b in the Function scope, got {param_names:?}"
+        );
+        for b in facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+        {
+            assert_eq!(
+                b.target,
+                BindingTarget::Local,
+                "param binding target must be Local"
+            );
+        }
+    }
+
+    #[test]
+    fn self_parameter_emits_param_binding() {
+        // `impl S { fn m(&self) {} }` → a Param binding named `"self"`.
+        let src = "pub struct S; impl S { fn m(&self) {} }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let self_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "self")
+            .expect("expected a Param binding named 'self'");
+        assert_eq!(self_binding.target, BindingTarget::Local);
+        // The scope must be a Function scope.
+        assert_eq!(
+            facts.scopes[self_binding.scope].kind,
+            ScopeKind::Function,
+            "self binding should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn let_binding_emits_local_binding() {
+        // `fn f() { let x = 1; }` → a Local binding for `x` in the Function scope.
+        let src = "fn f() { let x = 1; }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let x_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+
+        assert_eq!(
+            x_binding.scope, fn_scope_id,
+            "x should be in the Function scope"
+        );
+        assert_eq!(x_binding.target, BindingTarget::Local);
+
+        // intro must equal the start byte of the `x` identifier in the source.
+        let expected_intro = src.find('x').expect("'x' not in src");
+        assert_eq!(
+            x_binding.intro, expected_intro,
+            "intro should point at the 'x' token"
+        );
+    }
+
+    #[test]
+    fn shadowing_produces_two_local_bindings_with_different_intros() {
+        // `fn f() { let x = 1; let x = 2; }` → two Local bindings both named
+        // `x` with DIFFERENT intro offsets (the neutral fact enabling later
+        // shadowing resolution).
+        let src = "fn f() { let x = 1; let x = 2; }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let x_bindings: Vec<_> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Local && b.name == "x")
+            .collect();
+
+        assert_eq!(
+            x_bindings.len(),
+            2,
+            "expected exactly two Local bindings for 'x', got {}",
+            x_bindings.len()
+        );
+        assert_ne!(
+            x_bindings[0].intro, x_bindings[1].intro,
+            "shadowed bindings must have different intro offsets"
+        );
+    }
+
+    #[test]
+    fn nested_block_let_binding_attributes_to_inner_block_scope() {
+        // `fn f() { { let y = 1; } }` → the `y` Local binding's scope is the
+        // inner Block scope, not the Function scope.
+        let src = "fn f() { { let y = 1; } }";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+
+        let block_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Block)
+            .expect("expected a Block scope");
+
+        let y_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "y")
+            .expect("expected a Local binding for 'y'");
+
+        assert_eq!(
+            y_binding.scope, block_scope_id,
+            "y should be attributed to the inner Block scope ({}), got {}",
+            block_scope_id, y_binding.scope
+        );
     }
 
     #[test]

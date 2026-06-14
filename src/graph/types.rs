@@ -265,6 +265,9 @@ pub enum FfiAbi {
     /// A Node.js native addon binding (e.g. Rust `#[napi]`), callable from
     /// JavaScript or TypeScript under the exported name.
     NodeApi,
+    /// A Java Native Interface binding: a Java `native` method backed by a C/Rust
+    /// function whose name follows the `Java_<pkg>_<Class>_<method>` mangling.
+    Jni,
 }
 
 impl FfiAbi {
@@ -277,6 +280,7 @@ impl FfiAbi {
             FfiAbi::C => &["c", "cpp"],
             FfiAbi::Python => &["python"],
             FfiAbi::Wasm | FfiAbi::NodeApi => &["javascript", "typescript"],
+            FfiAbi::Jni => &["java"],
         }
     }
 }

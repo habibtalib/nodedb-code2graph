@@ -19,7 +19,9 @@ use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, Symbo
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, collect_call_references, field_text, node_text, one_line_signature, push_ref,
+};
 
 /// Tree-sitter query capturing call-callee identifiers.
 const CALL_QUERY: &str = r#"
@@ -63,6 +65,7 @@ impl Extractor for JavaExtractor {
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Java, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
+        collect_jni_natives(&root, bytes, file, &namespaces, &mut references);
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -416,22 +419,77 @@ fn collect_imports(
     }
 }
 
+/// True iff `node` has a `modifiers` child containing the modifier `keyword`.
+fn has_modifier(node: &Node, bytes: &[u8], keyword: &str) -> bool {
+    node.children(&mut node.walk())
+        .find(|c| c.kind() == "modifiers")
+        .is_some_and(|mods| {
+            mods.children(&mut mods.walk())
+                .any(|m| node_text(&m, bytes) == keyword)
+        })
+}
+
 /// True iff `node` has a `modifiers` child that contains the text `"public"`.
 ///
 /// If there is no `modifiers` child (package-private), returns `false`.
 fn is_public(node: &Node, bytes: &[u8]) -> bool {
-    for child in node.children(&mut node.walk()) {
-        if child.kind() != "modifiers" {
+    has_modifier(node, bytes, "public")
+}
+
+/// Emit an FFI-bridge reference for every `native` method, so the resolver links
+/// it to its C/Rust implementation across the JNI boundary.
+///
+/// A Java `native` method `m` in class `C` of package `a.b` is implemented by a
+/// native function named `Java_a_b_C_m` (the JNI mangling). We emit a `Call`
+/// reference carrying that mangled name at the method's site; the FFI resolver
+/// bridges it to a matching `Jni`-ABI export (e.g. a Rust `#[no_mangle] fn
+/// Java_a_b_C_m`). v1 handles top-level classes and the basic mangling — overload
+/// signature suffixes and `_`/Unicode escaping (`_1`, `_0xxxx`) are not applied.
+fn collect_jni_natives(
+    root: &Node,
+    bytes: &[u8],
+    file: &str,
+    namespaces: &[String],
+    out: &mut Vec<Reference>,
+) {
+    for ty in root.children(&mut root.walk()) {
+        if !matches!(
+            ty.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
             continue;
         }
-        for modifier in child.children(&mut child.walk()) {
-            if node_text(&modifier, bytes) == "public" {
-                return true;
+        let Some(class) = field_text(&ty, "name", bytes) else {
+            continue;
+        };
+        let Some(body) = ty.child_by_field_name("body") else {
+            continue;
+        };
+        for member in body.children(&mut body.walk()) {
+            if member.kind() != "method_declaration" || !has_modifier(&member, bytes, "native") {
+                continue;
             }
+            let Some(name_node) = member.child_by_field_name("name") else {
+                continue;
+            };
+            let method = node_text(&name_node, bytes);
+            let mangled = jni_mangle(namespaces, &class, method);
+            push_ref(out, &mangled, &name_node, file, RefRole::Call);
         }
-        return false;
     }
-    false
+}
+
+/// JNI short-form mangled name for a native method: `Java_<pkg>_<Class>_<method>`
+/// (package segments joined with `_`; omitted entirely for the default package).
+fn jni_mangle(namespaces: &[String], class: &str, method: &str) -> String {
+    if namespaces.is_empty() {
+        format!("Java_{class}_{method}")
+    } else {
+        format!("Java_{}_{}_{}", namespaces.join("_"), class, method)
+    }
 }
 
 #[cfg(test)]

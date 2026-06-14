@@ -56,9 +56,10 @@ changing how it reads the output. Identity rendering and the graph schema may st
 Every edge also carries a `Provenance` tag — which analysis derived it (name table, scope graph,
 or FFI bridge) — orthogonal to its `Confidence`. On top of the tiers, an `FfiBridgeResolver` links
 cross-language boundaries deterministically: a Rust `#[no_mangle]`/`#[export_name]` function called
-from C, a PyO3 `#[pyfunction]` from Python, or a `#[wasm_bindgen]`/`#[napi]` function from
-JavaScript/TypeScript, resolves to one edge — matched ABI-to-consumer and even when the exported name
-differs from the definition name, a boundary plain name resolution cannot recover.
+from C, a PyO3 `#[pyfunction]` from Python, a `#[wasm_bindgen]`/`#[napi]` function from
+JavaScript/TypeScript, or a Java `native` method backed by a `Java_*`-mangled Rust implementation,
+resolves to one ABI-matched edge — even when the exported name differs from the definition name, a
+boundary plain name resolution cannot recover.
 
 ## Measuring resolution quality
 

@@ -319,11 +319,21 @@ fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, Stri
         sib = node.prev_sibling();
     }
 
+    // A `#[no_mangle]`/`#[export_name]` symbol whose name follows the JNI
+    // mangling convention is a Java Native Interface implementation, not a plain
+    // C export — classify it so it bridges to Java, not C, call sites.
+    let c_abi_for = |name: &str| {
+        if name.starts_with("Java_") {
+            FfiAbi::Jni
+        } else {
+            FfiAbi::C
+        }
+    };
     let mut out = Vec::new();
     if let Some(name) = c_override {
-        out.push((FfiAbi::C, name));
+        out.push((c_abi_for(&name), name));
     } else if c_no_mangle {
-        out.push((FfiAbi::C, fn_name.to_owned()));
+        out.push((c_abi_for(fn_name), fn_name.to_owned()));
     }
     if py {
         out.push((

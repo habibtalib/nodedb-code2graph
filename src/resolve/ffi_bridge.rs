@@ -138,7 +138,7 @@ impl Resolver for FfiBridgeResolver {
 mod tests {
     use super::*;
     use crate::extract::{
-        CExtractor, Extractor, JavaScriptExtractor, PythonExtractor, RustExtractor,
+        CExtractor, Extractor, JavaExtractor, JavaScriptExtractor, PythonExtractor, RustExtractor,
     };
 
     /// Rust `#[no_mangle]` export, called from C → one FfiBridge edge.
@@ -332,6 +332,50 @@ mod tests {
             graph.edges[0].to.to_scip_string().ends_with("compute()."),
             "to was: {}",
             graph.edges[0].to.to_scip_string()
+        );
+    }
+
+    /// JNI: a Java `native` method bridges to its Rust `Java_*` implementation
+    /// via the mangled name, tagged with the JNI ABI.
+    #[test]
+    fn bridges_java_native_method_to_rust_jni_impl() {
+        let java = JavaExtractor
+            .extract(
+                "package com.example;\npublic class Foo {\n    public native int compute(int x);\n}\n",
+                "Foo.java",
+            )
+            .unwrap();
+        let rust = RustExtractor
+            .extract(
+                "#[no_mangle]\npub extern \"C\" fn Java_com_example_Foo_compute() -> u32 { 0 }",
+                "src/jni.rs",
+            )
+            .unwrap();
+        assert_eq!(rust.ffi_exports.len(), 1, "expected one FFI export");
+        assert_eq!(
+            rust.ffi_exports[0].abi,
+            FfiAbi::Jni,
+            "Java_-prefixed export must be classified JNI, not C"
+        );
+        assert_eq!(
+            rust.ffi_exports[0].export_name,
+            "Java_com_example_Foo_compute"
+        );
+
+        let graph = FfiBridgeResolver.resolve(&[java, rust]);
+        let bridges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.provenance == Provenance::FfiBridge)
+            .collect();
+        assert_eq!(bridges.len(), 1, "expected one JNI bridge edge");
+        assert!(
+            bridges[0]
+                .to
+                .to_scip_string()
+                .contains("Java_com_example_Foo_compute"),
+            "bridge target was {}",
+            bridges[0].to.to_scip_string()
         );
     }
 

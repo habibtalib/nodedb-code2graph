@@ -48,8 +48,8 @@ pub mod symbol;
 pub use error::{CodegraphError, Result};
 pub use extract::{Extractor, extract_file, extract_path};
 pub use graph::{
-    ByteSpan, CodeGraph, Confidence, Edge, EdgeKind, FileFacts, Occurrence, RefRole, Reference,
-    Symbol, SymbolKind,
+    ByteSpan, CodeGraph, Confidence, Edge, FileFacts, Occurrence, RefRole, Reference, Symbol,
+    SymbolKind,
 };
 pub use lang::Language;
 pub use resolve::{Resolver, SymbolTableResolver};

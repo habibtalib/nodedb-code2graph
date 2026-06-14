@@ -15,21 +15,9 @@
 
 use std::collections::HashMap;
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, EdgeKind, FileFacts, RefRole, Symbol};
+use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Symbol};
 
 use super::Resolver;
-
-/// Maps a [`RefRole`] to the corresponding [`EdgeKind`].
-///
-/// The match is exhaustive so that adding a new `RefRole` variant forces a
-/// compile error here, keeping the mapping intentional and explicit.
-fn edge_kind(role: RefRole) -> EdgeKind {
-    match role {
-        RefRole::Call => EdgeKind::Calls,
-        RefRole::IsImplementation => EdgeKind::Inherits,
-        RefRole::Import => EdgeKind::Imports,
-    }
-}
 
 /// Name-table resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -89,7 +77,7 @@ impl Resolver for SymbolTableResolver {
                     edges.push(Edge {
                         from: symbols[from_idx].id.clone(),
                         to: symbols[to_idx].id.clone(),
-                        kind: edge_kind(r.role),
+                        role: r.role,
                         confidence,
                         occ: r.occ.clone(),
                     });
@@ -107,6 +95,7 @@ mod tests {
     use crate::extract::Extractor;
     use crate::extract::JavaExtractor;
     use crate::extract::RustExtractor;
+    use crate::graph::types::RefRole;
 
     #[test]
     fn resolves_cross_file_call() {
@@ -119,11 +108,11 @@ mod tests {
 
         let graph = SymbolTableResolver.resolve(&[lib, main]);
 
-        // one Calls edge: run → helper
+        // one Call edge: run → helper
         let calls: Vec<_> = graph
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Calls)
+            .filter(|e| e.role == RefRole::Call)
             .collect();
         assert_eq!(calls.len(), 1);
         let e = calls[0];
@@ -156,11 +145,11 @@ mod tests {
 
         let graph = SymbolTableResolver.resolve(&[base, sub]);
 
-        // exactly one Inherits edge: Sub → Base
+        // exactly one IsImplementation edge: Sub → Base
         let inherits: Vec<_> = graph
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Inherits)
+            .filter(|e| e.role == RefRole::IsImplementation)
             .collect();
         assert_eq!(inherits.len(), 1);
         let e = inherits[0];
@@ -191,16 +180,16 @@ mod tests {
 
         let graph = SymbolTableResolver.resolve(&[greet, p]);
 
-        // Exactly one Inherits edge: P → Greet
+        // Exactly one IsImplementation edge: P → Greet
         let inherits: Vec<_> = graph
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Inherits)
+            .filter(|e| e.role == RefRole::IsImplementation)
             .collect();
         assert_eq!(
             inherits.len(),
             1,
-            "expected 1 Inherits edge, got {:?}",
+            "expected 1 IsImplementation edge, got {:?}",
             inherits.len()
         );
         let e = inherits[0];
@@ -235,16 +224,16 @@ mod tests {
 
         let graph = SymbolTableResolver.resolve(&[a, b]);
 
-        // Exactly one Imports edge: module(app) → Config
+        // Exactly one Import edge: module(app) → Config
         let imports: Vec<_> = graph
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Imports)
+            .filter(|e| e.role == RefRole::Import)
             .collect();
         assert_eq!(
             imports.len(),
             1,
-            "expected one Imports edge, got {:?}",
+            "expected one Import edge, got {:?}",
             imports.len()
         );
         let e = imports[0];
@@ -263,7 +252,7 @@ mod tests {
 
     #[test]
     fn resolves_import_edge_from_module() {
-        use crate::graph::types::{Occurrence, RefRole, Reference};
+        use crate::graph::types::{Occurrence, Reference};
 
         // File A defines `Config`.
         let a = RustExtractor
@@ -291,13 +280,13 @@ mod tests {
 
         let graph = SymbolTableResolver.resolve(&[a, b]);
 
-        // Exactly one Imports edge: module(app) → Config
+        // Exactly one Import edge: module(app) → Config
         let imports: Vec<_> = graph
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Imports)
+            .filter(|e| e.role == RefRole::Import)
             .collect();
-        assert_eq!(imports.len(), 1, "expected one Imports edge");
+        assert_eq!(imports.len(), 1, "expected one Import edge");
         let e = imports[0];
         assert!(
             e.from.to_scip_string().ends_with("app/"),
@@ -329,11 +318,11 @@ mod tests {
 
         let graph = SymbolTableResolver.resolve(&[a, b, caller]);
 
-        // Filter to Calls edges only (exclude any Inherits/Imports noise).
+        // Filter to Call edges only (exclude any IsImplementation/Import noise).
         let calls: Vec<_> = graph
             .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::Calls)
+            .filter(|e| e.role == RefRole::Call)
             .collect();
 
         // Recall preserved: both definitions must be reachable.

@@ -118,23 +118,15 @@ pub enum Confidence {
     NameOnly,
 }
 
-/// The kind of relationship an [`Edge`] expresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EdgeKind {
-    /// A symbol calls or constructs another symbol.
-    Calls,
-    /// A type inherits from / implements another type (subclass → parent).
-    Inherits,
-    /// A module imports a symbol (module → imported symbol).
-    Imports,
-}
-
 /// A resolved directed edge between two symbols.
 #[derive(Debug, Clone)]
 pub struct Edge {
     pub from: SymbolId,
     pub to: SymbolId,
-    pub kind: EdgeKind,
+    /// The relationship this edge expresses, mapped directly from the originating
+    /// [`Reference::role`]. Consumers filter on this field — e.g.
+    /// `e.role == RefRole::Call` to walk only call edges.
+    pub role: RefRole,
     /// Resolver precision for this edge.
     pub confidence: Confidence,
     /// The reference site that produced the edge — the evidence trail.

@@ -53,6 +53,25 @@ recall-first baseline. Both resolvers emit the same schema, so a consumer picks 
 changing how it reads the output. Identity rendering and the graph schema may still evolve before
 `0.1`.
 
+## Measuring resolution quality
+
+Resolution quality is measured, not asserted. The `codegraph-eval` crate scores ref→def
+**precision and recall per language and per resolver tier** against a corpus of golden fixtures
+(`eval/corpus/`), where each case pairs source files with the ground-truth edges they should
+resolve to. The evaluation unit is a located edge — a reference site bound to a definition site —
+so name-only fan-out is penalised exactly where it over-connects: a reference that links to *N*
+same-named definitions scores one true positive and *N − 1* false positives.
+
+```text
+cargo run -p codegraph-eval     # prints the scorecard
+cargo test -p codegraph-eval    # regression gate on the invariants
+```
+
+The scorer is independent of where the ground truth comes from, so a SCIP precision oracle
+(rust-analyzer / scip-java) can be plugged in alongside the hand-authored fixtures. The numbers
+quantify the tier tradeoff directly: the recall-first name tier finds everything but over-connects
+on ambiguity, while the scope-aware tier resolves a narrower set with no false positives.
+
 ## License
 
 Apache-2.0

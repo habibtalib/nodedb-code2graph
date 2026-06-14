@@ -262,6 +262,9 @@ pub enum FfiAbi {
     /// A WebAssembly/JavaScript binding (e.g. Rust `#[wasm_bindgen]`), callable
     /// from JavaScript or TypeScript under the exported name.
     Wasm,
+    /// A Node.js native addon binding (e.g. Rust `#[napi]`), callable from
+    /// JavaScript or TypeScript under the exported name.
+    NodeApi,
 }
 
 impl FfiAbi {
@@ -273,7 +276,7 @@ impl FfiAbi {
         match self {
             FfiAbi::C => &["c", "cpp"],
             FfiAbi::Python => &["python"],
-            FfiAbi::Wasm => &["javascript", "typescript"],
+            FfiAbi::Wasm | FfiAbi::NodeApi => &["javascript", "typescript"],
         }
     }
 }

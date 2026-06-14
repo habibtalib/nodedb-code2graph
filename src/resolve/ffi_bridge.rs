@@ -312,6 +312,29 @@ mod tests {
         assert_eq!(e.occ.file, "app.js");
     }
 
+    /// Rust `#[napi]` export, called from JavaScript → one FfiBridge edge.
+    #[test]
+    fn bridges_rust_napi_export_to_js_call() {
+        let rust = RustExtractor
+            .extract("#[napi]\npub fn compute() -> u32 { 0 }", "src/lib.rs")
+            .unwrap();
+        assert_eq!(rust.ffi_exports.len(), 1, "expected one FFI export");
+        assert_eq!(rust.ffi_exports[0].abi, FfiAbi::NodeApi);
+        assert_eq!(rust.ffi_exports[0].export_name, "compute");
+
+        let js = JavaScriptExtractor
+            .extract("function run() { compute(); }", "app.js")
+            .unwrap();
+        let graph = FfiBridgeResolver.resolve(&[rust, js]);
+        assert_eq!(graph.edges.len(), 1, "expected one FFI bridge edge");
+        assert_eq!(graph.edges[0].provenance, Provenance::FfiBridge);
+        assert!(
+            graph.edges[0].to.to_scip_string().ends_with("compute()."),
+            "to was: {}",
+            graph.edges[0].to.to_scip_string()
+        );
+    }
+
     /// ABI isolation: a C call must NOT bridge to a Python-only (PyO3) export of
     /// the same name, nor a Python call to a C-only export.
     #[test]

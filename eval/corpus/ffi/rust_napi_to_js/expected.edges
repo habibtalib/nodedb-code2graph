@@ -1,0 +1,4 @@
+# A Node.js native-addon boundary (napi-rs). JS calls `compute`, but the Rust
+# definition is `compute_sum`, exposed to JS as `compute` via js_name. Name/scope
+# resolution cannot bridge it; the FFI bridge follows the export.
+app.js:1 Call lib.rs:2

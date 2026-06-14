@@ -231,6 +231,8 @@ fn is_fully_pub(node: &Node, bytes: &[u8]) -> bool {
 ///   a `#[pyo3(name = "…")]` / `#[pyfunction(name = "…")]` override).
 /// - **Wasm/JS ABI** — `#[wasm_bindgen]` (exported under the function name, or a
 ///   `#[wasm_bindgen(js_name = "…")]` override).
+/// - **Node.js ABI** — `#[napi]` (exported under the function name, or a
+///   `#[napi(js_name = "…")]` override).
 ///
 /// Only functions extracted as symbols (the public ones) are bridged; each
 /// export is matched to its symbol by definition span, so the SCIP identity is
@@ -272,6 +274,8 @@ fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, Stri
     let mut py_override: Option<String> = None;
     let mut wasm = false;
     let mut wasm_override: Option<String> = None;
+    let mut napi = false;
+    let mut napi_override: Option<String> = None;
 
     let mut sib = func.prev_sibling();
     while let Some(node) = sib {
@@ -304,6 +308,14 @@ fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, Stri
                 wasm_override = Some(v.to_owned());
             }
         }
+        // Node.js native addon (napi-rs) marker — `#[napi(js_name = "…")]`
+        // overrides the JS-facing name.
+        if text.contains("napi") {
+            napi = true;
+            if let Some(v) = first_quoted(text) {
+                napi_override = Some(v.to_owned());
+            }
+        }
         sib = node.prev_sibling();
     }
 
@@ -323,6 +335,12 @@ fn fn_ffi_exports(func: &Node, bytes: &[u8], fn_name: &str) -> Vec<(FfiAbi, Stri
         out.push((
             FfiAbi::Wasm,
             wasm_override.unwrap_or_else(|| fn_name.to_owned()),
+        ));
+    }
+    if napi {
+        out.push((
+            FfiAbi::NodeApi,
+            napi_override.unwrap_or_else(|| fn_name.to_owned()),
         ));
     }
     out

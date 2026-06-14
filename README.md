@@ -1,10 +1,10 @@
-# codegraph
+# code2graph
 
 **Source files → structural facts.** A purpose-neutral, language-agnostic code-graph
 extraction library: it turns source code into **symbols**, **references**, and **cross-file
 edges** (calls, imports, …) as plain data — and stops there.
 
-codegraph has **no storage opinion** and **no product opinion**. It does not embed, score,
+code2graph has **no storage opinion** and **no product opinion**. It does not embed, score,
 rank, persist, or judge. Consumers decide what the facts mean:
 
 - a memory/RAG tool maps symbols to embedded entries for retrieval;
@@ -16,7 +16,7 @@ rank, persist, or judge. Consumers decide what the facts mean:
 Turning code into a graph means, per language: a tree-sitter walk, node-kind normalization,
 qualified-name and namespace conventions, signature extraction, and cross-file reference
 resolution — then maintaining all of it as grammars change. Most tools that need a code graph
-re-implement this from scratch. codegraph does it once, behind a neutral output and a stable
+re-implement this from scratch. code2graph does it once, behind a neutral output and a stable
 identity scheme, so a consumer builds its own layer (retrieval, analysis, navigation) without
 redoing parsing — and the wider ecosystem can share one substrate instead of many bespoke ones.
 
@@ -35,7 +35,7 @@ Out of scope (belongs in the consumer):
 
 - Storage, indexing, embeddings, ranking, scoring.
 - Recall-first heuristics, retrieval signals, ACLs.
-- Document/Markdown ingestion. codegraph is **code**.
+- Document/Markdown ingestion. code2graph is **code**.
 
 ## Status
 
@@ -63,7 +63,7 @@ boundary plain name resolution cannot recover.
 
 ## Measuring resolution quality
 
-Resolution quality is measured, not asserted. The `codegraph-eval` crate scores ref→def
+Resolution quality is measured, not asserted. The `code2graph-eval` crate scores ref→def
 **precision and recall per language and per resolver tier** against a corpus of golden fixtures
 (`eval/corpus/`), where each case pairs source files with the ground-truth edges they should
 resolve to. The evaluation unit is a located edge — a reference site bound to a definition site —
@@ -71,8 +71,8 @@ so name-only fan-out is penalised exactly where it over-connects: a reference th
 same-named definitions scores one true positive and *N − 1* false positives.
 
 ```text
-cargo run -p codegraph-eval     # prints the scorecard
-cargo test -p codegraph-eval    # regression gate on the invariants
+cargo run -p code2graph-eval     # prints the scorecard
+cargo test -p code2graph-eval    # regression gate on the invariants
 ```
 
 The scorer is independent of where the ground truth comes from, so a SCIP precision oracle

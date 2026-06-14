@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! # codegraph
+//! # code2graph
 //!
 //! Source files → structural facts. A purpose-neutral, language-agnostic
 //! code-graph extraction library: it turns source code into **symbols**,
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! ```
-//! use codegraph::{extract_path, resolve::{Resolver, SymbolTableResolver}};
+//! use code2graph::{extract_path, resolve::{Resolver, SymbolTableResolver}};
 //!
 //! let a = extract_path("src/util.rs", "pub fn helper() {}").unwrap();
 //! let b = extract_path("src/main.rs", "pub fn run() { helper() }").unwrap();

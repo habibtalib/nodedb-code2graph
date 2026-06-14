@@ -19,7 +19,7 @@
 //! `TypeRef`).
 
 use crate::score::ExpectedEdge;
-use codegraph::RefRole;
+use code2graph::RefRole;
 use std::fs;
 use std::io;
 use std::path::Path;

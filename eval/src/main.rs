@@ -3,13 +3,13 @@
 //! Prints a per-language, per-tier precision/recall scorecard for the corpus.
 //!
 //! ```text
-//! cargo run -p codegraph-eval
+//! cargo run -p code2graph-eval
 //! ```
 
-use codegraph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
-use codegraph_eval::corpus::load_corpus;
-use codegraph_eval::runner::{corpus_total, per_language};
-use codegraph_eval::score::Scorecard;
+use code2graph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
+use code2graph_eval::corpus::load_corpus;
+use code2graph_eval::runner::{corpus_total, per_language};
+use code2graph_eval::score::Scorecard;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -55,7 +55,7 @@ fn main() -> ExitCode {
 
     let langs: Vec<&String> = tiers[0].per_lang.keys().collect();
     println!(
-        "codegraph eval — {} cases across {} languages\n",
+        "code2graph eval — {} cases across {} languages\n",
         cases.len(),
         langs.len()
     );

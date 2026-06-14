@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Neutral structural-fact types — the output of codegraph.
+//! Neutral structural-fact types — the output of code2graph.
 //!
 //! Identity lives in [`crate::symbol`] (SCIP-aligned). These types are the
 //! facts a consumer reasons over: [`Symbol`] definitions, [`Reference`] sites,
@@ -10,7 +10,7 @@
 use crate::symbol::SymbolId;
 
 /// A half-open byte range `[start, end)` into a source file. Consumers slice
-/// their own text from this — codegraph never carries source bodies.
+/// their own text from this — code2graph never carries source bodies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSpan {
     pub start: usize,

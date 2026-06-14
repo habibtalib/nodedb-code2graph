@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# The evaluation harness for codegraph. A separate, unpublished crate: it is a
-# *consumer* of codegraph's public API (just like a real downstream tool), so it
+# The evaluation harness for code2graph. A separate, unpublished crate: it is a
+# *consumer* of code2graph's public API (just like a real downstream tool), so it
 # proves resolution quality without leaking any non-neutral concern into the core.
 [package]
-name = "codegraph-eval"
+name = "code2graph-eval"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
@@ -12,4 +12,4 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
-codegraph = { path = ".." }
+code2graph = { path = ".." }

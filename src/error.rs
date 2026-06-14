@@ -8,7 +8,7 @@
 /// Errors that can arise while turning source into structural facts.
 #[derive(Debug, thiserror::Error)]
 pub enum CodegraphError {
-    /// The language for an extension/path is not supported by codegraph.
+    /// The language for an extension/path is not supported by code2graph.
     #[error("unsupported language for `{0}`")]
     UnsupportedLanguage(String),
 
@@ -29,5 +29,5 @@ pub enum CodegraphError {
     },
 }
 
-/// Convenience alias for codegraph fallible operations.
+/// Convenience alias for code2graph fallible operations.
 pub type Result<T> = std::result::Result<T, CodegraphError>;

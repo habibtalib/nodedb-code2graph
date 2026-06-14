@@ -7,9 +7,9 @@
 //! Tier-A recall, a Tier-B false positive, or an erosion of the scope-tier's
 //! precision advantage all fail the build here.
 
-use codegraph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
-use codegraph_eval::corpus::{Case, load_corpus};
-use codegraph_eval::runner::{corpus_total, per_language, score_case};
+use code2graph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
+use code2graph_eval::corpus::{Case, load_corpus};
+use code2graph_eval::runner::{corpus_total, per_language, score_case};
 use std::path::Path;
 
 fn corpus() -> Vec<Case> {
@@ -53,9 +53,9 @@ fn ffi_bridge_recovers_what_name_resolution_cannot() {
     let ffi = cases_in(&cases, "ffi");
     assert!(!ffi.is_empty(), "expected ffi corpus cases");
 
-    let mut ffi_tier = codegraph_eval::score::Scorecard::default();
-    let mut name_tier = codegraph_eval::score::Scorecard::default();
-    let mut scope_tier = codegraph_eval::score::Scorecard::default();
+    let mut ffi_tier = code2graph_eval::score::Scorecard::default();
+    let mut name_tier = code2graph_eval::score::Scorecard::default();
+    let mut scope_tier = code2graph_eval::score::Scorecard::default();
     for c in &ffi {
         ffi_tier.merge(&score_case(c, &FfiBridgeResolver));
         name_tier.merge(&score_case(c, &SymbolTableResolver));

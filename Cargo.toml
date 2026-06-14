@@ -2,13 +2,13 @@
 members = ["eval"]
 
 [package]
-name = "codegraph"
+name = "code2graph"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "Purpose-neutral code-graph extraction: source files → symbols, references, and cross-file edges. Tree-sitter based, no storage opinion."
-repository = "https://github.com/nodedb-lab/codegraph"
+repository = "https://github.com/nodedb-lab/code2graph"
 keywords = ["code-graph", "tree-sitter", "static-analysis", "symbols", "cpg"]
 categories = ["development-tools", "parsing"]
 

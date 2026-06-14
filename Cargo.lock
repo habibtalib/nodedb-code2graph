@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph"
+name = "code2graph"
 version = "0.0.0"
 dependencies = [
  "thiserror",
@@ -45,10 +45,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "codegraph-eval"
+name = "code2graph-eval"
 version = "0.0.0"
 dependencies = [
- "codegraph",
+ "code2graph",
 ]
 
 [[package]]

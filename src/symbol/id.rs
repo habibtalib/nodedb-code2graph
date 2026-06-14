@@ -6,7 +6,7 @@
 //! is a stable, human-readable, fully-qualified name, so two references resolve
 //! to the same symbol iff their strings are equal — no separate join pass.
 //!
-//! codegraph is build-free, so it often does **not** know the package
+//! code2graph is build-free, so it often does **not** know the package
 //! (manager/name/version) at parse time. We still emit descriptors (the FQN
 //! within a package); a consumer that knows the manifest can fill `package`
 //! later. Within a single repo, descriptors + lang carry identity already.
@@ -16,7 +16,7 @@ use std::fmt;
 use super::descriptor::{Descriptor, parse_descriptor};
 
 /// Package coordinates (SCIP `<manager> <package-name> <version>`). Any field
-/// may be empty when unknown — codegraph leaves these to the consumer.
+/// may be empty when unknown — code2graph leaves these to the consumer.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Package {
     pub manager: String,
@@ -46,7 +46,7 @@ impl Package {
     }
 }
 
-/// Default scheme tag for codegraph-produced symbols.
+/// Default scheme tag for code2graph-produced symbols.
 pub const SCHEME: &str = "codegraph";
 
 /// Errors from parsing a SCIP symbol string (the inverse of

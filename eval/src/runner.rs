@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runs a case through codegraph and scores the result.
+//! Runs a case through code2graph and scores the result.
 //!
-//! This is the only part of the harness that touches codegraph's pipeline:
+//! This is the only part of the harness that touches code2graph's pipeline:
 //! extract every source file in the case, resolve with the chosen tier, and
 //! score the resulting graph against the case's ground truth. Everything else
 //! (loading, scoring) is independent of the library.
 
 use crate::corpus::Case;
 use crate::score::{Scorecard, score};
-use codegraph::{Resolver, extract_path};
+use code2graph::{Resolver, extract_path};
 use std::collections::BTreeMap;
 
 /// Extract every file in `case`, resolve with `resolver`, and score the graph

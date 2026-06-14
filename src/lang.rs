@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The set of languages codegraph can parse, plus extension dispatch.
+//! The set of languages code2graph can parse, plus extension dispatch.
 //!
 //! This is the single place that enumerates language coverage; extraction and
 //! resolution dispatch off it.
 
-/// A source language codegraph knows how to parse.
+/// A source language code2graph knows how to parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,

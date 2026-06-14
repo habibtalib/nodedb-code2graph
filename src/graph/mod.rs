@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Neutral graph data model — the facts codegraph produces.
+//! Neutral graph data model — the facts code2graph produces.
 
 pub mod types;
 

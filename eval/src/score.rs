@@ -13,13 +13,13 @@
 //! golden fixtures today, a SCIP precision oracle (rust-analyzer / scip-java)
 //! later. Both project into the same located-edge space.
 
-use codegraph::{CodeGraph, RefRole};
+use code2graph::{CodeGraph, RefRole};
 use std::collections::HashSet;
 
 /// A ground-truth ref→def edge, located by file + line at both ends.
 ///
-/// Lines are 1-based, matching [`codegraph::Symbol::line`] and
-/// [`codegraph::Occurrence::line`].
+/// Lines are 1-based, matching [`code2graph::Symbol::line`] and
+/// [`code2graph::Occurrence::line`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExpectedEdge {
     /// File containing the reference (use) site.
@@ -92,7 +92,7 @@ impl Scorecard {
 /// Project a resolved [`CodeGraph`] into the located-edge space and score it
 /// against the expected set.
 ///
-/// An emitted edge whose target [`codegraph::SymbolId`] has no matching symbol in
+/// An emitted edge whose target [`code2graph::SymbolId`] has no matching symbol in
 /// the graph (which should not happen for a well-formed graph) is skipped — it
 /// cannot be located, so it is neither credited nor penalised.
 pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {

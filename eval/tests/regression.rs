@@ -91,20 +91,27 @@ fn tier_b_never_fakes_precision() {
 
 #[test]
 fn scope_tier_beats_name_tier_on_precision_where_it_resolves() {
-    // The #1 thesis: on a language with scope extraction and genuine ambiguity
-    // (rust), the scope tier is strictly more precise than the name tier.
+    // The #1 thesis: in every language with scope extraction and genuine
+    // ambiguity, the scope tier is strictly more precise than the name tier and
+    // invents no edges. Asserted per scope-aware language so adding the next one
+    // extends the guarantee automatically.
     let cases = corpus();
     let a = per_language(&cases, &SymbolTableResolver);
     let b = per_language(&cases, &ScopeGraphResolver);
-    let (Some(a_rust), Some(b_rust)) = (a.get("rust"), b.get("rust")) else {
-        panic!("corpus must include rust cases");
-    };
-    assert!(
-        b_rust.precision() > a_rust.precision(),
-        "Tier-B precision ({:.2}) must beat Tier-A ({:.2}) on rust",
-        b_rust.precision(),
-        a_rust.precision()
-    );
-    // And it does so without inventing edges: every Tier-B rust edge is correct.
-    assert_eq!(b_rust.false_positives, 0);
+    for lang in ["rust", "python"] {
+        let (Some(a_l), Some(b_l)) = (a.get(lang), b.get(lang)) else {
+            panic!("corpus must include {lang} cases");
+        };
+        assert!(
+            b_l.precision() > a_l.precision(),
+            "Tier-B precision ({:.2}) must beat Tier-A ({:.2}) on {lang}",
+            b_l.precision(),
+            a_l.precision()
+        );
+        // And it does so without inventing edges: every Tier-B edge is correct.
+        assert_eq!(
+            b_l.false_positives, 0,
+            "Tier-B emitted a false positive on {lang}"
+        );
+    }
 }

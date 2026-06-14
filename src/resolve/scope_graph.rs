@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tier-B scope-aware resolver — precise resolution via lexical scopes (Rust-first).
+//! Tier-B scope-aware resolver — precise resolution via lexical scopes.
+//!
+//! The resolver itself is language-agnostic; it resolves whatever scope/binding
+//! facts an extractor emits. Scope-aware extractors today: Rust and Python.
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
 //! language's name-resolution rules would. It resolves four binding kinds:
@@ -34,8 +37,8 @@
 //!   more ambiguously, yields **no** edge (Tier-B never fakes precision; Tier-A
 //!   still provides recall via fan-out for those cases).
 //!
-//! A reference with `scope: None` (every extractor except Rust, for now) or a
-//! name that binds to nothing simply yields no edge.
+//! A reference with `scope: None` (from extractors without scope extraction) or
+//! a name that binds to nothing simply yields no edge.
 //!
 //! ## Confidence contract
 //!
@@ -289,6 +292,44 @@ mod tests {
     use crate::extract::Extractor;
     use crate::extract::PythonExtractor;
     use crate::extract::RustExtractor;
+
+    /// Python: an import disambiguates an otherwise-ambiguous cross-file call —
+    /// the scope tier binds the call to the imported definition alone, where the
+    /// name tier would fan out to every same-named def.
+    #[test]
+    fn python_import_disambiguates_ambiguous_call() {
+        use crate::graph::types::RefRole;
+        let alpha = PythonExtractor
+            .extract("def process():\n    pass\n", "alpha.py")
+            .unwrap();
+        let beta = PythonExtractor
+            .extract("def process():\n    pass\n", "beta.py")
+            .unwrap();
+        let main = PythonExtractor
+            .extract(
+                "from alpha import process\n\ndef run():\n    process()\n",
+                "main.py",
+            )
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[alpha, beta, main]);
+        let calls: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Call)
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly one call edge (no fan-out)"
+        );
+        assert_eq!(calls[0].provenance, Provenance::ScopeGraph);
+        assert!(
+            calls[0].to.to_scip_string().contains("alpha"),
+            "call must bind to alpha's process, got {}",
+            calls[0].to.to_scip_string()
+        );
+    }
 
     /// All edges whose target renders as a `local …` SCIP string.
     fn local_edges(graph: &CodeGraph) -> Vec<&Edge> {

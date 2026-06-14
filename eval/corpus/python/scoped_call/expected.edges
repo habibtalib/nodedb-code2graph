@@ -1,0 +1,5 @@
+# Two same-named `process` defs; the import fixes which one `run` calls.
+# Tier-A fans out (call+import each also hit beta); Tier-B follows the import
+# binding to alpha alone.
+main.py:1 Import alpha.py:1
+main.py:4 Call alpha.py:1

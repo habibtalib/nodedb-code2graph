@@ -13,11 +13,17 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
+    import_bindings, node_span, node_text, one_line_signature, push_binding, push_scope,
+};
 
 /// Tree-sitter query capturing call-callee identifiers.
 const CALL_QUERY: &str = r#"
@@ -55,7 +61,9 @@ impl Extractor for PythonExtractor {
         let bytes = source.as_bytes();
         let namespaces = python_namespaces(file);
 
-        let mut symbols = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Python, &namespaces, file, source.len());
         let module_id = mod_sym.id.to_scip_string();
         symbols.push(mod_sym);
@@ -70,13 +78,19 @@ impl Extractor for PythonExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Python.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -339,6 +353,124 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one Python file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// Python is **function-scoped, not block-scoped**: only `def`/`async def` open
+/// a scope; `if`/`for`/`while`/`with` do not. A `class` body is deliberately
+/// **not** a scope either — under Python's LEGB rule a method's name lookup skips
+/// the enclosing class, so nested defs take the class's enclosing scope as their
+/// parent.
+///
+/// Known v1 boundaries (documented, not yet handled): comprehension and lambda
+/// scopes, and the `global`/`nonlocal` rebinding statements.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening a `Function` scope for each `def`, recursing all other nodes with
+/// the same parent (so `class` bodies and block statements add no scope).
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    if node.kind() == "function_definition" {
+        let fn_id = push_scope(
+            scopes,
+            Some(parent_id),
+            node_span(node),
+            ScopeKind::Function,
+        );
+        if let Some(body) = node.child_by_field_name("body") {
+            for child in body.children(&mut body.walk()) {
+                scope_dfs(&child, fn_id, scopes);
+            }
+        }
+    } else {
+        for child in node.children(&mut node.walk()) {
+            scope_dfs(&child, parent_id, scopes);
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one file.
+///
+/// Covers function parameters and simple `name = …` assignments (each emitted as
+/// `BindingKind::Local`/`Param` with `target = BindingTarget::Local`). Tuple/
+/// attribute/subscript assignment targets and the walrus operator are deferred.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_definition" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                collect_params(&params, bytes, scopes, out);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "assignment" => {
+            // Only a bare `name = …` target binds a local in this unit.
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "identifier" {
+                    let intro = left.start_byte();
+                    let name = node_text(&left, bytes).to_owned();
+                    push_binding(out, name, intro, BindingKind::Local, scopes);
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each parameter in a `parameters` node,
+/// unwrapping the typed / default / splat parameter forms to the bound name.
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        let ident = match child.kind() {
+            "identifier" => Some(child),
+            "default_parameter" | "typed_default_parameter" => child.child_by_field_name("name"),
+            "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => child
+                .named_children(&mut child.walk())
+                .find(|c| c.kind() == "identifier"),
+            _ => None,
+        };
+        if let Some(id) = ident {
+            if id.kind() == "identifier" {
+                let intro = id.start_byte();
+                let name = node_text(&id, bytes).to_owned();
+                push_binding(out, name, intro, BindingKind::Param, scopes);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +512,49 @@ MAX_RETRIES = 3
         assert_eq!(
             facts.symbols[0].id.to_scip_string(),
             "codegraph . . . auth/helper()."
+        );
+    }
+
+    #[test]
+    fn emits_function_scope_and_bindings() {
+        let src = "def run(arg):\n    local = 1\n    helper(arg)\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        // Module root scope + one function scope.
+        assert_eq!(facts.scopes.len(), 2, "expected module + function scope");
+        assert_eq!(facts.scopes[0].kind, ScopeKind::Module);
+        assert_eq!(facts.scopes[1].kind, ScopeKind::Function);
+
+        let has = |name: &str, kind: BindingKind| {
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.name == name && b.kind == kind)
+        };
+        assert!(has("arg", BindingKind::Param), "param binding missing");
+        assert!(has("local", BindingKind::Local), "local binding missing");
+        assert!(has("run", BindingKind::Definition), "def binding missing");
+    }
+
+    #[test]
+    fn class_body_opens_no_scope_legb() {
+        // Python's LEGB skips the class scope for nested defs, so a class body
+        // adds no scope: the method's enclosing scope is the module.
+        let src = "class Foo:\n    def method(self):\n        pass\n";
+        let facts = PythonExtractor.extract(src, "src/m.py").unwrap();
+        let fn_scopes: Vec<_> = facts
+            .scopes
+            .iter()
+            .filter(|s| s.kind == ScopeKind::Function)
+            .collect();
+        assert_eq!(fn_scopes.len(), 1, "only the method opens a scope");
+        assert!(
+            !facts.scopes.iter().any(|s| s.kind == ScopeKind::Type),
+            "class body must not open a Type scope in Python"
+        );
+        assert_eq!(
+            fn_scopes[0].parent,
+            Some(0),
+            "method's enclosing scope is the module (class skipped)"
         );
     }
 

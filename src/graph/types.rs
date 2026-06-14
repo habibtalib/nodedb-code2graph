@@ -63,6 +63,8 @@ pub enum SymbolKind {
     View,
     /// A SQL column (a member of a table/view).
     Column,
+    /// An HCL/Terraform resource or data-source block.
+    Resource,
     /// Escape hatch while the taxonomy settles.
     Other,
 }

@@ -533,6 +533,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn typeref_produces_typeref_edge() {
+        // File A defines `Config`; file B uses it as a parameter type.
+        // Tier-A resolves cross-file by name: one global candidate → Scoped (Win-1).
+        // The key assertion is that `r.role` is copied onto the edge as TypeRef.
+        let a = RustExtractor
+            .extract("pub struct Config {}", "src/conf.rs")
+            .unwrap();
+        let b = RustExtractor
+            .extract("pub fn run(cfg: Config) {}", "src/app.rs")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b]);
+
+        // Filter to TypeRef-role edges only.
+        let typeref_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef)
+            .collect();
+
+        assert_eq!(
+            typeref_edges.len(),
+            1,
+            "expected exactly one TypeRef edge, got {:?}: {:?}",
+            typeref_edges.len(),
+            typeref_edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = typeref_edges[0];
+        assert!(
+            e.to.to_scip_string().ends_with("Config#"),
+            "TypeRef edge to must end with 'Config#' (the struct def), got: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::Scoped,
+            "single global candidate → Win-1 Scoped, got: {:?}",
+            e.confidence
+        );
+    }
+
     /// Regression: single-candidate import (Win-1) remains Scoped with Win-2 in place.
     #[test]
     fn import_disambiguation_single_candidate_stays_scoped() {

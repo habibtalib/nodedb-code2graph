@@ -811,6 +811,63 @@ mod tests {
     }
 
     #[test]
+    fn typeref_resolves_to_same_file_definition() {
+        use crate::graph::types::RefRole;
+
+        // One file: `Config` is a top-level struct (Definition binding at scope 0);
+        // `run` mentions `Config` as a parameter type → TypeRef reference.
+        // The scope_walk finds the Definition binding → Scoped edge.
+        let facts = RustExtractor
+            .extract(
+                "pub struct Config {}\npub fn run(cfg: Config) {}",
+                "src/main.rs",
+            )
+            .unwrap();
+        let graph = ScopeGraphResolver.resolve(&[facts]);
+
+        // Filter to TypeRef-role edges only.
+        let typeref_edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef)
+            .collect();
+
+        assert_eq!(
+            typeref_edges.len(),
+            1,
+            "expected exactly one TypeRef edge, got {:?}: {:?}",
+            typeref_edges.len(),
+            typeref_edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = typeref_edges[0];
+        assert!(
+            e.from.to_scip_string().ends_with("run()."),
+            "TypeRef edge from must end with 'run().', got: {}",
+            e.from.to_scip_string()
+        );
+        assert!(
+            e.to.to_scip_string().ends_with("Config#"),
+            "TypeRef edge to must end with 'Config#', got: {}",
+            e.to.to_scip_string()
+        );
+        assert_eq!(
+            e.confidence,
+            Confidence::Scoped,
+            "same-file definition resolution must carry Scoped confidence, got: {:?}",
+            e.confidence
+        );
+    }
+
+    #[test]
     fn nested_qualifier_resolves_to_nested_namespace() {
         // `src/a/b.rs` → namespaces ["a", "b"] → SCIP id ends with `a/b/process().`
         // Caller writes `a::b::process()` → qualifier "a::b"

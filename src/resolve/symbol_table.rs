@@ -23,6 +23,7 @@ use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, RefRole, Symbo
 use crate::symbol::SymbolId;
 
 use super::Resolver;
+use super::enclosing_symbol_index;
 
 /// Normalise a raw import path string into a sequence of non-empty, non-anchor
 /// segment slices.
@@ -83,12 +84,9 @@ impl Resolver for SymbolTableResolver {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
                 // The caller: innermost symbol in this file whose span holds the ref.
-                let Some(from_idx) = file_syms.and_then(|idxs| {
-                    idxs.iter()
-                        .copied()
-                        .filter(|&i| symbols[i].span.contains(r.occ.byte))
-                        .min_by_key(|&i| symbols[i].span.len())
-                }) else {
+                let Some(from_idx) =
+                    file_syms.and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
+                else {
                     continue; // reference not inside any extracted symbol — unattributable
                 };
 

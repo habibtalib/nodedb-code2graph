@@ -13,7 +13,9 @@
 //! [`FileFacts`]: crate::graph::FileFacts
 
 mod resolver;
+mod support;
 pub mod symbol_table;
 
 pub use resolver::Resolver;
+pub(crate) use support::enclosing_symbol_index;
 pub use symbol_table::SymbolTableResolver;

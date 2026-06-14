@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! HCL/Terraform extractor — extracts block symbols (resource, data, module)
-//! via tree-sitter-hcl.
+//! and reference traversals via tree-sitter-hcl.
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
-//! References (H3) are deferred to a later unit; this unit extracts symbols only.
+//! References: every attribute-value traversal of the form `T.N[.attr…]`
+//! (e.g. `aws_subnet.main.id`, `module.vpc.id`) is emitted as a
+//! [`RefRole::TypeRef`] with `name = seg1` and `qualifier = Some(seg0)`, so
+//! the language-agnostic resolver can link them to resource / module symbols.
+//!
+//! ## Tree structure (tree-sitter-hcl 1.1.0)
+//!
+//! A traversal `aws_subnet.main.id` is represented as an `expression` node
+//! whose **named children** are, in order:
+//! 1. `variable_expr` — one `identifier` child whose text is `aws_subnet` (seg0).
+//! 2. `get_attr`      — one `identifier` child whose text is `main` (seg1).
+//! 3. `get_attr`      — one `identifier` child whose text is `id`.
+//!
+//! `variable_expr` and each `get_attr` are **siblings** under `expression`; they
+//! are not nested. `${…}` interpolations wrap the same chain inside
+//! `template_interpolation` → `expression`, so the same traversal applies.
 
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -44,11 +59,13 @@ impl Extractor for HclExtractor {
         let mod_sym = super::module_symbol(Language::Hcl, &[], file, source.len());
         symbols.push(mod_sym);
 
+        let references = collect_references(&root, bytes, file);
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Hcl.as_str().to_owned(),
             symbols,
-            references: Vec::new(),
+            references,
             scopes: Vec::new(),
             bindings: Vec::new(),
         })
@@ -226,6 +243,116 @@ fn extract_block_symbol(block: &Node, bytes: &[u8], file: &str) -> Option<Symbol
         // other block types are deferred — they are recognised by Terraform but
         // their symbol taxonomy (kind, descriptor shape) is left for a later unit.
         _ => None,
+    }
+}
+
+// ── Reference extraction ──────────────────────────────────────────────────────
+
+/// Walk the whole parse tree and collect [`RefRole::TypeRef`] references for
+/// every **attribute-value traversal** with at least two segments.
+///
+/// A traversal is recognised when we visit an `expression` node that has a
+/// `variable_expr` named child **and** at least one `get_attr` named sibling
+/// within the same `expression`.  We emit exactly one [`Reference`] per
+/// traversal:
+/// - `name`      = the first `get_attr` identifier (seg1, e.g. `main`).
+/// - `qualifier` = the `variable_expr` identifier (seg0, e.g. `aws_subnet`).
+///
+/// This means `aws_subnet.main.id` resolves to name `main`, qualifier
+/// `aws_subnet`, matching the SCIP symbol `aws_subnet/main#`.  `module.vpc.x`
+/// → name `vpc`, qualifier `module`, matching `module/vpc#`.  A bare
+/// `variable_expr` with no `get_attr` sibling (single segment) is skipped.
+///
+/// v1 boundaries:
+/// - `data.T.N` references (leading `data`, 3 segments) won't resolve to the
+///   extracted data symbol with the 2-segment rule because the emitted name
+///   would be `T`, not `N`.  This is a harmless no-op (no wrong edge).
+/// - `var.region` → name `region`, qualifier `var`; no `var` symbol is
+///   extracted in v1, so this simply produces no edge.
+fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Vec<Reference> {
+    let mut out = Vec::new();
+    collect_references_recursive(root, bytes, file, &mut out);
+    out
+}
+
+fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    // Detect an `expression` node that starts a traversal chain.
+    //
+    // The tree-sitter-hcl grammar encodes `aws_subnet.main.id` as:
+    //   expression
+    //     variable_expr → identifier("aws_subnet")
+    //     get_attr      → identifier("main")
+    //     get_attr      → identifier("id")
+    //
+    // We collect the named children of every `expression` node; when the first
+    // named child is a `variable_expr` and at least one subsequent named child
+    // is a `get_attr`, we have a traversal.  We emit one reference and do NOT
+    // recurse further into this `expression`'s named children to avoid
+    // double-emitting for the same chain.
+    if node.kind() == "expression" {
+        let named: Vec<Node> = {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).collect()
+        };
+
+        // Does this expression open with a variable_expr?
+        if let Some(first) = named.first() {
+            if first.kind() == "variable_expr" {
+                // Locate the first get_attr sibling.
+                let first_get_attr = named.iter().find(|n| n.kind() == "get_attr");
+                if let Some(get_attr) = first_get_attr {
+                    // seg0: identifier inside variable_expr
+                    if let Some(seg0_node) = first
+                        .named_children(&mut first.walk())
+                        .find(|n| n.kind() == "identifier")
+                    {
+                        // seg1: identifier inside the first get_attr
+                        if let Some(seg1_node) = get_attr
+                            .named_children(&mut get_attr.walk())
+                            .find(|n| n.kind() == "identifier")
+                        {
+                            let seg0 = super::node_text(&seg0_node, bytes);
+                            let seg1 = super::node_text(&seg1_node, bytes);
+
+                            // Both segments must be non-empty; we do NOT apply
+                            // MIN_REF_LEN here — Terraform names like "vpc" or
+                            // "web" are exactly 3 chars; "id" (2 chars) only
+                            // appears as seg2+, never as seg1 in a real
+                            // resource traversal.  Skip only truly empty text
+                            // (parse error fallback).
+                            if !seg0.is_empty() && !seg1.is_empty() {
+                                out.push(Reference {
+                                    name: seg1.to_owned(),
+                                    qualifier: Some(seg0.to_owned()),
+                                    role: RefRole::TypeRef,
+                                    occ: super::node_occurrence(first, file),
+                                    source_module: None,
+                                    from_path: None,
+                                    scope: None,
+                                });
+                            }
+                        }
+                    }
+
+                    // This expression is a traversal root — do not recurse
+                    // into its named children (they are the variable_expr and
+                    // get_attr nodes we just processed).  But we must still
+                    // recurse into non-traversal child sub-trees (e.g. nested
+                    // expressions inside function call arguments).  Since the
+                    // children of a traversal expression are all either
+                    // `variable_expr`, `get_attr`, or `index` nodes (not
+                    // further `expression` nodes), it is safe to return here.
+                    return;
+                }
+            }
+        }
+    }
+
+    // Recurse into all children (named and anonymous) so we reach nested
+    // expressions inside blocks, function arguments, interpolations, etc.
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_references_recursive(&child, bytes, file, out);
     }
 }
 
@@ -410,7 +537,10 @@ module "vpc" { source = "./vpc" }
             facts.symbols.iter().any(|s| s.kind == SymbolKind::Module),
             "empty HCL should still produce the module symbol"
         );
-        assert!(facts.references.is_empty(), "no references emitted in H2");
+        assert!(
+            facts.references.is_empty(),
+            "empty HCL should emit no references"
+        );
     }
 
     #[test]
@@ -421,6 +551,111 @@ module "vpc" { source = "./vpc" }
         assert!(
             facts.symbols.iter().any(|s| s.kind == SymbolKind::Module),
             "malformed HCL should still return Ok with the module symbol"
+        );
+    }
+
+    // ── Reference extraction (H3) ─────────────────────────────────────────────
+
+    /// `subnet_id = aws_subnet.main.id` → one TypeRef ref with name `main`,
+    /// qualifier `aws_subnet`.
+    #[test]
+    fn resource_attr_traversal_emits_typeref_ref() {
+        let src = r#"resource "aws_instance" "web" { subnet_id = aws_subnet.main.id }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        let refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "main")
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly one TypeRef ref named 'main', got: {:?}",
+            facts.references
+        );
+        assert_eq!(
+            refs[0].qualifier,
+            Some("aws_subnet".to_owned()),
+            "qualifier should be 'aws_subnet', got: {:?}",
+            refs[0].qualifier
+        );
+    }
+
+    /// `x = module.vpc.id` inside a resource body → TypeRef ref name `vpc`,
+    /// qualifier `module`.
+    #[test]
+    fn module_traversal_in_resource_body_emits_typeref_ref() {
+        let src = r#"resource "aws_instance" "web" { x = module.vpc.id }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        let refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "vpc")
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly one TypeRef ref named 'vpc', got: {:?}",
+            facts.references
+        );
+        assert_eq!(
+            refs[0].qualifier,
+            Some("module".to_owned()),
+            "qualifier should be 'module', got: {:?}",
+            refs[0].qualifier
+        );
+    }
+
+    /// `subnet_id = "${aws_subnet.main.id}"` — traversal inside a string
+    /// interpolation — should still be captured via the `template_interpolation`
+    /// → `expression` path.
+    ///
+    /// If the grammar represents interpolated expressions differently and capture
+    /// fails here, this test is updated to document the v1 boundary rather than
+    /// faking it.
+    #[test]
+    fn traversal_inside_interpolation_emits_typeref_ref() {
+        let src = r#"resource "aws_instance" "web" { subnet_id = "${aws_subnet.main.id}" }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        let refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "main")
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected one TypeRef ref 'main' from interpolated traversal; \
+             if this fails, the grammar wraps interpolations differently — \
+             document as v1 boundary. Got: {:?}",
+            facts.references
+        );
+        assert_eq!(refs[0].qualifier, Some("aws_subnet".to_owned()));
+    }
+
+    /// A bare single-segment `variable_expr` (no `get_attr`) → no reference
+    /// emitted (can't identify an entity from one segment alone).
+    #[test]
+    fn single_segment_variable_expr_emits_no_ref() {
+        // `local.x` would be two segments; a plain variable reference like
+        // `count.index` would be two segments.  Use an attribute that is just
+        // a plain variable name with no dot:
+        let src = r#"resource "aws_instance" "web" { count = each }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        // Ensure no spurious TypeRef refs are emitted for the bare identifier.
+        let bare_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "each")
+            .collect();
+        assert!(
+            bare_refs.is_empty(),
+            "bare single-segment variable should produce no TypeRef ref; got: {:?}",
+            bare_refs
         );
     }
 }

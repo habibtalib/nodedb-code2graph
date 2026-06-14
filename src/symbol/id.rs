@@ -113,6 +113,28 @@ impl SymbolId {
         }
     }
 
+    /// The ordered names of all `Namespace` descriptors in this symbol's path,
+    /// in declaration order (outermost first). Non-namespace descriptors (Type,
+    /// Term, Method, …) are excluded. Returns an empty vec for `Local` symbols.
+    ///
+    /// Used by the Tier-A resolver to match an import's `from_path` suffix
+    /// against a candidate's module namespace chain without per-language rules.
+    pub fn namespaces(&self) -> Vec<&str> {
+        match self {
+            SymbolId::Global { descriptors, .. } => descriptors
+                .iter()
+                .filter_map(|d| {
+                    if let Descriptor::Namespace(n) = d {
+                        Some(n.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            SymbolId::Local { .. } => Vec::new(),
+        }
+    }
+
     /// The bare name of the final descriptor — the key for name-only matching.
     pub fn leaf_name(&self) -> Option<&str> {
         match self {
@@ -226,6 +248,33 @@ impl fmt::Display for SymbolId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespaces_returns_namespace_segments_only() {
+        // Java-style: two Namespace descriptors + a Type leaf.
+        let id = SymbolId::global(
+            "java",
+            vec![
+                Descriptor::Namespace("com".into()),
+                Descriptor::Namespace("example".into()),
+                Descriptor::Type("Config".into()),
+            ],
+        );
+        assert_eq!(id.namespaces(), vec!["com", "example"]);
+    }
+
+    #[test]
+    fn namespaces_empty_for_local() {
+        let id = SymbolId::local("src/main.rs", "x0");
+        assert!(id.namespaces().is_empty());
+    }
+
+    #[test]
+    fn namespaces_empty_for_no_namespace_descriptors() {
+        // A Type-only symbol (no Namespace wrappers).
+        let id = SymbolId::global("java", vec![Descriptor::Type("Foo".into())]);
+        assert!(id.namespaces().is_empty());
+    }
 
     #[test]
     fn global_renders_scip_string() {

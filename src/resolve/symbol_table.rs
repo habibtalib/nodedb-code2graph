@@ -6,18 +6,52 @@
 //! reference to the symbol whose span encloses it (the caller), and links it to
 //! every definition sharing the callee's name. An ambiguous name that fans out
 //! to several definitions tags each edge [`Confidence::NameOnly`]; a name with a
-//! single global candidate is tagged [`Confidence::Scoped`]. This is the
-//! recall-first baseline that works for every language without per-language
-//! binding rules — no edges are dropped, only the confidence varies. A precise
-//! resolver tags its edges [`Confidence::Exact`] instead.
+//! single global candidate is tagged [`Confidence::Scoped`]. Additionally, an
+//! import reference whose `from_path` uniquely matches exactly one candidate's
+//! module namespace suffix is tagged [`Confidence::Scoped`] while all other
+//! fan-out edges for that reference stay [`Confidence::NameOnly`] (recall
+//! preserved — no edges are dropped). This is the recall-first baseline that
+//! works for every language without per-language binding rules — no edges are
+//! dropped, only the confidence varies. A precise resolver tags its edges
+//! [`Confidence::Exact`] instead.
 //!
 //! It returns neutral [`Edge`]s and never writes to storage.
 
 use std::collections::HashMap;
 
-use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Symbol};
+use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, RefRole, Symbol};
+use crate::symbol::SymbolId;
 
 use super::Resolver;
+
+/// Normalise a raw import path string into a sequence of non-empty, non-anchor
+/// segment slices.
+///
+/// Splits on `.`, `/`, and `:` (so `pkg.models`, `std::io`, `./svc`, and
+/// `com/example` all decompose correctly). Filters out empty segments and the
+/// path-anchor keywords `"."`, `".."`, `"crate"`, `"self"`, and `"super"`.
+/// Returns `&str` slices into the original string — no new allocations.
+fn normalize_from_path(path: &str) -> Vec<&str> {
+    path.split(['.', '/', ':'])
+        .filter(|s| !s.is_empty() && !matches!(*s, "." | ".." | "crate" | "self" | "super"))
+        .collect()
+}
+
+/// Returns `true` iff `segs` is non-empty and the candidate's namespace chain
+/// (as returned by [`SymbolId::namespaces`]) **ends with** `segs`.
+///
+/// Example: candidate namespaces `["com", "example"]` with `segs = ["example"]`
+/// → true. With `segs = ["com", "example"]` → true. With `segs = ["other"]` → false.
+fn namespaces_end_with(candidate: &SymbolId, segs: &[&str]) -> bool {
+    if segs.is_empty() {
+        return false;
+    }
+    let ns = candidate.namespaces();
+    if segs.len() > ns.len() {
+        return false;
+    }
+    ns[ns.len() - segs.len()..] == *segs
+}
 
 /// Name-table resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -67,13 +101,49 @@ impl Resolver for SymbolTableResolver {
                 // intermediate Vec needed.
                 let non_self_count = targets.iter().filter(|&&i| i != from_idx).count();
 
-                let confidence = if non_self_count == 1 {
-                    Confidence::Scoped
+                // Import-path disambiguation (Win-2): when this is an Import
+                // reference with a non-empty `from_path`, find the single
+                // non-self candidate whose namespace chain ends with the
+                // normalised path segments.  If exactly one matches, that
+                // candidate's edge is promoted to Scoped; all others remain
+                // NameOnly.  Recall is preserved — no edges are dropped.
+                let import_bound: Option<usize> = if r.role == RefRole::Import {
+                    r.from_path.as_deref().and_then(|p| {
+                        let segs = normalize_from_path(p);
+                        if segs.is_empty() {
+                            return None;
+                        }
+                        let mut matched = targets.iter().copied().filter(|&i| {
+                            i != from_idx && namespaces_end_with(&symbols[i].id, &segs)
+                        });
+                        let first = matched.next()?;
+                        // Promote only when exactly one candidate matches.
+                        if matched.next().is_none() {
+                            Some(first)
+                        } else {
+                            None
+                        }
+                    })
                 } else {
-                    Confidence::NameOnly
+                    None
                 };
 
                 for &to_idx in targets.iter().filter(|&&i| i != from_idx) {
+                    // Decide per-edge confidence:
+                    // - If Win-2 fired (import_bound == Some(to_idx)): Scoped
+                    //   for the matched target, NameOnly for all others.
+                    // - Otherwise fall back to Win-1: Scoped iff unique candidate.
+                    let confidence = if import_bound == Some(to_idx) {
+                        Confidence::Scoped
+                    } else if import_bound.is_some() {
+                        // Win-2 fired but this is not the matched target.
+                        Confidence::NameOnly
+                    } else if non_self_count == 1 {
+                        Confidence::Scoped
+                    } else {
+                        Confidence::NameOnly
+                    };
+
                     edges.push(Edge {
                         from: symbols[from_idx].id.clone(),
                         to: symbols[to_idx].id.clone(),
@@ -95,7 +165,6 @@ mod tests {
     use crate::extract::Extractor;
     use crate::extract::JavaExtractor;
     use crate::extract::RustExtractor;
-    use crate::graph::types::RefRole;
 
     #[test]
     fn resolves_cross_file_call() {
@@ -357,6 +426,174 @@ mod tests {
             targets.iter().any(|s| s.ends_with("mod_b/process().")),
             "missing mod_b target; got: {:?}",
             targets
+        );
+    }
+
+    // ── Win-2: import-path disambiguation ────────────────────────────────────
+
+    /// Two classes named `Config` in different Java packages; importer of one
+    /// package gets `Scoped` for the matching def and `NameOnly` for the other.
+    ///
+    /// We use Java because its `package` declaration drives namespace derivation
+    /// cleanly: `package com.example;` → namespaces `["com","example"]`, and
+    /// `import com.example.Config` → `from_path = "com.example"`.  The suffix
+    /// match is exact and unambiguous.
+    #[test]
+    fn import_disambiguation_promotes_matching_package() {
+        // File 1: com.example package defines Config.
+        let a = JavaExtractor
+            .extract(
+                "package com.example;\npublic class Config {}",
+                "src/com/example/Config.java",
+            )
+            .unwrap();
+
+        // File 2: com.other package also defines Config (the decoy).
+        let b = JavaExtractor
+            .extract(
+                "package com.other;\npublic class Config {}",
+                "src/com/other/Config.java",
+            )
+            .unwrap();
+
+        // File 3: imports Config specifically from com.example.
+        let c = JavaExtractor
+            .extract(
+                "package app;\nimport com.example.Config;\npublic class App {}",
+                "src/app/App.java",
+            )
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b, c]);
+
+        let imports: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Import)
+            .collect();
+
+        // Recall preserved: BOTH Config defs must produce an edge.
+        assert_eq!(
+            imports.len(),
+            2,
+            "expected 2 Import edges (recall preserved), got {}: {:?}",
+            imports.len(),
+            imports
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+
+        // Find the two edges by their SCIP `to` strings.
+        let example_edge = imports
+            .iter()
+            .find(|e| e.to.to_scip_string().contains("com/example/Config"))
+            .expect("expected edge to com.example.Config");
+        let other_edge = imports
+            .iter()
+            .find(|e| e.to.to_scip_string().contains("com/other/Config"))
+            .expect("expected edge to com.other.Config");
+
+        // The matched package gets Scoped; the decoy stays NameOnly.
+        assert_eq!(
+            example_edge.confidence,
+            Confidence::Scoped,
+            "com.example.Config should be Scoped (from_path match), got {:?}",
+            example_edge.confidence
+        );
+        assert_eq!(
+            other_edge.confidence,
+            Confidence::NameOnly,
+            "com.other.Config should be NameOnly (no from_path match), got {:?}",
+            other_edge.confidence
+        );
+    }
+
+    /// Negative: `from_path` that matches no candidate's namespace leaves all
+    /// edges at their existing Win-1 confidence (NameOnly for ambiguous fan-out).
+    #[test]
+    fn import_disambiguation_no_match_leaves_fan_out_name_only() {
+        // Two classes named `Config` in unrelated packages.
+        let a = JavaExtractor
+            .extract(
+                "package com.alpha;\npublic class Config {}",
+                "src/com/alpha/Config.java",
+            )
+            .unwrap();
+        let b = JavaExtractor
+            .extract(
+                "package com.beta;\npublic class Config {}",
+                "src/com/beta/Config.java",
+            )
+            .unwrap();
+
+        // Importer whose from_path matches neither package ("com.gamma" is external).
+        let c = JavaExtractor
+            .extract(
+                "package app;\nimport com.gamma.Config;\npublic class App {}",
+                "src/app/App.java",
+            )
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b, c]);
+
+        let imports: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Import)
+            .collect();
+
+        // Recall preserved: still two edges even though no path matches.
+        assert_eq!(
+            imports.len(),
+            2,
+            "expected 2 Import edges, got {}",
+            imports.len()
+        );
+
+        // No promotion — both stay NameOnly (Win-1: non-unique candidate).
+        for e in &imports {
+            assert_eq!(
+                e.confidence,
+                Confidence::NameOnly,
+                "unmatched import fan-out should stay NameOnly, got {:?} for {}",
+                e.confidence,
+                e.to.to_scip_string()
+            );
+        }
+    }
+
+    /// Regression: single-candidate import (Win-1) remains Scoped with Win-2 in place.
+    #[test]
+    fn import_disambiguation_single_candidate_stays_scoped() {
+        // Identical to the existing Python single-candidate test, using Java.
+        let a = JavaExtractor
+            .extract(
+                "package com.example;\npublic class Config {}",
+                "src/com/example/Config.java",
+            )
+            .unwrap();
+        let b = JavaExtractor
+            .extract(
+                "package app;\nimport com.example.Config;\npublic class App {}",
+                "src/app/App.java",
+            )
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[a, b]);
+
+        let imports: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Import)
+            .collect();
+
+        assert_eq!(imports.len(), 1, "expected exactly one Import edge");
+        // Win-2 fires (unique path match) → Scoped.
+        assert_eq!(
+            imports[0].confidence,
+            Confidence::Scoped,
+            "single-candidate import should be Scoped"
         );
     }
 }

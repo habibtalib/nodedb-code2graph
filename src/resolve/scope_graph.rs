@@ -3,23 +3,27 @@
 //! Tier-B scope-aware resolver (**in progress**).
 //!
 //! This resolver walks each file's lexical scopes to bind references the way the
-//! language's name-resolution rules would. **Today it handles only the local
-//! case**: a reference that resolves to a local variable or parameter within the
-//! file's scopes produces a [`Confidence::Scoped`] edge whose target is a
-//! synthesized [`SymbolId::Local`]. Everything else is a graceful no-op — a
-//! reference with `scope: None` (every extractor except Rust, for now) or a name
-//! that binds to nothing simply yields no edge.
+//! language's name-resolution rules would. It currently resolves two binding
+//! kinds to [`Confidence::Scoped`] edges:
 //!
-//! It is therefore **not** a drop-in replacement for the Tier-A name-table
-//! resolver yet: it does not yet resolve references that bind to top-level
-//! definitions or imports (future units fill those in via the same
-//! [`scope_walk`] core). The honest read: this is the scope-walk foundation plus
-//! the local/param case, nothing more.
+//! * **Local/param bindings** — a reference that resolves to a local variable or
+//!   parameter within the file's scopes produces an edge whose target is a
+//!   synthesized [`SymbolId::Local`].
+//! * **Same-file top-level definitions** — a reference whose name walks out to a
+//!   scope-0 [`BindingKind::Definition`] binding produces an edge directly to
+//!   that definition's [`SymbolId`], eliminating Tier-A's name-only fan-out
+//!   across files.
+//!
+//! Cross-file and import resolution is **not yet handled**: `Import` bindings
+//! are currently a no-op (future unit U7 will fill those in via the same
+//! [`scope_walk`] core). A reference with `scope: None` (every extractor except
+//! Rust, for now) or a name that binds to nothing simply yields no edge.
 
 use std::collections::HashMap;
 
 use crate::graph::types::{
-    Binding, BindingKind, CodeGraph, Confidence, Edge, FileFacts, Scope, ScopeId, Symbol,
+    Binding, BindingKind, BindingTarget, CodeGraph, Confidence, Edge, FileFacts, Scope, ScopeId,
+    Symbol,
 };
 use crate::symbol::SymbolId;
 
@@ -67,16 +71,17 @@ impl Resolver for ScopeGraphResolver {
                     continue; // name binds to nothing visible — no edge
                 };
 
+                // The caller: innermost symbol in this file enclosing the ref.
+                // Hoisted here so every arm can use it without recomputation.
+                let Some(from_idx) = syms_by_file
+                    .get(f.file.as_str())
+                    .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
+                else {
+                    continue; // unattributable reference — skip, like Tier-A
+                };
+
                 match binding.kind {
                     BindingKind::Local | BindingKind::Param => {
-                        // The caller: innermost symbol in this file enclosing the ref.
-                        let Some(from_idx) = syms_by_file
-                            .get(f.file.as_str())
-                            .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
-                        else {
-                            continue; // unattributable reference — skip, like Tier-A
-                        };
-
                         // Stable, unique id for the local: file + scope + name +
                         // intro byte distinguishes shadowing bindings of one name.
                         let local_id = format!(
@@ -93,8 +98,21 @@ impl Resolver for ScopeGraphResolver {
                             occ: r.occ.clone(),
                         });
                     }
-                    // U6/U7 will handle Definition/Import bindings here.
-                    _ => continue,
+                    BindingKind::Definition => {
+                        // Same-file definition: resolve to the bound symbol's identity, precisely.
+                        if let BindingTarget::Def(target_id) = &binding.target {
+                            edges.push(Edge {
+                                from: symbols[from_idx].id.clone(),
+                                to: target_id.clone(),
+                                role: r.role,
+                                confidence: Confidence::Scoped,
+                                occ: r.occ.clone(),
+                            });
+                        }
+                        // (A Definition binding always carries Def(_); the `if let` is defensive.)
+                    }
+                    // U7 will handle Import bindings here.
+                    BindingKind::Import => continue,
                 }
             }
         }
@@ -151,7 +169,6 @@ mod tests {
     use crate::extract::Extractor;
     use crate::extract::PythonExtractor;
     use crate::extract::RustExtractor;
-    use crate::graph::types::RefRole;
 
     /// All edges whose target renders as a `local …` SCIP string.
     fn local_edges(graph: &CodeGraph) -> Vec<&Edge> {
@@ -269,7 +286,10 @@ mod tests {
         // and must NOT see it (outward walk skips child scopes). Name ≥ MIN_REF_LEN
         // so the call IS captured — otherwise this would pass for the wrong reason.
         let facts = RustExtractor
-            .extract("pub fn run() { { let val = make(); } val() }", "src/main.rs")
+            .extract(
+                "pub fn run() { { let val = make(); } val() }",
+                "src/main.rs",
+            )
             .unwrap();
         let graph = ScopeGraphResolver.resolve(&[facts]);
         assert!(
@@ -280,15 +300,145 @@ mod tests {
 
     #[test]
     fn ignores_role_noise_only_local_edges_counted() {
-        // Sanity: with no resolvable local, even if a call ref exists, no local edge.
+        // Sanity: `helper` has no definition or local in this file, so it binds to
+        // nothing — the call yields no edge at all, and in particular no local edge.
         let facts = RustExtractor
             .extract("pub fn run() { helper() }", "src/main.rs")
             .unwrap();
         let graph = ScopeGraphResolver.resolve(&[facts]);
-        // `helper` is a Definition-bound name (top-level) or unbound here; either
-        // way this unit emits no local edge for it.
-        for e in local_edges(&graph) {
-            assert_ne!(e.role, RefRole::IsImplementation);
-        }
+        assert!(
+            local_edges(&graph).is_empty(),
+            "unbound name must not produce a local edge"
+        );
+    }
+
+    // ── U6: Definition arm ────────────────────────────────────────────────────
+
+    #[test]
+    fn resolves_same_file_definition() {
+        // `helper()` call inside `run()` must resolve to the top-level `helper`
+        // definition in the same file — NOT to a synthesized local.
+        let facts = RustExtractor
+            .extract(
+                "pub fn helper() {} pub fn run() { helper() }",
+                "src/main.rs",
+            )
+            .unwrap();
+        let graph = ScopeGraphResolver.resolve(&[facts]);
+
+        // Exactly one edge whose source is `run` and target is the real `helper`.
+        let def_edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.from.to_scip_string().ends_with("run().")
+                    && e.to.to_scip_string().ends_with("helper().")
+                    && !e.to.to_scip_string().starts_with("local ")
+            })
+            .collect();
+
+        assert_eq!(
+            def_edges.len(),
+            1,
+            "expected exactly one run→helper definition edge, got {:?}",
+            def_edges
+                .iter()
+                .map(|e| format!("{} → {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            def_edges[0].confidence,
+            Confidence::Scoped,
+            "definition edge must carry Scoped confidence"
+        );
+        // No local edge must be produced for `helper`.
+        assert!(
+            local_edges(&graph).is_empty(),
+            "definition call must not produce a local edge"
+        );
+    }
+
+    #[test]
+    fn same_file_definition_wins_over_cross_file_fan_out() {
+        // Three files each with a `helper` function. `caller.rs` also has `run`
+        // calling `helper`. Tier-A would fan out to all three helpers; Tier-B
+        // (Definition binding) picks only caller.rs's own `helper`.
+        let facts_a = RustExtractor
+            .extract("pub fn helper() {}", "src/a.rs")
+            .unwrap();
+        let facts_b = RustExtractor
+            .extract("pub fn helper() {}", "src/b.rs")
+            .unwrap();
+        let facts_caller = RustExtractor
+            .extract(
+                "pub fn helper() {} pub fn run() { helper() }",
+                "src/caller.rs",
+            )
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[facts_a, facts_b, facts_caller]);
+
+        // Collect all edges whose `from` ends with `run().`.
+        let run_edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from.to_scip_string().ends_with("run()."))
+            .collect();
+
+        assert_eq!(
+            run_edges.len(),
+            1,
+            "expected exactly one edge from run, not a cross-file fan-out; got: {:?}",
+            run_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+
+        let edge = run_edges[0];
+        assert_eq!(edge.confidence, Confidence::Scoped);
+
+        // The resolved target must be caller.rs's OWN helper, not a.rs/b.rs.
+        // SCIP ids carry the file-derived namespace as a path segment, so
+        // caller.rs's helper renders as `…caller/helper().` while the decoys
+        // render as `…a/helper().` / `…b/helper().`. Asserting the `caller/`
+        // segment positively pins the correct file and fails on a wrong pick.
+        let to_scip = edge.to.to_scip_string();
+        assert!(
+            to_scip.ends_with("caller/helper()."),
+            "run→helper edge must target caller.rs's own helper, got: {to_scip}"
+        );
+    }
+
+    #[test]
+    fn local_shadows_same_name_definition() {
+        // `process` is both a top-level function and a `let` binding inside `run`.
+        // The LOCAL `process` must shadow the Definition — innermost scope wins.
+        let src = "pub fn process() {} pub fn run() { let process = make(); process() }";
+        let facts = RustExtractor.extract(src, "src/main.rs").unwrap();
+        let graph = ScopeGraphResolver.resolve(&[facts]);
+
+        // Exactly one edge from `run`.
+        let run_edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from.to_scip_string().ends_with("run()."))
+            .collect();
+
+        assert_eq!(
+            run_edges.len(),
+            1,
+            "expected exactly one edge from run, got {:?}",
+            run_edges
+                .iter()
+                .map(|e| e.to.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+
+        let to_scip = run_edges[0].to.to_scip_string();
+        assert!(
+            to_scip.starts_with("local "),
+            "let-binding must shadow top-level definition: target should be a local, got: {to_scip}"
+        );
     }
 }

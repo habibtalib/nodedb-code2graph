@@ -3,12 +3,14 @@
 //! SQL extractor — extracts DDL symbols (tables, views, columns) via tree-sitter-sequel.
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies. References
-//! and scope/binding extraction arrive in later units.
+//! (table use-sites in FROM/JOIN/INSERT/UPDATE/DELETE/REFERENCES clauses) are now
+//! emitted as [`RefRole::TypeRef`] so the language-agnostic resolver can link them
+//! to their table/view definitions automatically.
 
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, Symbol, SymbolKind};
+use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
@@ -43,11 +45,13 @@ impl Extractor for SqlExtractor {
         let mod_sym = super::module_symbol(Language::Sql, &[], file, source.len());
         symbols.push(mod_sym);
 
+        let references = collect_references(&root, bytes, file);
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Sql.as_str().to_owned(),
             symbols,
-            references: Vec::new(),
+            references,
             scopes: Vec::new(),
             bindings: Vec::new(),
         })
@@ -212,6 +216,70 @@ fn build_descriptors(schema: Option<&str>, table: &str, column: Option<&str>) ->
     descriptors
 }
 
+// ── Reference extraction ──────────────────────────────────────────────────────
+
+/// Walk the tree and collect [`RefRole::TypeRef`] references for every
+/// `object_reference` node that is NOT the definition name of a
+/// `create_table` / `create_view` / `create_materialized_view` statement.
+///
+/// The rule is: a direct child `object_reference` of one of those three
+/// parent kinds names the object being *created* (already a Symbol); every
+/// other `object_reference` in the tree is a use-site — FROM/JOIN/INSERT INTO /
+/// UPDATE / DELETE FROM / foreign-key REFERENCES / subquery names, etc.
+///
+/// v1 boundary: some constructs we don't yet extract as symbols (e.g.
+/// `CREATE TRIGGER`, `CREATE INDEX`) also produce `object_reference` nodes for
+/// their own names, which we'll emit as refs here. They simply resolve to
+/// nothing (no matching symbol) — a harmless no-op until those symbol kinds are
+/// added.
+fn collect_references(root: &Node, bytes: &[u8], file: &str) -> Vec<Reference> {
+    let mut out = Vec::new();
+    collect_references_recursive(root, bytes, file, &mut out);
+    out
+}
+
+fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "object_reference" {
+        // Determine whether this is the definition name: a direct child of
+        // create_table / create_view / create_materialized_view.
+        let is_definition_name = node
+            .parent()
+            .map(|p| {
+                matches!(
+                    p.kind(),
+                    "create_table" | "create_view" | "create_materialized_view"
+                )
+            })
+            .unwrap_or(false);
+
+        if !is_definition_name {
+            // Emit a TypeRef reference for this use-site.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = strip_ident(super::node_text(&name_node, bytes)).to_owned();
+                if !name.is_empty() {
+                    let qualifier = node
+                        .child_by_field_name("schema")
+                        .map(|n| strip_ident(super::node_text(&n, bytes)).to_owned());
+                    out.push(Reference {
+                        name,
+                        occ: super::node_occurrence(node, file),
+                        role: RefRole::TypeRef,
+                        source_module: None,
+                        from_path: None,
+                        qualifier,
+                        scope: None,
+                    });
+                }
+            }
+        }
+        // Recurse into children of this object_reference as well (nested
+        // object_references can appear in subqueries).
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_references_recursive(&child, bytes, file, out);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -246,7 +314,14 @@ mod tests {
             "module symbol SCIP string should contain the file stem; got: {}",
             mod_sym.id.to_scip_string()
         );
-        assert!(facts.references.is_empty());
+        // A pure CREATE TABLE with no use-sites emits no references.
+        assert!(
+            facts
+                .references
+                .iter()
+                .all(|r| r.role != RefRole::TypeRef || r.name != "users"),
+            "pure DDL should not emit a TypeRef reference for the table being created"
+        );
     }
 
     #[test]
@@ -429,5 +504,106 @@ mod tests {
     #[test]
     fn strip_ident_empty_unchanged() {
         assert_eq!(strip_ident(""), "");
+    }
+
+    // ── Reference extraction tests ────────────────────────────────────────────
+
+    /// `SELECT * FROM users` → one TypeRef reference named `users`, no qualifier.
+    #[test]
+    fn select_from_emits_typeref_reference() {
+        let src = "SELECT * FROM users;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+        let refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected exactly one TypeRef ref named 'users', got: {:?}",
+            facts.references
+        );
+        assert_eq!(
+            refs[0].qualifier, None,
+            "unqualified ref should have no qualifier"
+        );
+    }
+
+    /// `SELECT * FROM app.users` → TypeRef ref named `users`, qualifier `Some("app")`.
+    #[test]
+    fn select_from_schema_qualified_emits_qualifier() {
+        let src = "SELECT * FROM app.users;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+        let refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "expected one TypeRef ref named 'users', got: {:?}",
+            facts.references
+        );
+        assert_eq!(
+            refs[0].qualifier,
+            Some("app".to_owned()),
+            "schema-qualified ref should carry qualifier 'app'"
+        );
+    }
+
+    /// JOIN emits a TypeRef reference for the joined table.
+    #[test]
+    fn join_emits_typeref_reference() {
+        let src = "SELECT * FROM orders JOIN users ON orders.user_id = users.id;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+        let users_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .collect();
+        assert!(
+            !users_refs.is_empty(),
+            "expected at least one TypeRef ref for 'users' (JOIN target), got: {:?}",
+            facts.references
+        );
+    }
+
+    /// Foreign-key REFERENCES clause emits a TypeRef reference for the referenced table.
+    #[test]
+    fn foreign_key_references_emits_typeref() {
+        let src = "CREATE TABLE orders (id INT, user_id INT REFERENCES users(id));";
+        let facts = SqlExtractor.extract(src, "db/schema.sql").unwrap();
+        let fk_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .collect();
+        assert_eq!(
+            fk_refs.len(),
+            1,
+            "expected one TypeRef ref for FK REFERENCES 'users', got: {:?}",
+            facts.references
+        );
+    }
+
+    /// Pure DDL: `CREATE TABLE users (id INT)` alone emits NO TypeRef reference
+    /// for `users` — the definition name is skipped.
+    #[test]
+    fn pure_ddl_no_typeref_for_definition_name() {
+        let src = "CREATE TABLE users (id INT);";
+        let facts = SqlExtractor.extract(src, "db/schema.sql").unwrap();
+        let typeref_users: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .collect();
+        assert!(
+            typeref_users.is_empty(),
+            "pure DDL CREATE TABLE should NOT emit a TypeRef ref for 'users' (it's the definition name), \
+             got: {:?}",
+            typeref_users
+        );
     }
 }

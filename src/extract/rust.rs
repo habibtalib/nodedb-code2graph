@@ -217,7 +217,7 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                     super::simple_type_name(node_text(&trait_node, bytes), "::"),
                     &trait_node,
                     file,
-                    RefRole::Inherit,
+                    RefRole::IsImplementation,
                 );
             }
         }
@@ -232,7 +232,7 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                                 super::simple_type_name(node_text(&child, bytes), "::"),
                                 &child,
                                 file,
-                                RefRole::Inherit,
+                                RefRole::IsImplementation,
                             );
                         }
                         _ => {}
@@ -371,7 +371,7 @@ impl fmt::Display for Point {
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(
@@ -385,7 +385,7 @@ impl fmt::Display for Point {
         let inherit2: Vec<&str> = facts2
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(
@@ -401,7 +401,7 @@ impl fmt::Display for Point {
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(
@@ -427,7 +427,7 @@ impl std::fmt::Display for Point {
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(

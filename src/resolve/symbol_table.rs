@@ -26,7 +26,7 @@ use super::Resolver;
 fn edge_kind(role: RefRole) -> EdgeKind {
     match role {
         RefRole::Call => EdgeKind::Calls,
-        RefRole::Inherit => EdgeKind::Inherits,
+        RefRole::IsImplementation => EdgeKind::Inherits,
         RefRole::Import => EdgeKind::Imports,
     }
 }

@@ -551,7 +551,7 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                                 super::simple_type_name(node_text(&base, bytes), "::"),
                                 &base,
                                 file,
-                                RefRole::Inherit,
+                                RefRole::IsImplementation,
                             );
                         }
                         _ => {}
@@ -701,7 +701,7 @@ void run() {
         let inherit: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(inherit, vec!["Base"], "expected [Base], got {inherit:?}");
@@ -714,7 +714,7 @@ void run() {
         let mut inherit: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         inherit.sort_unstable();
@@ -728,7 +728,7 @@ void run() {
         let inherit: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(inherit, vec!["Base"], "expected [Base], got {inherit:?}");

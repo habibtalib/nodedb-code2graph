@@ -281,12 +281,12 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                             node_text(&child, bytes),
                             &child,
                             file,
-                            RefRole::Inherit,
+                            RefRole::IsImplementation,
                         );
                     }
                     "attribute" => {
                         if let Some(name) = field_text(&child, "attribute", bytes) {
-                            super::push_ref(out, &name, &child, file, RefRole::Inherit);
+                            super::push_ref(out, &name, &child, file, RefRole::IsImplementation);
                         }
                     }
                     _ => {} // subscript (Generic[T]), call, keyword_argument, etc.
@@ -365,7 +365,7 @@ MAX_RETRIES = 3
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(
@@ -382,7 +382,7 @@ MAX_RETRIES = 3
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(
@@ -402,7 +402,7 @@ MAX_RETRIES = 3
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert_eq!(

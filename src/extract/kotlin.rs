@@ -561,7 +561,7 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
                                 super::simple_type_name(node_text(&user_type_node, bytes), "."),
                                 &user_type_node,
                                 file,
-                                RefRole::Inherit,
+                                RefRole::IsImplementation,
                             );
                         }
                     }
@@ -804,7 +804,7 @@ fun main() {
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(
@@ -825,7 +825,7 @@ fun main() {
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(
@@ -842,7 +842,7 @@ fun main() {
         let inherit_names: Vec<&str> = facts
             .references
             .iter()
-            .filter(|r| r.role == RefRole::Inherit)
+            .filter(|r| r.role == RefRole::IsImplementation)
             .map(|r| r.name.as_str())
             .collect();
         assert!(

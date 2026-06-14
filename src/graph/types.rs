@@ -80,14 +80,14 @@ pub struct Symbol {
     pub signature: String,
 }
 
-/// The role a reference plays. `Call`, `Inherit`, and `Import` are live;
+/// The role a reference plays. `Call`, `IsImplementation`, and `Import` are live;
 /// `Read`/`Write` arrive with richer extractors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefRole {
     /// The reference is a call or object-creation site.
     Call,
-    /// The enclosing type extends or implements the referenced type.
-    Inherit,
+    /// The enclosing type extends or implements the referenced type — SCIP `is_implementation`.
+    IsImplementation,
     /// The enclosing module imports the referenced symbol (an `import`/`use`
     /// statement). Its source resolves to the file's module symbol.
     Import,

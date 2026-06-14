@@ -189,6 +189,24 @@ pub(crate) fn push_import_ref(
     });
 }
 
+/// Strip a single layer of surrounding `"` or `` ` `` from a quoted identifier or
+/// string literal. Returns the inner slice. If the text is not wrapped in a matching
+/// pair of those delimiters, returns it unchanged. Does not panic on any input.
+///
+/// Used by SQL (both `"` and `` ` `` are valid identifier quoting) and HCL
+/// (`"` only, but the superset is safe — HCL has no backtick syntax). Config
+/// extractors may reuse this as well.
+pub(crate) fn unquote(text: &str) -> &str {
+    let b = text.as_bytes();
+    if b.len() >= 2 {
+        let (first, last) = (b[0], b[b.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
+            return &text[1..text.len() - 1];
+        }
+    }
+    text
+}
+
 /// Whether `node` has a `static` storage-class specifier among its direct children.
 /// Shared by the C-family extractors (C, C++), whose grammars spell internal linkage
 /// the same way.
@@ -260,6 +278,22 @@ mod tests {
     use crate::extract::Extractor as _;
     use crate::extract::RustExtractor;
     use crate::graph::types::SymbolKind;
+
+    #[test]
+    fn unquote_removes_double_quotes() {
+        assert_eq!(super::unquote(r#""my table""#), "my table");
+    }
+
+    #[test]
+    fn unquote_removes_backticks() {
+        assert_eq!(super::unquote("`my_table`"), "my_table");
+    }
+
+    #[test]
+    fn unquote_bare_and_empty_unchanged() {
+        assert_eq!(super::unquote("users"), "users");
+        assert_eq!(super::unquote(""), "");
+    }
 
     #[test]
     fn emits_module_symbol() {

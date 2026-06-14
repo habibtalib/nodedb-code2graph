@@ -60,20 +60,6 @@ impl Extractor for SqlExtractor {
 
 // ── Symbol extraction ─────────────────────────────────────────────────────────
 
-/// Strip a single layer of surrounding `"` or `` ` `` from a quoted SQL
-/// identifier. Returns the inner slice. If the text is not quoted, returns it
-/// unchanged. Does not panic on malformed input.
-fn strip_ident(text: &str) -> &str {
-    let bytes = text.as_bytes();
-    if bytes.len() >= 2 {
-        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
-        if (first == b'"' && last == b'"') || (first == b'`' && last == b'`') {
-            return &text[1..text.len() - 1];
-        }
-    }
-    text
-}
-
 /// Walk the tree recursively and collect DDL symbols (tables, views, columns).
 ///
 /// SQL has no path-namespace derived from the file path — the optional schema
@@ -109,10 +95,10 @@ fn object_name_and_schema<'a>(
 ) -> Option<(String, Option<String>)> {
     let obj_ref = first_object_reference(node)?;
     let name_node = obj_ref.child_by_field_name("name")?;
-    let name = strip_ident(super::node_text(&name_node, bytes)).to_owned();
+    let name = super::unquote(super::node_text(&name_node, bytes)).to_owned();
     let schema = obj_ref
         .child_by_field_name("schema")
-        .map(|n| strip_ident(super::node_text(&n, bytes)).to_owned());
+        .map(|n| super::unquote(super::node_text(&n, bytes)).to_owned());
     Some((name, schema))
 }
 
@@ -154,7 +140,7 @@ fn extract_table(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
             continue;
         };
         let raw_col = super::node_text(&col_name_node, bytes);
-        let col_name = strip_ident(raw_col).to_owned();
+        let col_name = super::unquote(raw_col).to_owned();
 
         let col_descriptors = build_descriptors(schema.as_deref(), &table_name, Some(&col_name));
         out.push(Symbol {
@@ -255,11 +241,11 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
         if !is_definition_name {
             // Emit a TypeRef reference for this use-site.
             if let Some(name_node) = node.child_by_field_name("name") {
-                let name = strip_ident(super::node_text(&name_node, bytes)).to_owned();
+                let name = super::unquote(super::node_text(&name_node, bytes)).to_owned();
                 if !name.is_empty() {
                     let qualifier = node
                         .child_by_field_name("schema")
-                        .map(|n| strip_ident(super::node_text(&n, bytes)).to_owned());
+                        .map(|n| super::unquote(super::node_text(&n, bytes)).to_owned());
                     out.push(Reference {
                         name,
                         occ: super::node_occurrence(node, file),
@@ -482,28 +468,6 @@ mod tests {
             facts.symbols.iter().any(|s| s.kind == SymbolKind::Module),
             "malformed SQL should still return Ok with the module symbol"
         );
-    }
-
-    // ── strip_ident unit tests ────────────────────────────────────────────────
-
-    #[test]
-    fn strip_ident_removes_double_quotes() {
-        assert_eq!(strip_ident(r#""my table""#), "my table");
-    }
-
-    #[test]
-    fn strip_ident_removes_backticks() {
-        assert_eq!(strip_ident("`my_table`"), "my_table");
-    }
-
-    #[test]
-    fn strip_ident_bare_unchanged() {
-        assert_eq!(strip_ident("users"), "users");
-    }
-
-    #[test]
-    fn strip_ident_empty_unchanged() {
-        assert_eq!(strip_ident(""), "");
     }
 
     // ── Reference extraction tests ────────────────────────────────────────────

@@ -380,20 +380,26 @@ fn collect_imports(
             for child in node.children(&mut node.walk()) {
                 if child.kind() == "scoped_identifier" {
                     // The `name` field is the final leaf (e.g. `Foo` in `com.x.Foo`).
+                    // The `path` field is the package prefix (e.g. `com.x`).
                     if let Some(name_node) = child.child_by_field_name("name") {
                         let name = super::node_text(&name_node, bytes);
-                        super::push_import_ref(out, name, &name_node, file, module_id);
+                        // tree-sitter-java's `scoped_identifier` names the prefix
+                        // field `scope` (Rust calls the analogous field `path`).
+                        let from_path = child
+                            .child_by_field_name("scope")
+                            .map_or("", |n| super::node_text(&n, bytes));
+                        super::push_import_ref(out, name, &name_node, file, module_id, from_path);
                         found = true;
                     }
                     break;
                 }
             }
             if !found {
-                // Bare identifier import: `import Foo;`
+                // Bare identifier import: `import Foo;` — no package prefix.
                 for child in node.children(&mut node.walk()) {
                     if child.kind() == "identifier" {
                         let name = super::node_text(&child, bytes);
-                        super::push_import_ref(out, name, &child, file, module_id);
+                        super::push_import_ref(out, name, &child, file, module_id, "");
                         break;
                     }
                 }
@@ -661,5 +667,25 @@ public class Client {
                 expected_module_id
             );
         }
+    }
+
+    // --- from_path tests ---
+
+    #[test]
+    fn named_import_carries_from_path() {
+        // `import com.example.Service;` → from_path == "com.example"
+        let src = "import com.example.Service;\nclass A {}";
+        let facts = JavaExtractor.extract(src, "src/A.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "Service")
+            .expect("expected Import ref for 'Service'");
+        assert_eq!(
+            r.from_path,
+            Some("com.example".to_owned()),
+            "from_path should be 'com.example', got {:?}",
+            r.from_path
+        );
     }
 }

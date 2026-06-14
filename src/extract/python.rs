@@ -214,9 +214,10 @@ fn const_of<'a>(
 /// the resolver).
 ///
 /// Rules:
-/// - `import_statement`'s `name` field children are the imported names.
-/// - `import_from_statement`'s `name` field children are the *imported symbols*
-///   (not the `module_name` of the from-clause).
+/// - `import_from_statement`'s `module_name` field is the from-path (e.g.
+///   `pkg.models` in `from pkg.models import Config`).
+/// - `import_statement`'s imported names ARE the from-path (e.g. `import os` →
+///   `from_path = "os"`; `import foo.bar` → `from_path = "foo.bar"`).
 /// - For a `dotted_name` child: emit the leaf segment (last `.`-separated part).
 /// - For an `aliased_import` child: emit the leaf of its `name` field (the real
 ///   name), ignoring the `alias` field.
@@ -229,20 +230,51 @@ fn collect_imports(
     module_id: &str,
 ) {
     match node.kind() {
-        "import_statement" | "import_from_statement" => {
+        "import_from_statement" => {
+            // Extract the from-path once from the `module_name` field.
+            let from_path = node
+                .child_by_field_name("module_name")
+                .map_or("", |n| node_text(&n, bytes));
             for child in node.children_by_field_name("name", &mut node.walk()) {
                 match child.kind() {
                     "dotted_name" => {
                         let text = node_text(&child, bytes);
                         let leaf = super::simple_type_name(text, ".");
-                        super::push_import_ref(out, leaf, &child, file, module_id);
+                        super::push_import_ref(out, leaf, &child, file, module_id, from_path);
                     }
                     "aliased_import" => {
                         // Take the real `name` field (a `dotted_name`), ignore `alias`.
                         if let Some(name_node) = child.child_by_field_name("name") {
                             let text = node_text(&name_node, bytes);
                             let leaf = super::simple_type_name(text, ".");
-                            super::push_import_ref(out, leaf, &name_node, file, module_id);
+                            super::push_import_ref(
+                                out, leaf, &name_node, file, module_id, from_path,
+                            );
+                        }
+                    }
+                    // wildcard_import and anything else produce nothing.
+                    _ => {}
+                }
+            }
+        }
+        "import_statement" => {
+            // `import foo.bar` / `import foo.bar as baz` — the from-path is the
+            // full dotted name of the thing being imported (before any alias).
+            for child in node.children_by_field_name("name", &mut node.walk()) {
+                match child.kind() {
+                    "dotted_name" => {
+                        let text = node_text(&child, bytes);
+                        let leaf = super::simple_type_name(text, ".");
+                        // from_path = the full dotted text (e.g. "foo.bar")
+                        super::push_import_ref(out, leaf, &child, file, module_id, text);
+                    }
+                    "aliased_import" => {
+                        // Take the real `name` field (a `dotted_name`), ignore `alias`.
+                        if let Some(name_node) = child.child_by_field_name("name") {
+                            let text = node_text(&name_node, bytes);
+                            let leaf = super::simple_type_name(text, ".");
+                            // from_path = full dotted path before the alias
+                            super::push_import_ref(out, leaf, &name_node, file, module_id, text);
                         }
                     }
                     // wildcard_import and anything else produce nothing.
@@ -561,5 +593,56 @@ MAX_RETRIES = 3
                 r.name
             );
         }
+    }
+
+    // --- from_path tests ---
+
+    #[test]
+    fn import_from_statement_carries_from_path() {
+        // `from pkg.models import Config` → from_path == "pkg.models"
+        let src = "from pkg.models import Config\n";
+        let facts = PythonExtractor.extract(src, "src/app.py").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "Config")
+            .expect("expected Import ref for 'Config'");
+        assert_eq!(
+            r.from_path,
+            Some("pkg.models".to_owned()),
+            "from_path should be 'pkg.models', got {:?}",
+            r.from_path
+        );
+    }
+
+    #[test]
+    fn plain_import_statement_carries_from_path() {
+        // `import os` → from_path == "os"; `import foo.bar` → from_path == "foo.bar"
+        let src = "import os\nimport foo.bar\n";
+        let facts = PythonExtractor.extract(src, "src/mod.py").unwrap();
+
+        let os_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "os")
+            .expect("expected Import ref for 'os'");
+        assert_eq!(
+            os_ref.from_path,
+            Some("os".to_owned()),
+            "from_path for 'import os' should be 'os', got {:?}",
+            os_ref.from_path
+        );
+
+        let bar_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "bar")
+            .expect("expected Import ref for 'bar'");
+        assert_eq!(
+            bar_ref.from_path,
+            Some("foo.bar".to_owned()),
+            "from_path for 'import foo.bar' should be 'foo.bar', got {:?}",
+            bar_ref.from_path
+        );
     }
 }

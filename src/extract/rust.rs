@@ -249,12 +249,17 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
 /// Recursively collect leaf import names from a use-tree node and push an
 /// [`RefRole::Import`] reference for each one.
 ///
+/// `prefix` is the accumulated path prefix from enclosing `scoped_use_list`
+/// nodes (e.g. `"std::collections"` when processing the list in
+/// `use std::collections::{HashMap, BTreeMap}`). It is threaded downward so
+/// bare `identifier` leaves inside a `use_list` can report their `from_path`.
+///
 /// The leaf is always the concrete identifier being imported:
-/// - `identifier`         → its own text.
-/// - `scoped_identifier`  → the `name` field (final segment after `::`.
-/// - `use_as_clause`      → recurse into the `path` field (alias is ignored).
-/// - `scoped_use_list`    → recurse into the `list` field.
-/// - `use_list`           → recurse into every named child.
+/// - `identifier`         → `from_path = prefix` (the received prefix).
+/// - `scoped_identifier`  → `from_path` = its own `path` field (authoritative).
+/// - `use_as_clause`      → recurse into the `path` field (alias ignored), passing `prefix` through.
+/// - `scoped_use_list`    → compute `new_prefix` from the node's `path` field, then recurse into `list`.
+/// - `use_list`           → recurse each named child, passing `prefix` through.
 /// - `use_wildcard` / `crate` / `self` / `super` / anything else → skip.
 fn collect_use_leaves(
     node: &Node,
@@ -262,12 +267,25 @@ fn collect_use_leaves(
     file: &str,
     out: &mut Vec<Reference>,
     module_id: &str,
+    prefix: &str,
 ) {
     match node.kind() {
         "identifier" => {
-            super::push_import_ref(out, super::node_text(node, bytes), node, file, module_id);
+            // Bare leaf inside a use_list — from_path is the enclosing prefix.
+            super::push_import_ref(
+                out,
+                super::node_text(node, bytes),
+                node,
+                file,
+                module_id,
+                prefix,
+            );
         }
         "scoped_identifier" => {
+            // The node's `path` field is the authoritative from-path.
+            let from_path = node
+                .child_by_field_name("path")
+                .map_or("", |n| super::node_text(&n, bytes));
             if let Some(name_node) = node.child_by_field_name("name") {
                 super::push_import_ref(
                     out,
@@ -275,22 +293,30 @@ fn collect_use_leaves(
                     &name_node,
                     file,
                     module_id,
+                    from_path,
                 );
             }
         }
         "use_as_clause" => {
+            // Alias is ignored; recurse into the path child, passing prefix through.
             if let Some(path_node) = node.child_by_field_name("path") {
-                collect_use_leaves(&path_node, bytes, file, out, module_id);
+                collect_use_leaves(&path_node, bytes, file, out, module_id, prefix);
             }
         }
         "scoped_use_list" => {
+            // Compute a fresh prefix from this node's `path` field, then recurse
+            // into the list with that prefix so bare identifiers inside the list
+            // can report the correct from_path.
+            let new_prefix = node
+                .child_by_field_name("path")
+                .map_or("", |n| super::node_text(&n, bytes));
             if let Some(list_node) = node.child_by_field_name("list") {
-                collect_use_leaves(&list_node, bytes, file, out, module_id);
+                collect_use_leaves(&list_node, bytes, file, out, module_id, new_prefix);
             }
         }
         "use_list" => {
             for child in node.named_children(&mut node.walk()) {
-                collect_use_leaves(&child, bytes, file, out, module_id);
+                collect_use_leaves(&child, bytes, file, out, module_id, prefix);
             }
         }
         // use_wildcard, crate, self, super, metavariable → skip
@@ -310,7 +336,7 @@ fn collect_imports(
 ) {
     if node.kind() == "use_declaration" {
         if let Some(arg) = node.child_by_field_name("argument") {
-            collect_use_leaves(&arg, bytes, file, out, module_id);
+            collect_use_leaves(&arg, bytes, file, out, module_id, "");
         }
         // No need to recurse further inside a use_declaration.
         return;
@@ -558,6 +584,54 @@ impl std::fmt::Display for Point {
                 "Import ref '{}' should carry source_module = {:?}",
                 r.name,
                 expected_module_id
+            );
+        }
+    }
+
+    // --- from_path tests ---
+
+    #[test]
+    fn import_scoped_identifier_carries_from_path() {
+        // `use std::io::Result;` → from_path == "std::io"
+        let src = "use std::io::Result;";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "Result")
+            .expect("expected Import ref for 'Result'");
+        assert_eq!(
+            r.from_path,
+            Some("std::io".to_owned()),
+            "from_path should be 'std::io', got {:?}",
+            r.from_path
+        );
+    }
+
+    #[test]
+    fn import_use_list_leaves_carry_prefix_as_from_path() {
+        // `use std::collections::{HashMap, BTreeMap};`
+        // Both leaf refs must have from_path == "std::collections".
+        let src = "use std::collections::{HashMap, BTreeMap};";
+        let facts = RustExtractor.extract(src, "src/lib.rs").unwrap();
+        let import_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .collect();
+        assert_eq!(
+            import_refs.len(),
+            2,
+            "expected 2 Import refs, got {:?}",
+            import_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        for r in &import_refs {
+            assert_eq!(
+                r.from_path,
+                Some("std::collections".to_owned()),
+                "from_path for '{}' should be 'std::collections', got {:?}",
+                r.name,
+                r.from_path
             );
         }
     }

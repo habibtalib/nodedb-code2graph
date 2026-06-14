@@ -150,12 +150,14 @@ pub(crate) fn push_ref(
         occ: node_occurrence(node, file),
         role,
         source_module: None,
+        from_path: None,
     });
 }
 
 /// Push an [`RefRole::Import`] [`Reference`] for `name` at `node`'s position,
 /// carrying `module_id` as the SCIP identity of the importing file's module
-/// symbol.
+/// symbol, and `from_path` as the raw module path string written in the source
+/// (e.g. `"std::io"`, `"./svc"`, `"pkg.models"`).
 ///
 /// Like [`push_ref`] but sets `source_module: Some(module_id)` and hard-codes
 /// `role: RefRole::Import`. Empty names are skipped.
@@ -165,6 +167,7 @@ pub(crate) fn push_import_ref(
     node: &Node,
     file: &str,
     module_id: &str,
+    from_path: &str,
 ) {
     if name.is_empty() {
         return;
@@ -174,6 +177,11 @@ pub(crate) fn push_import_ref(
         occ: node_occurrence(node, file),
         role: RefRole::Import,
         source_module: Some(module_id.to_owned()),
+        from_path: if from_path.is_empty() {
+            None
+        } else {
+            Some(from_path.to_owned())
+        },
     });
 }
 
@@ -223,6 +231,7 @@ pub(crate) fn collect_call_references(
                 occ: node_occurrence(&cap.node, file),
                 role: RefRole::Call,
                 source_module: None,
+                from_path: None,
             });
         }
     }

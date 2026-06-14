@@ -106,6 +106,10 @@ pub struct Reference {
     /// For [`RefRole::Import`] references: the SCIP identity string of the
     /// importing file's module symbol. `None` for all other reference roles.
     pub source_module: Option<String>,
+    /// For [`RefRole::Import`] references: the module path the symbol is imported
+    /// from, as written in the source (e.g. `"pkg.models"`, `"std::io"`,
+    /// `"./svc"`). `None` for non-import refs or when unavailable.
+    pub from_path: Option<String>,
 }
 
 /// How confident the resolver is in an [`Edge`] — the precision marker that lets

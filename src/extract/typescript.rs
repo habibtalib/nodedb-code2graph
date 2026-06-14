@@ -328,6 +328,16 @@ fn collect_imports(
     module_id: &str,
 ) {
     if node.kind() == "import_statement" {
+        // Extract the from-path once from the `source` field (a string literal).
+        // The raw text includes surrounding quotes; strip both styles.
+        let from_path = node
+            .child_by_field_name("source")
+            .map(|n| {
+                let raw = super::node_text(&n, bytes);
+                raw.trim_matches('"').trim_matches('\'').to_owned()
+            })
+            .unwrap_or_default();
+
         // Locate the `import_clause` child (may be absent for bare `import "x"`).
         if let Some(clause) = node
             .children(&mut node.walk())
@@ -343,6 +353,7 @@ fn collect_imports(
                             &child,
                             file,
                             module_id,
+                            &from_path,
                         );
                     }
                     // Named imports: `import { A, B as C } from "x"`
@@ -360,6 +371,7 @@ fn collect_imports(
                                         &name_node,
                                         file,
                                         module_id,
+                                        &from_path,
                                     );
                                 }
                                 // string-named imports (exotic) → skip silently
@@ -643,5 +655,25 @@ function internal() {}
                 expected_module_id
             );
         }
+    }
+
+    // --- from_path tests ---
+
+    #[test]
+    fn ts_named_import_carries_from_path() {
+        // `import { Service } from "./svc";` → from_path == "./svc" (quotes stripped)
+        let src = r#"import { Service } from "./svc";"#;
+        let facts = TypeScriptExtractor.extract(src, "src/client.ts").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "Service")
+            .expect("expected Import ref for 'Service'");
+        assert_eq!(
+            r.from_path,
+            Some("./svc".to_owned()),
+            "from_path should be './svc', got {:?}",
+            r.from_path
+        );
     }
 }

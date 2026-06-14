@@ -10,7 +10,7 @@ use crate::lang::Language;
 use super::{
     CExtractor, CppExtractor, GoExtractor, JavaExtractor, JavaScriptExtractor, KotlinExtractor,
     PhpExtractor, PythonExtractor, RubyExtractor, RustExtractor, ShellExtractor, SolidityExtractor,
-    SwiftExtractor, TypeScriptExtractor,
+    SqlExtractor, SwiftExtractor, TypeScriptExtractor,
 };
 
 /// A per-language source-to-facts extractor.
@@ -42,6 +42,7 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Swift => SwiftExtractor.extract(source, file),
         Language::Kotlin => KotlinExtractor.extract(source, file),
         Language::Solidity => SolidityExtractor.extract(source, file),
+        Language::Sql => SqlExtractor.extract(source, file),
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
     }
 }

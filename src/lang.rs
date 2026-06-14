@@ -22,6 +22,7 @@ pub enum Language {
     Swift,      // .swift
     Kotlin,     // .kt, .kts
     Solidity,   // .sol
+    Sql,        // .sql
 }
 
 impl Language {
@@ -42,6 +43,7 @@ impl Language {
             Language::Swift => "swift",
             Language::Kotlin => "kotlin",
             Language::Solidity => "solidity",
+            Language::Sql => "sql",
         }
     }
 
@@ -62,6 +64,7 @@ impl Language {
             "swift" => Some(Self::Swift),
             "kt" | "kts" => Some(Self::Kotlin),
             "sol" => Some(Self::Solidity),
+            "sql" => Some(Self::Sql),
             _ => None,
         }
     }

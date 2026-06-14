@@ -57,6 +57,12 @@ pub enum SymbolKind {
     Static,
     Module,
     Impl,
+    /// A SQL table definition (`CREATE TABLE`).
+    Table,
+    /// A SQL view definition (`CREATE VIEW`).
+    View,
+    /// A SQL column (a member of a table/view).
+    Column,
     /// Escape hatch while the taxonomy settles.
     Other,
 }

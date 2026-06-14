@@ -1,0 +1,4 @@
+# Tier-A breadth: a cross-file call in a language without scope extraction.
+# Tier-A resolves on the unique global candidate; Tier-B emits nothing because
+# Python has no scope/binding facts yet (recall-first fallback territory).
+main.py:2 Call util.py:1

@@ -1,0 +1,4 @@
+# The differentiator no neutral library ships: a code->artifact edge. A Rust
+# field typed `users` references the SQL table `users` of the same SCIP identity,
+# so the cross-artifact edge falls out of the language-blind resolver for free.
+model.rs:2 TypeRef schema.sql:1

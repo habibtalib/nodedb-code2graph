@@ -1,3 +1,6 @@
+[workspace]
+members = ["eval"]
+
 [package]
 name = "codegraph"
 version = "0.0.0"

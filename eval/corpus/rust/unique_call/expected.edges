@@ -1,0 +1,4 @@
+# Unambiguous cross-file call: a single same-named definition exists, so the
+# call binds to exactly one target. Tier-A resolves it on the unique global
+# candidate; Tier-B needs no edge here (no in-scope binding for the name).
+main.rs:2 Call util.rs:1

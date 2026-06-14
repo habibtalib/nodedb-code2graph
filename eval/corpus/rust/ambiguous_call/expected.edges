@@ -1,0 +1,7 @@
+# Two same-named `helper` definitions exist (alpha, beta); the import fixes
+# which one the call means. Ground truth binds both the import and the call to
+# `alpha` only. This is the fan-out demonstrator: a name-only resolver also
+# emits the spurious call->beta edge (a false positive), while a scope-aware
+# resolver follows the import binding to alpha alone.
+main.rs:1 Import alpha.rs:1
+main.rs:4 Call alpha.rs:1

@@ -75,6 +75,8 @@ impl Extractor for CExtractor {
             lang: Language::C.as_str().to_owned(),
             symbols,
             references,
+            scopes: Vec::new(),
+            bindings: Vec::new(),
         })
     }
 }

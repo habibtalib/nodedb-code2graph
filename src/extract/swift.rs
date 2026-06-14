@@ -99,6 +99,8 @@ impl Extractor for SwiftExtractor {
             lang: Language::Swift.as_str().to_owned(),
             symbols,
             references,
+            scopes: Vec::new(),
+            bindings: Vec::new(),
         })
     }
 }

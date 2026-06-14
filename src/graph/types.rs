@@ -110,7 +110,87 @@ pub struct Reference {
     /// from, as written in the source (e.g. `"pkg.models"`, `"std::io"`,
     /// `"./svc"`). `None` for non-import refs or when unavailable.
     pub from_path: Option<String>,
+    /// The innermost scope enclosing this reference site; `None` until a
+    /// scope-aware extractor populates it.
+    pub scope: Option<ScopeId>,
 }
+
+// ── Scope / binding data model ──────────────────────────────────────────────
+
+/// Index into a file's [`FileFacts::scopes`] vector. Stable within one file's facts.
+pub type ScopeId = usize;
+
+/// What kind of lexical name-resolution region a scope is. Cross-language
+/// superset; not every variant applies to every language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScopeKind {
+    /// A file-level or explicit module/namespace scope.
+    Module,
+    /// A function or method body scope.
+    Function,
+    /// A generic block scope (e.g. `if`/`for`/`{…}` bodies).
+    Block,
+    /// A type body scope (class, struct, enum, trait, interface, …).
+    Type,
+    /// Escape hatch while the taxonomy settles.
+    Other,
+}
+
+/// A lexical scope: a nested name-resolution region within one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    /// The enclosing scope, or `None` for the file/module root scope.
+    pub parent: Option<ScopeId>,
+    /// Source range this scope governs.
+    pub span: ByteSpan,
+    /// What kind of lexical region this scope represents.
+    pub kind: ScopeKind,
+}
+
+/// What kind of binding a name introduces — drives lexical visibility rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingKind {
+    /// A local variable introduced by a `let`/`var`/assignment.
+    Local,
+    /// A function or method parameter.
+    Param,
+    /// A name brought into scope via an `import`/`use`/`require` statement.
+    Import,
+    /// A top-level definition (function, class, constant, …) participating in
+    /// lexical lookup.
+    Definition,
+}
+
+/// What a binding resolves to — the target of a name introduced by a [`Binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingTarget {
+    /// File-local binding (parameter or `let`/`var`) — no global [`Symbol`].
+    Local,
+    /// An import: the module path as written in source (mirrors
+    /// [`Reference::from_path`]).
+    Import(String),
+    /// Points at an extracted top-level [`Symbol`]'s SCIP identity.
+    Def(SymbolId),
+}
+
+/// A name introduced into a scope — a parameter, local variable, import alias,
+/// or a top-level definition that participates in lexical lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    /// The scope in which this name is introduced.
+    pub scope: ScopeId,
+    /// The bare identifier as written at the introduction site.
+    pub name: String,
+    /// Byte offset where the binding becomes visible (used to enforce
+    /// declaration-order and detect shadowing).
+    pub intro: usize,
+    /// What kind of binding this is.
+    pub kind: BindingKind,
+    /// What the binding resolves to.
+    pub target: BindingTarget,
+}
+
+// ── Confidence / Edge ────────────────────────────────────────────────────────
 
 /// How confident the resolver is in an [`Edge`] — the precision marker that lets
 /// consumers (e.g. a quality analyzer) gate on resolution quality.
@@ -143,10 +223,20 @@ pub struct Edge {
 /// The neutral facts extracted from a single file (extractor output, resolver input).
 #[derive(Debug, Clone)]
 pub struct FileFacts {
+    /// File path relative to the project root.
     pub file: String,
+    /// Language tag (see [`crate::lang::Language::as_str`]).
     pub lang: String,
+    /// Top-level symbol definitions found in this file.
     pub symbols: Vec<Symbol>,
+    /// Reference (use) sites found in this file.
     pub references: Vec<Reference>,
+    /// Lexical scopes discovered in this file; indexed by [`ScopeId`].
+    /// Empty until a scope-aware extractor populates it.
+    pub scopes: Vec<Scope>,
+    /// Name bindings discovered in this file. Empty until a scope-aware
+    /// extractor populates it.
+    pub bindings: Vec<Binding>,
 }
 
 /// The resolved whole-project graph: definitions plus cross-file edges.

@@ -69,6 +69,8 @@ impl Extractor for RustExtractor {
             lang: Language::Rust.as_str().to_owned(),
             symbols,
             references,
+            scopes: Vec::new(),
+            bindings: Vec::new(),
         })
     }
 }

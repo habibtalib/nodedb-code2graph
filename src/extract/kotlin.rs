@@ -103,6 +103,8 @@ impl Extractor for KotlinExtractor {
             lang: Language::Kotlin.as_str().to_owned(),
             symbols,
             references,
+            scopes: Vec::new(),
+            bindings: Vec::new(),
         })
     }
 }

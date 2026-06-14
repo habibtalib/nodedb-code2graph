@@ -151,6 +151,7 @@ pub(crate) fn push_ref(
         role,
         source_module: None,
         from_path: None,
+        scope: None,
     });
 }
 
@@ -182,6 +183,7 @@ pub(crate) fn push_import_ref(
         } else {
             Some(from_path.to_owned())
         },
+        scope: None,
     });
 }
 
@@ -232,6 +234,7 @@ pub(crate) fn collect_call_references(
                 role: RefRole::Call,
                 source_module: None,
                 from_path: None,
+                scope: None,
             });
         }
     }

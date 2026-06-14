@@ -5,6 +5,6 @@
 pub mod types;
 
 pub use types::{
-    ByteSpan, CodeGraph, Confidence, Edge, FileFacts, Occurrence, RefRole, Reference, Symbol,
-    SymbolKind,
+    Binding, BindingKind, BindingTarget, ByteSpan, CodeGraph, Confidence, Edge, FileFacts,
+    Occurrence, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
 };

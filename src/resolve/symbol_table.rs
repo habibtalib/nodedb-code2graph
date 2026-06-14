@@ -705,6 +705,137 @@ mod tests {
         assert_eq!(e.occ.file, "src/app.rs");
     }
 
+    // ── HCL cross-artifact resolution tests ──────────────────────────────────
+
+    /// Intra-HCL: `resource "aws_subnet" "main" {}` defined in the same file as
+    /// `resource "aws_instance" "web" { subnet_id = aws_subnet.main.id }`.
+    /// The traversal emits a TypeRef ref (name `main`, qualifier `aws_subnet`).
+    /// With `aws_subnet/main#` as the sole global candidate for name `main`,
+    /// Win-1 fires → Confidence::Scoped.
+    #[test]
+    fn intra_hcl_typeref_edge_from_instance_to_subnet() {
+        use crate::extract::HclExtractor;
+
+        // One file defines both resources.
+        let hcl = HclExtractor
+            .extract(
+                r#"
+resource "aws_subnet" "main" {}
+resource "aws_instance" "web" { subnet_id = aws_subnet.main.id }
+"#,
+                // File stem deliberately NOT "main": the per-file module symbol is
+                // named after the file stem and would otherwise collide in `by_name`
+                // with the `aws_subnet."main"` resource (honest NameOnly fan-out).
+                "infra/network.tf",
+            )
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[hcl]);
+
+        // Expect exactly one TypeRef edge whose `to` ends with `aws_subnet/main#`.
+        let typeref_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("aws_subnet/main#")
+            })
+            .collect();
+
+        assert_eq!(
+            typeref_edges.len(),
+            1,
+            "expected one intra-HCL TypeRef edge to 'aws_subnet/main#', got {:?}: {:?}",
+            typeref_edges.len(),
+            graph
+                .edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = typeref_edges[0];
+        // `main` is the only global candidate → Win-1 → Scoped.
+        assert_eq!(
+            e.confidence,
+            Confidence::Scoped,
+            "unique subnet candidate should be Scoped (Win-1), got {:?}",
+            e.confidence
+        );
+        // `from` should be the aws_instance/web symbol.
+        assert!(
+            e.from.to_scip_string().ends_with("aws_instance/web#"),
+            "edge `from` should be 'aws_instance/web#', got: {}",
+            e.from.to_scip_string()
+        );
+        assert_eq!(e.occ.file, "infra/network.tf");
+    }
+
+    /// Intra-HCL: `module "vpc" {}` defined alongside
+    /// `resource "aws_instance" "web" { x = module.vpc.id }`.
+    /// Traversal → name `vpc`, qualifier `module`; `module/vpc#` is the sole
+    /// candidate → Win-1 → Scoped.
+    #[test]
+    fn intra_hcl_typeref_edge_from_resource_to_module() {
+        use crate::extract::HclExtractor;
+
+        let hcl = HclExtractor
+            .extract(
+                r#"
+module "vpc" { source = "./vpc" }
+resource "aws_instance" "web" { vpc_id = module.vpc.id }
+"#,
+                "infra/main.tf",
+            )
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[hcl]);
+
+        let typeref_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.role == RefRole::TypeRef && e.to.to_scip_string().ends_with("module/vpc#")
+            })
+            .collect();
+
+        assert_eq!(
+            typeref_edges.len(),
+            1,
+            "expected one TypeRef edge to 'module/vpc#', got {:?}: {:?}",
+            typeref_edges.len(),
+            graph
+                .edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?}/{:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.role,
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        let e = typeref_edges[0];
+        assert_eq!(
+            e.confidence,
+            Confidence::Scoped,
+            "unique module/vpc candidate should be Scoped (Win-1), got {:?}",
+            e.confidence
+        );
+        assert!(
+            e.from.to_scip_string().ends_with("aws_instance/web#"),
+            "edge `from` should be 'aws_instance/web#', got: {}",
+            e.from.to_scip_string()
+        );
+    }
+
     /// Regression: single-candidate import (Win-1) remains Scoped with Win-2 in place.
     #[test]
     fn import_disambiguation_single_candidate_stays_scoped() {

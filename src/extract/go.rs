@@ -18,7 +18,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -26,7 +26,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, simple_type_name,
+    push_binding, push_ref, push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -77,6 +77,7 @@ impl Extractor for GoExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Go, bytes, file)?;
         collect_imports(&root, bytes, file, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -412,6 +413,151 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: TypeRef ───────────────────────────────────────────────────
+
+/// Recursively walk a Go type node and emit leaf `type_identifier` nodes.
+///
+/// Go type grammar rules handled:
+/// - `type_identifier` → leaf; emit with `ctx`.
+/// - `qualified_type` (`pkg.Type`) → field `name` is a `type_identifier`; emit
+///   that leaf (the package qualifier is skipped for v1).
+/// - `pointer_type` (`*T`) → field `type` is the pointee; recurse with `ctx`.
+/// - `slice_type` (`[]T`) → field `element` is the element; recurse with `ctx`.
+/// - `array_type` (`[N]T`) → field `element` is the element; recurse with `ctx`.
+/// - `map_type` → fields `key` and `value`; recurse both with `ctx`.
+/// - `generic_type` → field `type` is the base `type_identifier` (ctx as given);
+///   field `type_arguments` children each recurse with `GenericArg`.
+/// - `channel_type` / `interface_type` / `struct_type` and any other container:
+///   recurse all named children (catches inline struct/interface annotations).
+///
+/// Builtin primitives (`int`, `string`, `bool`, …) are `type_identifier` nodes
+/// too — emitting them is harmless since they won't resolve to a definition.
+fn type_leaf(node: &Node, bytes: &[u8], file: &str, ctx: TypeRefContext, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, bytes);
+            push_type_ref(out, name, node, file, ctx);
+        }
+        "qualified_type" => {
+            // `pkg.Type` — the `name:` field is the leaf `type_identifier`.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                type_leaf(&name_node, bytes, file, ctx, out);
+            }
+        }
+        "pointer_type" => {
+            // `*T` — the pointee is an unnamed-field child; recurse named children.
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        "slice_type" => {
+            // `[]T` — the element is the `element:` field.
+            if let Some(elem) = node.child_by_field_name("element") {
+                type_leaf(&elem, bytes, file, ctx, out);
+            }
+        }
+        "array_type" => {
+            // `[N]T` — the element is the `element:` field.
+            if let Some(elem) = node.child_by_field_name("element") {
+                type_leaf(&elem, bytes, file, ctx, out);
+            }
+        }
+        "map_type" => {
+            // `map[K]V` — recurse key and value.
+            if let Some(key) = node.child_by_field_name("key") {
+                type_leaf(&key, bytes, file, ctx, out);
+            }
+            if let Some(val) = node.child_by_field_name("value") {
+                type_leaf(&val, bytes, file, ctx, out);
+            }
+        }
+        "generic_type" => {
+            // `Type[T1, T2]` — base type gets outer ctx; arguments get GenericArg.
+            if let Some(base) = node.child_by_field_name("type") {
+                type_leaf(&base, bytes, file, ctx, out);
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                for child in args.named_children(&mut args.walk()) {
+                    type_leaf(&child, bytes, file, TypeRefContext::GenericArg, out);
+                }
+            }
+        }
+        "channel_type" => {
+            // `chan T` or `<-chan T` or `chan<- T`.
+            if let Some(val) = node.child_by_field_name("value") {
+                type_leaf(&val, bytes, file, ctx, out);
+            }
+        }
+        // Parenthesised / function / interface / struct types:
+        // recurse all named children so inline annotations are covered.
+        _ => {
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// type identifier that appears in an annotation position.
+///
+/// Covered positions (tree-sitter-go grammar):
+/// - `parameter_declaration` / `variadic_parameter_declaration` `type:` field
+///   → [`TypeRefContext::ParameterType`]
+/// - `function_declaration` / `method_declaration` `result:` field (single type
+///   or `parameter_list` of return types) → [`TypeRefContext::ReturnType`]
+/// - `field_declaration` (inside a `struct_type`) `type:` field
+///   → [`TypeRefContext::Field`]
+///
+/// Generic type arguments are handled recursively inside [`type_leaf`] with
+/// [`TypeRefContext::GenericArg`].
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "parameter_declaration" | "variadic_parameter_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+            // No further recursion needed — parameters don't nest.
+            return;
+        }
+        "function_declaration" | "method_declaration" => {
+            // Return type(s) live in the `result:` field.
+            if let Some(result) = node.child_by_field_name("result") {
+                if result.kind() == "parameter_list" {
+                    // Multiple return types: `func f() (Config, error)`
+                    for child in result.named_children(&mut result.walk()) {
+                        // Each child is a `parameter_declaration` (with or without
+                        // a name) or a bare type node.
+                        if child.kind() == "parameter_declaration" {
+                            if let Some(t) = child.child_by_field_name("type") {
+                                type_leaf(&t, bytes, file, TypeRefContext::ReturnType, out);
+                            }
+                        } else {
+                            // Unnamed return: the child IS the type node.
+                            type_leaf(&child, bytes, file, TypeRefContext::ReturnType, out);
+                        }
+                    }
+                } else {
+                    // Single return type: `func f() Config`
+                    type_leaf(&result, bytes, file, TypeRefContext::ReturnType, out);
+                }
+            }
+            // Fall through to recurse into body / parameters.
+        }
+        "field_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
     }
 }
 
@@ -1068,6 +1214,106 @@ func main() {
         assert!(
             read_refs.is_empty(),
             "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    // ── TypeRef tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn type_ref_param_type() {
+        // `func f(c Config) {}` → TypeRef "Config" ctx ParameterType.
+        let src = "package p\nfunc f(c Config) {}\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let found = facts
+            .references
+            .iter()
+            .find(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::ParameterType)
+            })
+            .is_some();
+        assert!(
+            found,
+            "expected TypeRef 'Config' with ParameterType context"
+        );
+    }
+
+    #[test]
+    fn type_ref_pointer_param_type() {
+        // `func f(c *Config) {}` → TypeRef "Config" ParameterType (pointer unwrapped).
+        let src = "package p\nfunc f(c *Config) {}\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let found = facts
+            .references
+            .iter()
+            .find(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::ParameterType)
+            })
+            .is_some();
+        assert!(
+            found,
+            "expected TypeRef 'Config' with ParameterType from pointer param; refs: {:?}",
+            facts
+                .references
+                .iter()
+                .filter(|r| r.role == RefRole::TypeRef)
+                .map(|r| (&r.name, r.type_ref_ctx))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn type_ref_return_type() {
+        // `func f() Config { return Config{} }` → TypeRef "Config" ctx ReturnType.
+        let src = "package p\nfunc f() Config { return Config{} }\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let found = facts
+            .references
+            .iter()
+            .find(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::ReturnType)
+            })
+            .is_some();
+        assert!(
+            found,
+            "expected TypeRef 'Config' with ReturnType context; refs: {:?}",
+            facts
+                .references
+                .iter()
+                .filter(|r| r.role == RefRole::TypeRef)
+                .map(|r| (&r.name, r.type_ref_ctx))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn type_ref_struct_field_type() {
+        // `type T struct { conf Config }` → TypeRef "Config" ctx Field.
+        let src = "package p\ntype T struct { conf Config }\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let found = facts
+            .references
+            .iter()
+            .find(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::Field)
+            })
+            .is_some();
+        assert!(
+            found,
+            "expected TypeRef 'Config' with Field context; refs: {:?}",
+            facts
+                .references
+                .iter()
+                .filter(|r| r.role == RefRole::TypeRef)
+                .map(|r| (&r.name, r.type_ref_ctx))
+                .collect::<Vec<_>>()
         );
     }
 

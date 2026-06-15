@@ -19,7 +19,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -27,7 +27,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope,
+    push_ref, push_scope, push_type_ref,
 };
 
 // NOTE: SymbolKind has no Union variant; unions map to Struct. Preprocessor
@@ -85,6 +85,7 @@ impl Extractor for CppExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -897,6 +898,155 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
 }
 
+// ── Edge richness: TypeRef ───────────────────────────────────────────────────
+
+/// Emit a single [`RefRole::TypeRef`] for a type node, given the outer context.
+///
+/// Handles `type_identifier`, `template_type`, and `qualified_identifier` leaves.
+/// For `template_type`: emits the base name (with the given `ctx`), then recurses
+/// into `type_arguments` / `template_argument_list` children with `GenericArg`.
+/// Skips `primitive_type`, `sized_type_specifier`, and
+/// `placeholder_type_specifier` (auto) — these are C++ built-ins.
+fn emit_cpp_type_node(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    ctx: TypeRefContext,
+    out: &mut Vec<Reference>,
+) {
+    match node.kind() {
+        // Skip primitives and auto — not user-defined types.
+        "primitive_type" | "sized_type_specifier" | "placeholder_type_specifier" => {}
+
+        "type_identifier" => {
+            let name = node_text(node, bytes);
+            push_type_ref(out, name, node, file, ctx);
+        }
+
+        "qualified_identifier" => {
+            // Recurse into the final `name:` segment so a templated tail like
+            // `std::vector<Config>` yields base `vector` + GenericArg `Config`,
+            // rather than text-splitting to `vector<Config>`. Fall back to the
+            // last `::` text segment only when there is no structured name field.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                emit_cpp_type_node(&name_node, bytes, file, ctx, out);
+            } else {
+                let text = node_text(node, bytes);
+                let leaf = text.rsplit("::").next().unwrap_or(text);
+                if !leaf.is_empty() {
+                    push_type_ref(out, leaf, node, file, ctx);
+                }
+            }
+        }
+
+        "template_type" => {
+            // Base name: the `name` field is a `type_identifier` or
+            // `qualified_identifier` identifying the template itself.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                // Use type_leaf_name to strip any inner qualification.
+                if let Some(leaf) = type_leaf_name(&name_node, bytes) {
+                    push_type_ref(out, &leaf, &name_node, file, ctx);
+                }
+            }
+            // Type arguments: `template_argument_list` contains the generic args.
+            // tree-sitter-cpp names this field "arguments" with kind
+            // "template_argument_list". Walk all named children that are type nodes.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "template_argument_list" {
+                    for arg in child.children(&mut child.walk()) {
+                        // type arguments appear as `type_descriptor` children which
+                        // hold a `type:` field, or directly as type nodes.
+                        match arg.kind() {
+                            "type_descriptor" => {
+                                if let Some(t) = arg.child_by_field_name("type") {
+                                    emit_cpp_type_node(
+                                        &t,
+                                        bytes,
+                                        file,
+                                        TypeRefContext::GenericArg,
+                                        out,
+                                    );
+                                }
+                            }
+                            "type_identifier" | "qualified_identifier" | "template_type" => {
+                                emit_cpp_type_node(
+                                    &arg,
+                                    bytes,
+                                    file,
+                                    TypeRefContext::GenericArg,
+                                    out,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        _ => {}
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for
+/// user-defined type names in annotation positions.
+///
+/// Covered positions (tree-sitter-cpp grammar):
+/// - `parameter_declaration` / `optional_parameter_declaration` `type:` field
+///   → [`TypeRefContext::ParameterType`]
+/// - `function_definition` `type:` field (return type)
+///   → [`TypeRefContext::ReturnType`]
+/// - `field_declaration` (inside `field_declaration_list`) `type:` field
+///   → [`TypeRefContext::Field`]
+/// - `template_type` → base name with outer context + recurse args with
+///   [`TypeRefContext::GenericArg`]
+///
+/// Skips `primitive_type`, `sized_type_specifier`, and `placeholder_type_specifier`.
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Parameter types: `void f(Config c)` — the `type:` field of the parameter node.
+        "parameter_declaration" | "optional_parameter_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                emit_cpp_type_node(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+            // Recurse into children (e.g. default value expressions).
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return;
+        }
+
+        // Return types: `Config make() { ... }` — the `type:` field of function_definition.
+        "function_definition" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                emit_cpp_type_node(&type_node, bytes, file, TypeRefContext::ReturnType, out);
+            }
+            // Recurse into the declarator and body so nested functions are covered.
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return;
+        }
+
+        // Field types: `struct T { Config conf; };` — `type:` field of field_declaration.
+        "field_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                emit_cpp_type_node(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return;
+        }
+
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
+}
+
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `class_specifier` and `struct_specifier` in the tree (including nested
 /// classes and those inside namespace blocks).
@@ -1478,6 +1628,115 @@ void run() {
         assert!(
             field_reads.is_empty(),
             "field_identifier 'field' must NOT be a Read ref; got: {field_reads:?}"
+        );
+    }
+
+    // ── TypeRef tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn type_ref_param_type() {
+        // `void f(Config c) {}` → TypeRef "Config" ctx ParameterType.
+        let src = "void f(Config c) {}\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn type_ref_return_type() {
+        // `Config make() { return Config(); }` → TypeRef "Config" ctx ReturnType.
+        let src = "Config make() { return Config(); }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn type_ref_field_type() {
+        // `struct T { Config conf; };` → TypeRef "Config" ctx Field.
+        let src = "struct T { Config conf; };\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn type_ref_template_arg() {
+        // `void f(std::vector<Config> xs) {}`
+        // → TypeRef "vector" (ParameterType) + TypeRef "Config" (GenericArg).
+        let src = "void f(std::vector<Config> xs) {}\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let type_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef)
+            .collect();
+        // "vector" comes from the template_type base (qualified_identifier leaf).
+        let vector_ref = type_refs.iter().find(|r| r.name == "vector");
+        assert!(
+            vector_ref.is_some(),
+            "expected TypeRef 'vector', got: {:?}",
+            type_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vector_ref.unwrap().type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx for 'vector'"
+        );
+        // "Config" comes from the template_argument_list (GenericArg).
+        let config_ref = type_refs.iter().find(|r| r.name == "Config");
+        assert!(
+            config_ref.is_some(),
+            "expected TypeRef 'Config', got: {:?}",
+            type_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            config_ref.unwrap().type_ref_ctx,
+            Some(TypeRefContext::GenericArg),
+            "expected GenericArg ctx for 'Config'"
+        );
+    }
+
+    #[test]
+    fn type_ref_primitive_skipped() {
+        // `void f(int n) {}` → NO TypeRef "int".
+        let src = "void f(int n) {}\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let int_typerefs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "int")
+            .collect();
+        assert!(
+            int_typerefs.is_empty(),
+            "primitive 'int' must NOT produce a TypeRef, got: {int_typerefs:?}"
         );
     }
 }

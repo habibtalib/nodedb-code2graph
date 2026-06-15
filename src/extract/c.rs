@@ -17,7 +17,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
-    ScopeId, ScopeKind, Symbol, SymbolKind,
+    ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -25,7 +25,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope,
+    push_ref, push_scope, push_type_ref,
 };
 
 // NOTE: SymbolKind has no Union or Macro variants; unions map to Struct,
@@ -77,6 +77,7 @@ impl Extractor for CExtractor {
         ));
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::C, bytes, file)?;
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -529,7 +530,91 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
     }
 }
 
-// ── Edge richness: Read / Write ──────────────────────────────────────────────
+// ── Edge richness: TypeRef / Read / Write ────────────────────────────────────
+
+/// Extract the user-defined type name from a C type specifier node, if any.
+///
+/// Returns `(name, leaf_node)` for:
+/// - `type_identifier` — a typedef'd / user-defined type name; the node itself is the leaf.
+/// - `struct_specifier` / `union_specifier` / `enum_specifier` with a `name:` field — the
+///   tag name is the leaf (a `type_identifier` child at the `name:` field).
+///
+/// Returns `None` for:
+/// - `primitive_type` (int, char, float, void, …) — no user def, skip.
+/// - `sized_type_specifier` (unsigned int, long long, …) — builtin composite, skip.
+/// - Anonymous struct/union/enum (specifier without a `name:` field) — skip.
+fn type_leaf<'tree>(node: &Node<'tree>, bytes: &[u8]) -> Option<(String, Node<'tree>)> {
+    match node.kind() {
+        "type_identifier" => Some((node_text(node, bytes).to_owned(), *node)),
+        "struct_specifier" | "union_specifier" | "enum_specifier" => {
+            // Only emit when the specifier has a name (tag), i.e. `struct Foo` not
+            // `struct { ... }` (anonymous). The `name:` field is a `type_identifier`.
+            let name_node = node.child_by_field_name("name")?;
+            Some((node_text(&name_node, bytes).to_owned(), name_node))
+        }
+        // primitive_type: int, char, void, float, double, bool, …
+        // sized_type_specifier: unsigned int, long long, …
+        // Any other specifier node — skip.
+        _ => None,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// user-defined type name appearing in an annotation position.
+///
+/// Covered positions (tree-sitter-c grammar):
+/// - `function_definition` `type:` field → `ReturnType`
+/// - `parameter_declaration` `type:` field → `ParameterType`
+/// - `field_declaration` (inside a `field_declaration_list`) `type:` field → `Field`
+///
+/// Primitive types (`primitive_type`) and sized builtin specifiers
+/// (`sized_type_specifier`) are skipped — they have no user definition to link.
+/// Only `type_identifier` (typedef aliases / user-defined names) and named
+/// `struct_specifier` / `union_specifier` / `enum_specifier` nodes emit a ref.
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Function definition return type: `Config make(void) { ... }`.
+        // The `type:` field on a `function_definition` is the return specifier.
+        "function_definition" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                if let Some((name, leaf)) = type_leaf(&type_node, bytes) {
+                    push_type_ref(out, &name, &leaf, file, TypeRefContext::ReturnType);
+                }
+            }
+            // Recurse into parameters and body.
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return; // avoid double-recursion at the bottom
+        }
+        // Parameter type: `void f(Config c)` — the `type:` field of
+        // `parameter_declaration` is the type specifier.
+        "parameter_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                if let Some((name, leaf)) = type_leaf(&type_node, bytes) {
+                    push_type_ref(out, &name, &leaf, file, TypeRefContext::ParameterType);
+                }
+            }
+            // parameter_declaration has no interesting sub-trees for type refs.
+            return;
+        }
+        // Struct/union field type: `struct T { Config conf; };` — `field_declaration`
+        // carries a `type:` field for the field's type specifier.
+        "field_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                if let Some((name, leaf)) = type_leaf(&type_node, bytes) {
+                    push_type_ref(out, &name, &leaf, file, TypeRefContext::Field);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
+}
 
 /// Returns `true` when `node` (an `identifier`) is in a position that is already
 /// captured by another collector and must NOT also be emitted as a Read reference.
@@ -648,7 +733,7 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::types::RefRole;
+    use crate::graph::types::{RefRole, TypeRefContext};
 
     #[test]
     fn extracts_defs_and_skips_static() {
@@ -1113,6 +1198,103 @@ int main(void) {
         assert!(
             val_reads.is_empty(),
             "field 'val' in field_expression must NOT produce a Read ref; got: {val_reads:?}"
+        );
+    }
+
+    // ── TypeRef tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn typeref_param_type_emitted() {
+        // `void f(Config c) {}` — `Config` is a type_identifier (typedef'd user type)
+        // → TypeRef "Config" with ParameterType context.
+        let src = "void f(Config c) {}\n";
+        let facts = CExtractor.extract(src, "src/tr.c").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected TypeRef for 'Config', got refs: {:?}",
+                    facts
+                        .references
+                        .iter()
+                        .map(|r| (&r.name, r.role, r.type_ref_ctx))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn typeref_return_type_emitted() {
+        // `Config make(void) { ... }` — `Config` as return type
+        // → TypeRef "Config" with ReturnType context.
+        let src = "Config make(void) { Config c; return c; }\n";
+        let facts = CExtractor.extract(src, "src/tr.c").unwrap();
+        let type_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .collect();
+        let ret_ref = type_refs
+            .iter()
+            .find(|r| r.type_ref_ctx == Some(TypeRefContext::ReturnType))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected TypeRef 'Config' with ReturnType, got: {:?}",
+                    type_refs.iter().map(|r| r.type_ref_ctx).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(ret_ref.type_ref_ctx, Some(TypeRefContext::ReturnType));
+    }
+
+    #[test]
+    fn typeref_field_type_emitted() {
+        // `struct T { Config conf; };` — `Config` as struct field type
+        // → TypeRef "Config" with Field context.
+        let src = "struct T { Config conf; };\n";
+        let facts = CExtractor.extract(src, "src/tr.c").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected TypeRef for 'Config' field, got refs: {:?}",
+                    facts
+                        .references
+                        .iter()
+                        .map(|r| (&r.name, r.role, r.type_ref_ctx))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn typeref_primitive_param_not_emitted() {
+        // `void f(int n) {}` — `int` is a primitive_type → must NOT produce a TypeRef.
+        let src = "void f(int n) {}\n";
+        let facts = CExtractor.extract(src, "src/tr.c").unwrap();
+        let type_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "int")
+            .collect();
+        assert!(
+            type_refs.is_empty(),
+            "primitive 'int' must NOT produce a TypeRef; got: {type_refs:?}"
         );
     }
 }

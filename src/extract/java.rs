@@ -17,7 +17,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -25,7 +25,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope,
+    push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -73,6 +73,7 @@ impl Extractor for JavaExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_jni_natives(&root, bytes, file, &namespaces, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -504,6 +505,131 @@ fn jni_mangle(namespaces: &[String], class: &str, method: &str) -> String {
         format!("Java_{class}_{method}")
     } else {
         format!("Java_{}_{}_{}", namespaces.join("_"), class, method)
+    }
+}
+
+// ── Edge richness: TypeRef ───────────────────────────────────────────────────
+
+/// Recursively walk `node` emitting [`RefRole::TypeRef`] references for every
+/// user-defined type that appears in a typed annotation position.
+///
+/// Covered positions (tree-sitter-java grammar):
+/// - `formal_parameter` and `spread_parameter` → `type:` field → `ParameterType`
+/// - `method_declaration` → `type:` field (the return type) → `ReturnType`
+/// - `field_declaration` → `type:` field → `Field`
+/// - Generic type arguments inside `type_arguments` → `GenericArg`
+///
+/// Primitive/void types (`integral_type`, `floating_point_type`, `boolean_type`,
+/// `void_type`) are skipped — they never resolve to user-defined symbols.
+/// `array_type` is unwrapped recursively to reach the element type.
+/// `scoped_type_identifier` (e.g. `pkg.Outer.Inner`) emits only its final
+/// `type_identifier` segment (the name field `name`).
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    /// Emit one or more type refs from a (possibly composed) type node, with the
+    /// given context. Handles the type-node grammar recursively:
+    ///
+    /// - `type_identifier` → leaf; emit with `ctx`.
+    /// - `generic_type` → emit the base `type_identifier` (or
+    ///   `scoped_type_identifier`) child with `ctx`; recurse the `type_arguments`
+    ///   children with `GenericArg`.
+    /// - `scoped_type_identifier` → emit only the `name` (last segment) child.
+    /// - `array_type` → recurse the `element:` type with the same `ctx`.
+    /// - Primitive kinds (`integral_type`, `floating_point_type`, `boolean_type`,
+    ///   `void_type`) → skip (no user definition).
+    fn type_leaf(
+        node: &Node,
+        bytes: &[u8],
+        file: &str,
+        ctx: TypeRefContext,
+        out: &mut Vec<Reference>,
+    ) {
+        match node.kind() {
+            "type_identifier" => {
+                let name = node_text(node, bytes);
+                push_type_ref(out, name, node, file, ctx);
+            }
+            "generic_type" => {
+                // First named child is the base type (type_identifier or
+                // scoped_type_identifier). tree-sitter-java doesn't expose it as
+                // a named field, so we take the first named child.
+                if let Some(base) = node.named_children(&mut node.walk()).next() {
+                    type_leaf(&base, bytes, file, ctx, out);
+                }
+                // Recurse type arguments with GenericArg context.
+                if let Some(args) = node
+                    .children(&mut node.walk())
+                    .find(|c| c.kind() == "type_arguments")
+                {
+                    for child in args.named_children(&mut args.walk()) {
+                        // Skip wildcard bounds (`? extends T`, `? super T`) and bare
+                        // wildcards (`?`) — they are not type_identifier leaves.
+                        if child.kind() == "wildcard" {
+                            // Recurse into the wildcard's bounded type if present.
+                            for wc_child in child.named_children(&mut child.walk()) {
+                                type_leaf(&wc_child, bytes, file, TypeRefContext::GenericArg, out);
+                            }
+                        } else {
+                            type_leaf(&child, bytes, file, TypeRefContext::GenericArg, out);
+                        }
+                    }
+                }
+            }
+            "scoped_type_identifier" => {
+                // e.g. `com.example.Config` — emit only the final `name` field.
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    type_leaf(&name_node, bytes, file, ctx, out);
+                }
+            }
+            "array_type" => {
+                // Recurse into the element type at the same context.
+                if let Some(element) = node.child_by_field_name("element") {
+                    type_leaf(&element, bytes, file, ctx, out);
+                }
+            }
+            // Primitives: integral_type (int, long, …), floating_point_type,
+            // boolean_type, void_type — no user definition, skip entirely.
+            "integral_type"
+            | "floating_point_type"
+            | "boolean_type"
+            | "void_type"
+            | "annotated_type" => {}
+            _ => {}
+        }
+    }
+
+    match node.kind() {
+        // `formal_parameter`: typed parameter `SomeType name` — the `type:` field
+        // is the type node. Also covers annotation-type parameters.
+        "formal_parameter" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+        }
+        // `spread_parameter`: varargs `SomeType... name` — the type node is the
+        // first named child (tree-sitter-java does not expose it as a named field).
+        "spread_parameter" => {
+            if let Some(type_node) = node.named_children(&mut node.walk()).next() {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+        }
+        // `method_declaration`: the `type:` field is the return type.
+        "method_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ReturnType, out);
+            }
+        }
+        // `field_declaration`: the `type:` field is the field type.
+        "field_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+        }
+        _ => {}
+    }
+
+    // Recurse into all children so nested classes, lambdas, etc. are covered.
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
     }
 }
 
@@ -1541,6 +1667,91 @@ public class C {
         assert!(
             field_reads.is_empty(),
             "member name 'field' in field_access must NOT be a Read ref; got: {field_reads:?}"
+        );
+    }
+
+    // ── TypeRef tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn java_param_type_ref_emitted() {
+        // `void f(Config c) {}` → TypeRef "Config" with ParameterType ctx.
+        let src = "package p; class C { void f(Config c) {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn java_return_type_ref_emitted() {
+        // `Config get() { return null; }` → TypeRef "Config" with ReturnType ctx.
+        let src = "package p; class C { Config get() { return null; } }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn java_field_type_ref_emitted() {
+        // `Config conf;` as a class field → TypeRef "Config" with Field ctx.
+        let src = "package p; class C { Config conf; }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn java_generic_arg_type_ref_emitted() {
+        // `void f(List<Config> xs) {}` → TypeRef "List" (ParameterType) and "Config" (GenericArg).
+        let src = "package p; class C { void f(List<Config> xs) {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let list_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "List")
+            .expect("expected TypeRef ref for 'List'");
+        assert_eq!(
+            list_ref.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx for 'List', got {:?}",
+            list_ref.type_ref_ctx
+        );
+        let config_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            config_ref.type_ref_ctx,
+            Some(TypeRefContext::GenericArg),
+            "expected GenericArg ctx for 'Config', got {:?}",
+            config_ref.type_ref_ctx
         );
     }
 }

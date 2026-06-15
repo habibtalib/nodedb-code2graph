@@ -4,8 +4,11 @@
 //!
 //! Definitions: top-level **exported** declarations (first character of the
 //! name is uppercase). Covers `func`, methods, `type` (struct/interface/alias),
-//! `const`, and `var`. Qualified identity follows the package path derived from
-//! the file path (`src/auth/session.go` → namespaces `auth`,`session`).
+//! `const`, and `var`. Qualified identity follows the Go convention that a
+//! package occupies exactly one directory, so the file's **directory path** is
+//! the package identity (e.g. `src/auth/session.go` → namespace `["auth"]`);
+//! this is collision-free across same-named packages in different directories.
+//! Flat (directory-less) files fall back to the `package` clause name.
 //! References: callee identifiers of `call_expression` nodes, plus
 //! [`RefRole::Read`] for identifiers used in value/expression positions and
 //! [`RefRole::Write`] for bare-identifier left-hand sides of
@@ -24,9 +27,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref, simple_type_name,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -63,7 +66,7 @@ impl Extractor for GoExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
-        let namespaces = go_namespaces(file);
+        let namespaces = go_namespaces(&root, bytes, file);
 
         let defs = collect_symbols(&root, bytes, file, &namespaces);
         let def_bindings = definition_bindings(&defs);
@@ -99,17 +102,58 @@ impl Extractor for GoExtractor {
     }
 }
 
-/// Derive the Go package path (namespace descriptors) from a file path.
+/// Derive the Go package namespace.
 ///
-/// Strips the `.go` extension, strips a leading `src/` prefix, then splits on
-/// `/`. The file stem is kept as the last namespace segment (no `main` drop).
-fn go_namespaces(file: &str) -> Vec<String> {
-    let p = file.strip_suffix(".go").unwrap_or(file);
-    let p = p.strip_prefix("src/").unwrap_or(p);
-    p.split('/')
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// Go enforces one package per directory, so the file's **directory path** is
+/// the collision-free package identity (and aligns with SCIP-go's import-path
+/// descriptors). Two same-named packages in different directories (`a/config`
+/// and `b/config`) therefore get distinct namespaces, avoiding SCIP-id
+/// collisions. Priority:
+///
+/// 1. **Directory path.** Strip a leading `src/` from `file`, take everything
+///    before the last `/`, split on `/`, drop empties. If non-empty, that IS
+///    the namespace (e.g. `src/auth/session.go` → `["auth"]`;
+///    `auth/session/x.go` → `["auth", "session"]`).
+/// 2. **Flat-file fallback.** No directory component → use the `package` clause
+///    name (e.g. `util.go` with `package main` → `["main"]`). This keeps the
+///    flat eval corpus' same-package files sharing one namespace so the Tier-B
+///    resolver can stitch their cross-file calls.
+/// 3. **Last resort.** Flat file with no parseable `package` clause → the file
+///    stem (`.go` stripped) as a single segment (e.g. `util.go` → `["util"]`).
+fn go_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
+    let p = file.strip_prefix("src/").unwrap_or(file);
+    if let Some((dir, _)) = p.rsplit_once('/') {
+        let segs: Vec<String> = dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !segs.is_empty() {
+            return segs;
+        }
+    }
+    // Flat file: package clause, else file stem.
+    if let Some(pkg) = go_package_name(root, bytes) {
+        return vec![pkg];
+    }
+    let stem = p.strip_suffix(".go").unwrap_or(p);
+    if stem.is_empty() {
+        Vec::new()
+    } else {
+        vec![stem.to_owned()]
+    }
+}
+
+/// The package name from the file's `package_clause`, if present and non-empty.
+///
+/// Grammar: `package_clause` has a `package_identifier` child carrying the name.
+/// Returns `None` (no panic) when the clause is absent/unparseable.
+fn go_package_name(root: &Node, bytes: &[u8]) -> Option<String> {
+    let clause = root
+        .children(&mut root.walk())
+        .find(|c| c.kind() == "package_clause")?;
+    let name = child_text(&clause, "package_identifier", bytes)?;
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
@@ -754,21 +798,21 @@ fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut V
 /// `variadic_parameter_declaration` (`...type`). Skips blank `_` names.
 fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
     for child in params.named_children(&mut params.walk()) {
-        match child.kind() {
-            "parameter_declaration" | "variadic_parameter_declaration" => {
-                for ident in child.children(&mut child.walk()) {
-                    if ident.kind() != "identifier" {
-                        continue;
-                    }
-                    let name = node_text(&ident, bytes);
-                    if name == "_" {
-                        continue;
-                    }
-                    let intro = ident.start_byte();
-                    push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
+        if matches!(
+            child.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            for ident in child.children(&mut child.walk()) {
+                if ident.kind() != "identifier" {
+                    continue;
                 }
+                let name = node_text(&ident, bytes);
+                if name == "_" {
+                    continue;
+                }
+                let intro = ident.start_byte();
+                push_binding(out, name.to_owned(), intro, BindingKind::Param, scopes);
             }
-            _ => {}
         }
     }
 }
@@ -797,10 +841,7 @@ func helper() {}
         let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
 
         let vt = by_name("Validate").unwrap();
-        assert_eq!(
-            vt.id.to_scip_string(),
-            "codegraph . . . auth/session/Validate()."
-        );
+        assert_eq!(vt.id.to_scip_string(), "codegraph . . . auth/Validate().");
         assert_eq!(vt.kind, SymbolKind::Function);
 
         assert_eq!(by_name("Config").unwrap().kind, SymbolKind::Struct);
@@ -811,6 +852,51 @@ func helper() {}
         assert!(by_name("helper").is_none());
 
         assert_eq!(facts.lang, "go");
+    }
+
+    #[test]
+    fn flat_files_same_package_share_namespace() {
+        // Two FLAT (directory-less) files declaring the same `package main` share
+        // the namespace `["main"]` via the flat-file package-clause fallback —
+        // this is what lets cross-file resolution stitch the eval corpus.
+        let util = GoExtractor
+            .extract("package main\nfunc Helper() {}\n", "util.go")
+            .unwrap();
+        let main = GoExtractor
+            .extract("package main\nfunc Run() { Helper() }\n", "main.go")
+            .unwrap();
+        let helper = util.symbols.iter().find(|s| s.name == "Helper").unwrap();
+        let run = main.symbols.iter().find(|s| s.name == "Run").unwrap();
+        assert_eq!(helper.id.to_scip_string(), "codegraph . . . main/Helper().");
+        assert_eq!(run.id.to_scip_string(), "codegraph . . . main/Run().");
+    }
+
+    #[test]
+    fn different_directories_are_different_packages() {
+        // Go: one package per directory. Same package name in different dirs is
+        // a DIFFERENT package, so namespaces (and SCIP ids) must differ.
+        let a = GoExtractor
+            .extract("package x\nfunc F() {}\n", "pkg_a/x.go")
+            .unwrap();
+        let b = GoExtractor
+            .extract("package x\nfunc F() {}\n", "pkg_b/x.go")
+            .unwrap();
+        let fa = a.symbols.iter().find(|s| s.name == "F").unwrap();
+        let fb = b.symbols.iter().find(|s| s.name == "F").unwrap();
+        assert_eq!(fa.id.to_scip_string(), "codegraph . . . pkg_a/F().");
+        assert_eq!(fb.id.to_scip_string(), "codegraph . . . pkg_b/F().");
+        assert_ne!(fa.id.to_scip_string(), fb.id.to_scip_string());
+    }
+
+    #[test]
+    fn namespace_falls_back_to_file_stem_without_package_clause() {
+        // Flat file (`src/util.go` → `util.go`) with no parseable `package`
+        // clause → last-resort file-stem fallback → `["util"]`.
+        let facts = GoExtractor
+            .extract("func Helper() {}\n", "src/util.go")
+            .unwrap();
+        let helper = facts.symbols.iter().find(|s| s.name == "Helper").unwrap();
+        assert_eq!(helper.id.to_scip_string(), "codegraph . . . util/Helper().");
     }
 
     #[test]

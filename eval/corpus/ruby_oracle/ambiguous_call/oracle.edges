@@ -1,0 +1,3 @@
+# oracle: SCIP index — location pairs (ref -> def), role-agnostic
+main.rb:5 alpha.rb:1
+main.rb:5 alpha.rb:2

@@ -475,8 +475,8 @@ fn handle_function(
         return;
     }
     // field `name` is usually a simple_identifier; for operators it may not be.
-    let name = match node.child_by_field_name("name") {
-        Some(n) => node_text(&n, bytes).to_owned(),
+    let name = match field_text(&node, "name", bytes) {
+        Some(n) => n,
         None => return,
     };
     let kind = if inside_type {

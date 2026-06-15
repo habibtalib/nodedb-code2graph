@@ -273,6 +273,8 @@ fn collect_imports(
                     _ => {}
                 }
             }
+            // Import statements cannot contain nested import statements.
+            return;
         }
         "import_statement" => {
             // `import foo.bar` / `import foo.bar as baz` — the from-path is the
@@ -298,6 +300,8 @@ fn collect_imports(
                     _ => {}
                 }
             }
+            // Import statements cannot contain nested import statements.
+            return;
         }
         _ => {}
     }

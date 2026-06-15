@@ -215,9 +215,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 /// True if the node's first `visibility_modifier` child is bare `pub`.
 fn is_fully_pub(node: &Node, bytes: &[u8]) -> bool {
     node.children(&mut node.walk())
-        .find(|c| c.kind() == "visibility_modifier")
-        .map(|c| node_text(&c, bytes).trim() == "pub")
-        .unwrap_or(false)
+        .find_map(|c| (c.kind() == "visibility_modifier").then(|| node_text(&c, bytes)))
+        == Some("pub")
 }
 
 /// Collect cross-language export markers from top-level functions.
@@ -366,17 +365,17 @@ fn first_quoted(s: &str) -> Option<&str> {
 
 /// Display name for an `impl` block: the last type identifier before the body.
 fn impl_type_name(node: &Node, bytes: &[u8]) -> String {
-    let mut names = Vec::new();
+    let mut name: Option<String> = None;
     for child in node.children(&mut node.walk()) {
         match child.kind() {
             "type_identifier" | "generic_type" | "scoped_type_identifier" => {
-                names.push(node_text(&child, bytes).to_owned());
+                name = Some(node_text(&child, bytes).to_owned());
             }
             "declaration_list" => break,
             _ => {}
         }
     }
-    names.last().cloned().unwrap_or_else(|| "impl".to_owned())
+    name.unwrap_or_else(|| "impl".to_owned())
 }
 
 /// Recursively walk `node` collecting `Inherit` references for every

@@ -422,6 +422,8 @@ fn collect_imports(
                 super::push_import_ref(out, name, &child, file, module_id, "");
             }
         }
+        // import_declaration children are identifiers, never nested imports.
+        return;
     }
 
     // Recurse — import_declarations are top-level, but recursing everywhere is harmless.

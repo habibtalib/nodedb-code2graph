@@ -33,7 +33,9 @@ use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, Symbo
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, child_text, collect_call_references, field_text, node_text, one_line_signature,
+};
 
 /// Tree-sitter query capturing call-callee identifiers.
 ///
@@ -478,13 +480,7 @@ fn handle_enum_entry(
         return;
     }
     // enum_entry has an identifier child (the case name).
-    let name: Option<String> = {
-        let mut cursor = node.walk();
-        node.children(&mut cursor)
-            .find(|c| c.kind() == "identifier")
-            .map(|c| node_text(&c, bytes).to_owned())
-    };
-    let name = match name {
+    let name = match child_text(&node, "identifier", bytes) {
         Some(n) => n,
         None => return,
     };

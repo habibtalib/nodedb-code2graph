@@ -338,12 +338,7 @@ fn aggregate_type_symbol(spec: &Node, bytes: &[u8]) -> Option<(SymbolKind, Strin
         _ => return None,
     };
     // Must have a body (i.e. this is a definition, not just a reference).
-    let has_body = spec
-        .children(&mut spec.walk())
-        .any(|c| matches!(c.kind(), "field_declaration_list" | "enumerator_list"));
-    if !has_body {
-        return None;
-    }
+    spec.child_by_field_name("body")?;
     let name = field_text(spec, "name", bytes)?;
     Some((kind, name))
 }

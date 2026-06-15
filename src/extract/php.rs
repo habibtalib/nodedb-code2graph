@@ -143,17 +143,18 @@ fn collect_defs(
     file: &str,
     out: &mut Vec<Symbol>,
 ) {
+    let base_descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
     for child in container.children(&mut container.walk()) {
         match child.kind() {
             "function_definition" => {
                 let Some(name) = field_text(&child, "name", bytes) else {
                     continue;
                 };
-                let mut descriptors: Vec<Descriptor> = namespaces
-                    .iter()
-                    .cloned()
-                    .map(Descriptor::Namespace)
-                    .collect();
+                let mut descriptors = base_descriptors.clone();
                 descriptors.push(Descriptor::Method {
                     name: name.clone(),
                     disambiguator: String::new(),
@@ -182,11 +183,7 @@ fn collect_defs(
                     "enum_declaration" => SymbolKind::Enum,
                     _ => unreachable!(),
                 };
-                let mut type_descriptors: Vec<Descriptor> = namespaces
-                    .iter()
-                    .cloned()
-                    .map(Descriptor::Namespace)
-                    .collect();
+                let mut type_descriptors = base_descriptors.clone();
                 type_descriptors.push(Descriptor::Type(type_name.clone()));
                 push_symbol(
                     out,
@@ -266,7 +263,11 @@ fn collect_members(
                         continue;
                     };
                     // Strip the leading `$` from the variable name.
-                    let name = raw_name.strip_prefix('$').unwrap_or(&raw_name).to_owned();
+                    let name = if let Some(stripped) = raw_name.strip_prefix('$') {
+                        stripped.to_owned()
+                    } else {
+                        raw_name
+                    };
                     let mut descriptors = type_descriptors.to_vec();
                     descriptors.push(Descriptor::Term(name.clone()));
                     push_symbol(

@@ -24,11 +24,13 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeKind, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::Extractor;
+use super::{Extractor, attach_reference_scopes, definition_bindings, push_scope};
 
 /// Extracts HCL/Terraform symbols and references.
 pub struct HclExtractor;
@@ -55,22 +57,57 @@ impl Extractor for HclExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
 
-        let mut symbols = collect_symbols(&root, bytes, file);
-        let mod_sym = super::module_symbol(Language::Hcl, &[], file, source.len());
-        symbols.push(mod_sym);
+        // Collect definitions first so we can derive bindings before adding the
+        // file-module symbol (the module symbol is not a user-written definition).
+        let defs = collect_symbols(&root, bytes, file);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
+        symbols.push(super::module_symbol(Language::Hcl, &[], file, source.len()));
 
-        let references = collect_references(&root, bytes, file);
+        let mut references = collect_references(&root, bytes, file);
+
+        // HCL is flat — one Module scope spanning the whole file, no nesting.
+        let scopes = collect_scopes(source.len());
+        attach_reference_scopes(&mut references, &scopes);
+
+        // Only definition bindings for HCL (no imports, no locals).
+        let bindings = def_bindings;
 
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Hcl.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
+}
+
+// ── Scope collection ──────────────────────────────────────────────────────────
+
+/// Build the scope tree for an HCL file.
+///
+/// HCL has no nested lexical scopes (unlike Rust/Python function bodies or
+/// JS block scopes).  A single [`ScopeKind::Module`] scope spanning the whole
+/// file is sufficient: every top-level definition binds at scope 0 and every
+/// reference (including qualified traversals like `module.vpc.id`) is attached
+/// to the same file-root scope.  Qualified references are resolved by the
+/// scope-graph resolver's **path-qualified-call** arm, which bypasses the
+/// lexical scope walk entirely.
+fn collect_scopes(source_len: usize) -> Vec<Scope> {
+    let mut scopes: Vec<Scope> = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    scopes
 }
 
 // ── Symbol extraction ─────────────────────────────────────────────────────────
@@ -657,6 +694,134 @@ module "vpc" { source = "./vpc" }
             bare_refs.is_empty(),
             "bare single-segment variable should produce no TypeRef ref; got: {:?}",
             bare_refs
+        );
+    }
+
+    // ── Tier-B scope / binding wiring ─────────────────────────────────────────
+
+    /// One Module scope spanning the whole file.
+    #[test]
+    fn tier_b_one_module_scope_spans_file() {
+        use crate::graph::types::ScopeKind;
+
+        let src = r#"module "vpc" { source = "./vpc" }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        assert_eq!(facts.scopes.len(), 1, "expected exactly one scope");
+        let s = &facts.scopes[0];
+        assert_eq!(s.kind, ScopeKind::Module, "scope kind should be Module");
+        assert_eq!(s.parent, None, "root scope has no parent");
+        assert_eq!(s.span.start, 0, "scope should start at 0");
+        assert_eq!(s.span.end, src.len(), "scope should end at source length");
+    }
+
+    /// module block → Definition binding at scope 0.
+    #[test]
+    fn tier_b_module_block_yields_definition_binding() {
+        use crate::graph::types::{BindingKind, BindingTarget};
+
+        let src = r#"module "vpc" { source = "./vpc" }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        let binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "vpc")
+            .expect("expected a binding named 'vpc'");
+        assert_eq!(
+            binding.kind,
+            BindingKind::Definition,
+            "binding kind should be Definition"
+        );
+        assert_eq!(binding.scope, 0, "module binding must live in scope 0");
+        assert!(
+            matches!(binding.target, BindingTarget::Def(_)),
+            "target should be BindingTarget::Def(_); got {:?}",
+            binding.target
+        );
+    }
+
+    /// resource block → Definition binding at scope 0.
+    #[test]
+    fn tier_b_resource_block_yields_definition_binding() {
+        use crate::graph::types::{BindingKind, BindingTarget};
+
+        let src = r#"resource "aws_instance" "web" {}"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        let binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "web")
+            .expect("expected a binding named 'web'");
+        assert_eq!(
+            binding.kind,
+            BindingKind::Definition,
+            "binding kind should be Definition"
+        );
+        assert_eq!(binding.scope, 0, "resource binding must live in scope 0");
+        assert!(
+            matches!(binding.target, BindingTarget::Def(_)),
+            "target should be BindingTarget::Def(_); got {:?}",
+            binding.target
+        );
+    }
+
+    /// A reference like `module.vpc.id` gets its `scope` set to Some(_) after
+    /// scope attachment.
+    #[test]
+    fn tier_b_reference_scope_is_attached() {
+        let src = r#"resource "aws_instance" "web" { x = module.vpc.id }"#;
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+
+        // Find the TypeRef reference for "vpc" (qualifier "module").
+        let vpc_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "vpc")
+            .expect("expected a TypeRef ref named 'vpc'");
+        assert!(
+            vpc_ref.scope.is_some(),
+            "reference scope should be attached (Some(_)); got None"
+        );
+    }
+
+    /// End-to-end resolution via ScopeGraphResolver: `module.vpc.id` reference
+    /// resolves exactly to the `module "vpc"` definition with Exact confidence.
+    #[test]
+    fn tier_b_e2e_qualified_module_ref_resolves_exact() {
+        use crate::graph::types::{Confidence, RefRole};
+        use crate::resolve::{Resolver, ScopeGraphResolver};
+
+        let src = "module \"vpc\" {\n  source = \"./vpc\"\n}\n\nresource \"aws_instance\" \"web\" {\n  vpc_id = module.vpc.id\n}\n";
+        let facts = HclExtractor.extract(src, "infra/main.tf").unwrap();
+        let graph = ScopeGraphResolver.resolve(&[facts]);
+
+        // Collect TypeRef edges whose `to` SCIP string contains "module/vpc".
+        let typeref_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.to_scip_string().contains("module/vpc"))
+            .collect();
+
+        assert_eq!(
+            typeref_edges.len(),
+            1,
+            "expected exactly one TypeRef edge targeting module/vpc, got: {:?}",
+            typeref_edges
+                .iter()
+                .map(|e| format!(
+                    "{} → {} ({:?})",
+                    e.from.to_scip_string(),
+                    e.to.to_scip_string(),
+                    e.confidence
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            typeref_edges[0].confidence,
+            Confidence::Exact,
+            "qualified module reference should resolve with Exact confidence"
         );
     }
 }

@@ -1,0 +1,4 @@
+# Tier-B resolution via the qualified-call path: qualifier="module", name="vpc"
+# suffix-matches the module/vpc# symbol (Namespace("module") in its SCIP id).
+# var./local. refs are a v1 extraction boundary (not yet captured as symbols).
+main.tf:6 TypeRef main.tf:1

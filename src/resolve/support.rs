@@ -39,9 +39,13 @@ pub(crate) fn normalize_from_path(path: &str) -> Vec<&str> {
 /// Returns `true` iff `segs` is non-empty and the candidate's namespace chain
 /// (as returned by [`SymbolId::namespaces_iter`]) **ends with** `segs`.
 ///
+/// Generic over the segment string type (`&str`, `String`, …) so callers can
+/// match against borrowed path slices or owned segment vectors without an
+/// intermediate `Vec<&str>` conversion.
+///
 /// Example: candidate namespaces `["com", "example"]` with `segs = ["example"]`
 /// → true. With `segs = ["com", "example"]` → true. With `segs = ["other"]` → false.
-pub(crate) fn namespaces_end_with(candidate: &SymbolId, segs: &[&str]) -> bool {
+pub(crate) fn namespaces_end_with<S: AsRef<str>>(candidate: &SymbolId, segs: &[S]) -> bool {
     if segs.is_empty() {
         return false;
     }
@@ -53,5 +57,5 @@ pub(crate) fn namespaces_end_with(candidate: &SymbolId, segs: &[&str]) -> bool {
         .namespaces_iter()
         .skip(n - segs.len())
         .zip(segs.iter())
-        .all(|(a, b)| a == *b)
+        .all(|(a, b)| a == b.as_ref())
 }

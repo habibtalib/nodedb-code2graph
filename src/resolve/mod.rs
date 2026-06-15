@@ -13,6 +13,7 @@
 //! [`FileFacts`]: crate::graph::FileFacts
 
 pub mod ffi_bridge;
+mod incremental;
 mod resolver;
 pub mod scope_graph;
 mod support;

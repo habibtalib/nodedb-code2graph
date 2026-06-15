@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Per-file (intra-file) Tier-B resolution.
+//!
+//! [`build_subgraph`] performs ALL of a file's isolated resolution work — local
+//! and parameter bindings, same-file definitions — and emits them as fully
+//! resolved [`Edge`]s. Any reference whose resolution depends on *other* files
+//! (path-qualified calls, imports) is deferred as a [`PendingRef`] for the
+//! cross-file stitch phase. Nothing here looks at any file but its own: caller
+//! attribution indexes only `f.symbols`, so the result is a true per-file
+//! subgraph that a future incremental store can build and cache in isolation.
+
+use std::collections::HashMap;
+
+use crate::graph::types::{
+    Binding, BindingKind, BindingTarget, Confidence, Edge, FileFacts, Occurrence, Provenance,
+    RefRole, Scope, ScopeId, Symbol,
+};
+use crate::symbol::SymbolId;
+
+use super::super::{enclosing_symbol_index, normalize_from_path};
+
+/// A cross-file reference whose resolution is deferred to the stitch phase.
+/// Both qualified calls and imports reduce to "match `name` whose namespace
+/// chain ends with `segs`, uniquely" — they differ only in `role`.
+pub(crate) struct PendingRef {
+    /// Caller (resolved intra-file).
+    pub from: SymbolId,
+    /// Leaf name to look up.
+    pub name: String,
+    /// Normalized qualifier / import-path segments.
+    pub segs: Vec<String>,
+    pub role: RefRole,
+    pub occ: Occurrence,
+}
+
+/// The resolution facts for ONE file, isolated from all other files.
+pub(crate) struct FileSubgraph {
+    /// This file's symbols (a clone of `f.symbols`).
+    pub symbols: Vec<Symbol>,
+    /// Fully-resolved local/param/same-file-definition edges.
+    pub intra_edges: Vec<Edge>,
+    /// Cross-file refs awaiting the global index.
+    pub pending: Vec<PendingRef>,
+}
+
+/// Resolve everything in `f` that can be resolved without other files, deferring
+/// cross-file references as [`PendingRef`]s. See module docs.
+pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
+    let symbols = f.symbols.clone();
+
+    // All of this file's symbols index into `symbols` (every one belongs to
+    // `f.file`), so caller attribution is per-file — no global flattened vec.
+    let all_idxs: Vec<usize> = (0..symbols.len()).collect();
+
+    // Per-file binding index (scope → its bindings), built before the reference
+    // loop so it borrows `f.bindings` independently of `f.references`.
+    let mut bindings_by_scope: HashMap<ScopeId, Vec<&Binding>> = HashMap::new();
+    for b in &f.bindings {
+        bindings_by_scope.entry(b.scope).or_default().push(b);
+    }
+
+    // Precompute normalized import-path segments once per unique from_path.
+    // Many references in a file can resolve to the same import binding (e.g. an
+    // imported name used 50 times); without this cache, `normalize_from_path`
+    // would re-split and re-filter the same string on every such reference. The
+    // cache borrows `from_path` strings and segment slices from `f.bindings`,
+    // which lives for the whole function — lifetimes are fine.
+    let mut import_segs_cache: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in &f.bindings {
+        if let BindingTarget::Import(fp) = &b.target {
+            import_segs_cache
+                .entry(fp.as_str())
+                .or_insert_with(|| normalize_from_path(fp.as_str()));
+        }
+    }
+
+    let mut intra_edges: Vec<Edge> = Vec::new();
+    let mut pending: Vec<PendingRef> = Vec::new();
+
+    for r in &f.references {
+        // Caller attribution — needed by both the qualified and unqualified
+        // paths. Indexes only this file's symbols (isolation).
+        let Some(from_idx) = enclosing_symbol_index(&symbols, &all_idxs, r.occ.byte) else {
+            continue; // unattributable reference — skip, like Tier-A
+        };
+        let from = symbols[from_idx].id.clone();
+
+        // QUALIFIED CALL: explicit written path → unique global namespace-suffix
+        // match. Bypasses scope_walk entirely (this is a path lookup, not
+        // lexical resolution). Deferred to the stitch phase as a PendingRef.
+        //
+        // KNOWN LIMITATION: only MODULE-qualified calls resolve
+        // (`mod_a::process` — where `mod_a` appears as a Namespace descriptor in
+        // the target's SCIP id path). `Type::assoc_fn()` does NOT resolve
+        // because:
+        //   (1) `namespaces_end_with` matches only `Namespace` descriptors, not
+        //       the `Type` descriptor used for structs/enums/traits; and
+        //   (2) associated functions inside `impl` blocks are not yet extracted
+        //       as top-level symbols.
+        // This is an intentional, documented gap — resolving it requires
+        // type-member extraction work that is out of scope for this unit. It is
+        // NOT a silent miss. Do NOT widen `namespaces_end_with` to paper over it.
+        if let Some(qual) = &r.qualifier {
+            let segs = normalize_from_path(qual);
+            if !segs.is_empty() {
+                pending.push(PendingRef {
+                    from,
+                    name: r.name.clone(),
+                    segs: segs.iter().map(|s| s.to_string()).collect(),
+                    role: r.role,
+                    occ: r.occ.clone(),
+                });
+            }
+            continue; // qualified ref handled (deferred or honest no-op)
+        }
+
+        // UNQUALIFIED: lexical scope_walk path (needs r.scope). No scope info on
+        // the reference → no Tier-B edge.
+        let Some(start) = r.scope else { continue };
+
+        let Some(binding) = scope_walk(&r.name, r.occ.byte, start, &f.scopes, &bindings_by_scope)
+        else {
+            continue; // name binds to nothing visible — no edge
+        };
+
+        match binding.kind {
+            BindingKind::Local | BindingKind::Param => {
+                // A name-use exactly at its own binding's introduction site is
+                // the definition, not a reference — emit no self-edge. (In
+                // Python, `base = helper()` both defines `base` and is its write
+                // site; the write must not resolve to itself.)
+                if binding.intro == r.occ.byte {
+                    continue;
+                }
+                // Stable, unique id for the local: file + scope + name + intro
+                // byte distinguishes shadowing bindings of one name.
+                let local_id = format!(
+                    "{}@{}:{}@{}",
+                    f.file, binding.scope, binding.name, binding.intro
+                );
+                let to = SymbolId::local(f.file.clone(), local_id);
+
+                intra_edges.push(Edge {
+                    from,
+                    to,
+                    role: r.role,
+                    confidence: Confidence::Exact,
+                    provenance: Provenance::ScopeGraph,
+                    occ: r.occ.clone(),
+                });
+            }
+            BindingKind::Definition => {
+                // Same-file definition: resolve to the bound symbol's identity,
+                // precisely.
+                if let BindingTarget::Def(target_id) = &binding.target {
+                    intra_edges.push(Edge {
+                        from,
+                        to: target_id.clone(),
+                        role: r.role,
+                        confidence: Confidence::Scoped,
+                        provenance: Provenance::ScopeGraph,
+                        occ: r.occ.clone(),
+                    });
+                }
+                // (A Definition binding always carries Def(_); the `if let` is
+                // defensive.)
+            }
+            BindingKind::Import => {
+                if let BindingTarget::Import(from_path) = &binding.target {
+                    let segs: &[&str] = import_segs_cache
+                        .get(from_path.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if !segs.is_empty() {
+                        // Among global symbols sharing the imported name, the
+                        // stitch phase finds the UNIQUE one whose namespace chain
+                        // ends with the import path segments.
+                        pending.push(PendingRef {
+                            from,
+                            name: binding.name.clone(),
+                            segs: segs.iter().map(|s| s.to_string()).collect(),
+                            role: r.role,
+                            occ: r.occ.clone(),
+                        });
+                    }
+                    // Empty segs → drop (Tier-B never fakes precision; Tier-A
+                    // still provides recall via fan-out for those).
+                }
+                // No from_path → no edge.
+            }
+        }
+    }
+
+    FileSubgraph {
+        symbols,
+        intra_edges,
+        pending,
+    }
+}
+
+/// Walk lexical scopes outward from `start` looking for the binding that the
+/// name resolves to. Returns the winning binding (caller dispatches on kind).
+///
+/// The walk goes outward only (child → parent), so a reference never sees
+/// bindings in sibling or child scopes — block visibility falls out for free.
+fn scope_walk<'b>(
+    name: &str,
+    ref_byte: usize,
+    start: ScopeId,
+    scopes: &[Scope],
+    bindings_by_scope: &HashMap<ScopeId, Vec<&'b Binding>>,
+) -> Option<&'b Binding> {
+    let mut current = start;
+    loop {
+        if let Some(cands) = bindings_by_scope.get(&current) {
+            // Visible candidates in THIS scope, matching the name. On shadowing
+            // (multiple matches), the latest introduction wins.
+            let winner = cands
+                .iter()
+                .copied()
+                .filter(|b| b.name == name && is_visible(b, ref_byte))
+                .max_by_key(|b| b.intro);
+            if let Some(b) = winner {
+                return Some(b);
+            }
+        }
+        match scopes.get(current).and_then(|s| s.parent) {
+            Some(p) => current = p,
+            None => return None, // reached root with no match
+        }
+    }
+}
+
+/// Visibility: `let` locals are position-gated (must be introduced before use);
+/// params, definitions, and imports are visible scope-wide.
+fn is_visible(b: &Binding, ref_byte: usize) -> bool {
+    match b.kind {
+        BindingKind::Local => b.intro <= ref_byte,
+        BindingKind::Param | BindingKind::Definition | BindingKind::Import => true,
+    }
+}

@@ -55,16 +55,10 @@
 //! confidence or emits nothing (Tier-A still provides recall via fan-out for
 //! those cases).
 
-use std::collections::HashMap;
-
-use crate::graph::types::{
-    Binding, BindingKind, BindingTarget, CodeGraph, Confidence, Edge, FileFacts, Provenance, Scope,
-    ScopeId, Symbol,
-};
-use crate::symbol::SymbolId;
+use crate::graph::types::{CodeGraph, Edge, FileFacts, Symbol};
 
 use super::Resolver;
-use super::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
+use super::incremental::{FileSubgraph, GlobalIndex, build_subgraph, stitch};
 
 /// Scope-aware resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -72,241 +66,34 @@ pub struct ScopeGraphResolver;
 
 impl Resolver for ScopeGraphResolver {
     fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
-        // Flatten symbols exactly like Tier-A — these are the returned graph's
-        // symbols. Synthesized Local targets are edge targets only (SCIP-style);
-        // they are never added here.
-        let symbols: Vec<Symbol> = files
+        // Build one isolated subgraph per file. This is the SAME resolution code
+        // path the future incremental store wraps — both derive everything
+        // (symbols, intra-file edges, cross-file pending refs) from
+        // `build_subgraph`, so the two paths never drift.
+        let subs: Vec<FileSubgraph> = files.iter().map(build_subgraph).collect();
+
+        // The returned graph's symbols are the per-file symbols, concatenated in
+        // file order (synthesized Local edge targets are never added here).
+        let symbols: Vec<Symbol> = subs
             .iter()
-            .flat_map(|f| f.symbols.iter().cloned())
+            .flat_map(|s| s.symbols.iter().cloned())
             .collect();
 
-        // file path → indices into `symbols`, for caller attribution.
-        // Global leaf-name → indices into `symbols`, for cross-file import
-        // resolution (mirrors Tier-A's `by_name`).
-        let mut syms_by_file: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, s) in symbols.iter().enumerate() {
-            syms_by_file.entry(s.file.as_str()).or_default().push(i);
-            if let Some(n) = s.id.leaf_name() {
-                by_name.entry(n).or_default().push(i);
-            }
-        }
+        // Global leaf-name → SymbolId index for the cross-file stitch phase
+        // (mirrors Tier-A's `by_name`).
+        let index = GlobalIndex::from_symbols(&symbols);
 
+        // Intra-file edges first (all files, in order), then the stitched
+        // cross-file edges. Tests assert edge sets, not positional order.
         let mut edges: Vec<Edge> = Vec::new();
-        for f in files {
-            // Per-file binding index (scope → its bindings), built before the
-            // reference loop so it borrows `f.bindings` independently of the
-            // separate immutable borrow of `f.references`.
-            let mut bindings_by_scope: HashMap<ScopeId, Vec<&Binding>> = HashMap::new();
-            for b in &f.bindings {
-                bindings_by_scope.entry(b.scope).or_default().push(b);
-            }
-
-            // Precompute normalized import-path segments once per unique from_path.
-            // Many references in a file can resolve to the same import binding
-            // (e.g. an imported name used 50 times); without this cache,
-            // `normalize_from_path` would re-split and re-filter the same string
-            // on every such reference. The cache borrows `from_path` strings and
-            // segment slices from `f.bindings`, which lives for the whole inner
-            // block — lifetimes are fine.
-            let mut import_segs_cache: HashMap<&str, Vec<&str>> = HashMap::new();
-            for b in &f.bindings {
-                if let BindingTarget::Import(fp) = &b.target {
-                    import_segs_cache
-                        .entry(fp.as_str())
-                        .or_insert_with(|| normalize_from_path(fp.as_str()));
-                }
-            }
-
-            for r in &f.references {
-                // Caller attribution — needed by both the qualified and unqualified paths.
-                let Some(from_idx) = syms_by_file
-                    .get(f.file.as_str())
-                    .and_then(|idxs| enclosing_symbol_index(&symbols, idxs, r.occ.byte))
-                else {
-                    continue; // unattributable reference — skip, like Tier-A
-                };
-
-                // QUALIFIED CALL: explicit written path → unique global namespace-suffix match.
-                // Bypasses scope_walk entirely (this is a path lookup, not lexical resolution).
-                //
-                // KNOWN LIMITATION: only MODULE-qualified calls resolve
-                // (`mod_a::process` — where `mod_a` appears as a Namespace descriptor in the
-                // target's SCIP id path). `Type::assoc_fn()` does NOT resolve because:
-                //   (1) `namespaces_end_with` matches only `Namespace` descriptors, not the
-                //       `Type` descriptor used for structs/enums/traits; and
-                //   (2) associated functions inside `impl` blocks are not yet extracted as
-                //       top-level symbols.
-                // This is an intentional, documented gap — resolving it requires type-member
-                // extraction work that is out of scope for this unit. It is NOT a silent miss.
-                // Do NOT widen `namespaces_end_with` to paper over it.
-                if let Some(qual) = &r.qualifier {
-                    let segs = normalize_from_path(qual);
-                    if !segs.is_empty() {
-                        if let Some(to_idx) =
-                            unique_suffix_match(&by_name, &symbols, r.name.as_str(), &segs)
-                        {
-                            edges.push(Edge {
-                                from: symbols[from_idx].id.clone(),
-                                to: symbols[to_idx].id.clone(),
-                                role: r.role,
-                                confidence: Confidence::Exact,
-                                provenance: Provenance::ScopeGraph,
-                                occ: r.occ.clone(),
-                            });
-                        }
-                    }
-                    continue; // qualified ref handled (edge or honest no-op) — never fall through
-                }
-
-                // UNQUALIFIED: existing lexical scope_walk path (needs r.scope).
-                // No scope info on the reference → no Tier-B edge.
-                let Some(start) = r.scope else { continue };
-
-                let Some(binding) =
-                    scope_walk(&r.name, r.occ.byte, start, &f.scopes, &bindings_by_scope)
-                else {
-                    continue; // name binds to nothing visible — no edge
-                };
-
-                match binding.kind {
-                    BindingKind::Local | BindingKind::Param => {
-                        // A name-use exactly at its own binding's introduction site is the
-                        // definition, not a reference — emit no self-edge. (In Python,
-                        // `base = helper()` both defines `base` and is its write site; the
-                        // write must not resolve to itself.)
-                        if binding.intro == r.occ.byte {
-                            continue;
-                        }
-                        // Stable, unique id for the local: file + scope + name +
-                        // intro byte distinguishes shadowing bindings of one name.
-                        let local_id = format!(
-                            "{}@{}:{}@{}",
-                            f.file, binding.scope, binding.name, binding.intro
-                        );
-                        let to = SymbolId::local(f.file.clone(), local_id);
-
-                        edges.push(Edge {
-                            from: symbols[from_idx].id.clone(),
-                            to,
-                            role: r.role,
-                            confidence: Confidence::Exact,
-                            provenance: Provenance::ScopeGraph,
-                            occ: r.occ.clone(),
-                        });
-                    }
-                    BindingKind::Definition => {
-                        // Same-file definition: resolve to the bound symbol's identity, precisely.
-                        if let BindingTarget::Def(target_id) = &binding.target {
-                            edges.push(Edge {
-                                from: symbols[from_idx].id.clone(),
-                                to: target_id.clone(),
-                                role: r.role,
-                                confidence: Confidence::Scoped,
-                                provenance: Provenance::ScopeGraph,
-                                occ: r.occ.clone(),
-                            });
-                        }
-                        // (A Definition binding always carries Def(_); the `if let` is defensive.)
-                    }
-                    BindingKind::Import => {
-                        if let BindingTarget::Import(from_path) = &binding.target {
-                            let segs: &[&str] = import_segs_cache
-                                .get(from_path.as_str())
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]);
-                            if !segs.is_empty() {
-                                // Among global symbols sharing the imported name, find the
-                                // UNIQUE one whose namespace chain ends with the import path
-                                // segments.
-                                if let Some(to_idx) = unique_suffix_match(
-                                    &by_name,
-                                    &symbols,
-                                    binding.name.as_str(),
-                                    segs,
-                                ) {
-                                    edges.push(Edge {
-                                        from: symbols[from_idx].id.clone(),
-                                        to: symbols[to_idx].id.clone(),
-                                        role: r.role,
-                                        confidence: Confidence::Exact,
-                                        provenance: Provenance::ScopeGraph,
-                                        occ: r.occ.clone(),
-                                    });
-                                }
-                            }
-                        }
-                        // No from_path, empty segs, or non-unique match → no edge
-                        // (Tier-B never fakes precision; Tier-A still provides recall
-                        // via fan-out for those).
-                    }
-                }
-            }
+        let mut all_pending = Vec::new();
+        for sub in subs {
+            edges.extend(sub.intra_edges);
+            all_pending.extend(sub.pending);
         }
+        edges.extend(stitch(&all_pending, &index));
 
         CodeGraph { symbols, edges }
-    }
-}
-
-/// The unique index into `symbols` whose leaf name is `name` and whose
-/// namespace chain ends with `segs`, or `None` if zero or more than one
-/// candidate matches (Tier-B never fakes precision).
-fn unique_suffix_match(
-    by_name: &HashMap<&str, Vec<usize>>,
-    symbols: &[Symbol],
-    name: &str,
-    segs: &[&str],
-) -> Option<usize> {
-    by_name.get(name).and_then(|cands| {
-        let mut it = cands
-            .iter()
-            .filter(|&&i| namespaces_end_with(&symbols[i].id, segs));
-        match (it.next(), it.next()) {
-            (Some(&only), None) => Some(only), // exactly one match
-            _ => None,                         // zero or ambiguous → no edge
-        }
-    })
-}
-
-/// Walk lexical scopes outward from `start` looking for the binding that the
-/// name resolves to. Returns the winning binding (caller dispatches on kind).
-///
-/// The walk goes outward only (child → parent), so a reference never sees
-/// bindings in sibling or child scopes — block visibility falls out for free.
-fn scope_walk<'b>(
-    name: &str,
-    ref_byte: usize,
-    start: ScopeId,
-    scopes: &[Scope],
-    bindings_by_scope: &HashMap<ScopeId, Vec<&'b Binding>>,
-) -> Option<&'b Binding> {
-    let mut current = start;
-    loop {
-        if let Some(cands) = bindings_by_scope.get(&current) {
-            // Visible candidates in THIS scope, matching the name. On shadowing
-            // (multiple matches), the latest introduction wins.
-            let winner = cands
-                .iter()
-                .copied()
-                .filter(|b| b.name == name && is_visible(b, ref_byte))
-                .max_by_key(|b| b.intro);
-            if let Some(b) = winner {
-                return Some(b);
-            }
-        }
-        match scopes.get(current).and_then(|s| s.parent) {
-            Some(p) => current = p,
-            None => return None, // reached root with no match
-        }
-    }
-}
-
-/// Visibility: `let` locals are position-gated (must be introduced before use);
-/// params, definitions, and imports are visible scope-wide.
-fn is_visible(b: &Binding, ref_byte: usize) -> bool {
-    match b.kind {
-        BindingKind::Local => b.intro <= ref_byte,
-        BindingKind::Param | BindingKind::Definition | BindingKind::Import => true,
     }
 }
 
@@ -316,6 +103,7 @@ mod tests {
     use crate::extract::Extractor;
     use crate::extract::PythonExtractor;
     use crate::extract::RustExtractor;
+    use crate::graph::types::{Confidence, Provenance};
 
     /// Python: an import disambiguates an otherwise-ambiguous cross-file call —
     /// the scope tier binds the call to the imported definition alone, where the

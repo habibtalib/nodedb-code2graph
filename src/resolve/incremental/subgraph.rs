@@ -21,8 +21,9 @@ use crate::symbol::SymbolId;
 use super::super::{enclosing_symbol_index, normalize_from_path};
 
 /// A cross-file reference whose resolution is deferred to the stitch phase.
-/// Both qualified calls and imports reduce to "match `name` whose namespace
-/// chain ends with `segs`, uniquely" — they differ only in `role`.
+/// Qualified calls, imports, and unqualified same-namespace cross-file calls
+/// all reduce to "match `name` whose namespace chain ends with `segs`,
+/// uniquely" — they differ only in `role` and `confidence`.
 #[derive(Clone)]
 pub(crate) struct PendingRef {
     /// Caller (resolved intra-file).
@@ -33,6 +34,11 @@ pub(crate) struct PendingRef {
     pub segs: Vec<String>,
     pub role: RefRole,
     pub occ: Occurrence,
+    /// Confidence to stamp on the resolved edge. Explicit written paths
+    /// (qualified calls, imports) are [`Confidence::Exact`]; an unqualified
+    /// same-namespace cross-file match (e.g. a Go same-package call) is
+    /// [`Confidence::Scoped`] — consistent with same-file Definition resolution.
+    pub confidence: Confidence,
 }
 
 /// The resolution facts for ONE file, isolated from all other files.
@@ -77,6 +83,18 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
         }
     }
 
+    // This file's own namespace (the package, for Go), derived from any defined
+    // symbol's `Namespace` descriptors. All of a file's symbols share it. Used
+    // to defer unqualified, unbound references so the stitch phase can match a
+    // same-namespace definition in another file (e.g. a Go same-package call
+    // with no import). Empty when the file defines no namespaced symbol — then
+    // we never defer (nothing to match against; Tier-B never fakes precision).
+    let file_namespace: Vec<String> = symbols
+        .iter()
+        .find(|s| s.id.namespaces_iter().next().is_some())
+        .map(|s| s.id.namespaces_iter().map(str::to_owned).collect())
+        .unwrap_or_default();
+
     let mut intra_edges: Vec<Edge> = Vec::new();
     let mut pending: Vec<PendingRef> = Vec::new();
 
@@ -112,6 +130,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                     segs: segs.iter().map(|s| s.to_string()).collect(),
                     role: r.role,
                     occ: r.occ.clone(),
+                    confidence: Confidence::Exact,
                 });
             }
             continue; // qualified ref handled (deferred or honest no-op)
@@ -123,7 +142,23 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
 
         let Some(binding) = scope_walk(&r.name, r.occ.byte, start, &f.scopes, &bindings_by_scope)
         else {
-            continue; // name binds to nothing visible — no edge
+            // Not bound anywhere visible in this file. It may be a same-namespace
+            // definition in ANOTHER file (e.g. a Go same-package call with no
+            // import). Defer it scoped to THIS file's namespace so stitch matches
+            // only a sibling-file def of the same package — never cross-package,
+            // and a no-op for languages whose files have distinct namespaces.
+            // No namespace known (symbol-less file) → drop (don't fake precision).
+            if !file_namespace.is_empty() {
+                pending.push(PendingRef {
+                    from,
+                    name: r.name.clone(),
+                    segs: file_namespace.clone(),
+                    role: r.role,
+                    occ: r.occ.clone(),
+                    confidence: Confidence::Scoped,
+                });
+            }
+            continue;
         };
 
         match binding.kind {
@@ -184,6 +219,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                             segs: segs.iter().map(|s| s.to_string()).collect(),
                             role: r.role,
                             occ: r.occ.clone(),
+                            confidence: Confidence::Exact,
                         });
                     }
                     // Empty segs → drop (Tier-B never fakes precision; Tier-A

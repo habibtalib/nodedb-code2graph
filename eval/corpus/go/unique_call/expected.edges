@@ -1,0 +1,6 @@
+# Cross-file SAME-PACKAGE call with NO import: `Run` in main.go calls `Helper`
+# in util.go, both `package main`. Both files share the namespace `main` (from
+# the package clause, not the file stem), so Tier-B defers the unbound call and
+# the stitch phase matches the unique same-namespace `Helper` definition. Tier-A
+# also resolves it on the unique global candidate.
+main.go:4 Call util.go:3

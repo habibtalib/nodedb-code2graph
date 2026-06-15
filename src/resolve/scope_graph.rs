@@ -517,6 +517,50 @@ mod tests {
     }
 
     #[test]
+    fn go_same_package_cross_file_call_resolves_scoped() {
+        // Go same-package call with NO import: `Run` in main.go calls `Helper`
+        // in util.go, both `package main`. They share namespace ["main"], so the
+        // unbound call is deferred and stitched to the unique same-namespace
+        // `Helper`. Confidence is Scoped (not Exact — no explicit written path).
+        use crate::extract::GoExtractor;
+        use crate::graph::types::RefRole;
+        let util = GoExtractor
+            .extract("package main\nfunc Helper() {}\n", "util.go")
+            .unwrap();
+        let main = GoExtractor
+            .extract("package main\nfunc Run() {\n\tHelper()\n}\n", "main.go")
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[util, main]);
+
+        let edges: Vec<&Edge> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                e.role == RefRole::Call
+                    && e.from.to_scip_string().ends_with("main/Run().")
+                    && e.to.to_scip_string().ends_with("main/Helper().")
+            })
+            .collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one Run→Helper cross-file edge, got: {:?}",
+            graph
+                .edges
+                .iter()
+                .map(|e| format!("{} → {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            edges[0].confidence,
+            Confidence::Scoped,
+            "same-package cross-file call must be Scoped"
+        );
+        assert_eq!(edges[0].provenance, Provenance::ScopeGraph);
+    }
+
+    #[test]
     fn ambiguous_import_becomes_precise_single_exact_edge() {
         // Two files define `Config` in DIFFERENT namespaces:
         //   src/conf.rs   → ["conf"]

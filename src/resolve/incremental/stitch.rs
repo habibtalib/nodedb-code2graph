@@ -5,13 +5,14 @@
 //! The per-file phase defers every cross-file reference as a [`PendingRef`].
 //! This phase resolves them against a [`GlobalIndex`] — a leaf-name → SymbolIds
 //! map that owns its ids so a future incremental store can maintain it across
-//! edits. Each pending ref becomes at most one [`Confidence::Exact`] edge, only
-//! when its `(name, segs)` lookup has a UNIQUE match — Tier-B never fakes
-//! precision (zero or ambiguous → no edge).
+//! edits. Each pending ref becomes at most one edge, carrying the ref's own
+//! [`Confidence`](crate::graph::types::Confidence), only when its `(name, segs)`
+//! lookup has a UNIQUE match — Tier-B never fakes precision (zero or ambiguous →
+//! no edge).
 
 use std::collections::HashMap;
 
-use crate::graph::types::{Confidence, Edge, Provenance, Symbol};
+use crate::graph::types::{Edge, Provenance, Symbol};
 use crate::symbol::SymbolId;
 
 use super::super::namespaces_end_with;
@@ -103,7 +104,10 @@ impl Default for GlobalIndex {
 }
 
 /// Resolve all pending cross-file refs into edges via the global index. One
-/// [`Confidence::Exact`] [`Provenance::ScopeGraph`] edge per unique match.
+/// [`Provenance::ScopeGraph`] edge per unique match, stamped with the pending
+/// ref's own [`Confidence`](crate::graph::types::Confidence) (Exact for
+/// explicit written paths, Scoped for an
+/// unqualified same-namespace cross-file match).
 pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
     let mut edges = Vec::new();
     for p in pending {
@@ -112,7 +116,7 @@ pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
                 from: p.from.clone(),
                 to: matched_id.clone(),
                 role: p.role,
-                confidence: Confidence::Exact,
+                confidence: p.confidence,
                 provenance: Provenance::ScopeGraph,
                 occ: p.occ.clone(),
             });

@@ -1,0 +1,4 @@
+# oracle: SCIP index — location pairs (ref -> def), role-agnostic
+com/example/Main.java:3 com/example/alpha/Service.java:3
+com/example/Main.java:7 com/example/alpha/Service.java:3
+com/example/Main.java:7 com/example/alpha/Service.java:4

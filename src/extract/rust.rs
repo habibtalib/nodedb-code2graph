@@ -59,7 +59,7 @@ impl Extractor for RustExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
-        let ts_language = TsLanguage::from(tree_sitter_rust::LANGUAGE);
+        let ts_language = crate::grammar::rust();
         let mut parser = Parser::new();
         parser
             .set_language(&ts_language)
@@ -1325,7 +1325,7 @@ impl std::fmt::Display for Point {
     fn empty_source_produces_exactly_one_root_scope() {
         // Empty source → collect_scopes returns exactly one scope (the file root),
         // does not panic.
-        let ts_language = tree_sitter::Language::from(tree_sitter_rust::LANGUAGE);
+        let ts_language = crate::grammar::rust();
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&ts_language).unwrap();
         let tree = parser.parse("", None).unwrap();

@@ -415,10 +415,6 @@ pub(crate) fn import_bindings(refs: &[Reference], scopes: &[Scope]) -> Vec<Bindi
 
 #[cfg(test)]
 mod tests {
-    use crate::extract::Extractor as _;
-    use crate::extract::RustExtractor;
-    use crate::graph::types::SymbolKind;
-
     #[test]
     fn unquote_removes_double_quotes() {
         assert_eq!(super::unquote(r#""my table""#), "my table");
@@ -435,8 +431,13 @@ mod tests {
         assert_eq!(super::unquote(""), "");
     }
 
+    #[cfg(feature = "rust")]
     #[test]
     fn emits_module_symbol() {
+        use crate::extract::Extractor as _;
+        use crate::extract::RustExtractor;
+        use crate::graph::types::SymbolKind;
+
         let facts = RustExtractor
             .extract("pub fn f() {}", "src/util.rs")
             .unwrap();

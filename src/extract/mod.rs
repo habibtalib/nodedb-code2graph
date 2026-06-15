@@ -12,42 +12,75 @@
 mod dispatch;
 mod support;
 
+#[cfg(feature = "c")]
 pub mod c;
+#[cfg(feature = "cpp")]
 pub mod cpp;
+#[cfg(feature = "go")]
 pub mod go;
+#[cfg(feature = "hcl")]
 pub mod hcl;
+#[cfg(feature = "java")]
 pub mod java;
+#[cfg(feature = "typescript")]
 pub mod javascript;
+#[cfg(feature = "kotlin")]
 pub mod kotlin;
+#[cfg(feature = "php")]
 pub mod php;
+#[cfg(feature = "python")]
 pub mod python;
+#[cfg(feature = "ruby")]
 pub mod ruby;
+#[cfg(feature = "rust")]
 pub mod rust;
+#[cfg(feature = "shell")]
 pub mod shell;
+#[cfg(feature = "solidity")]
 pub mod solidity;
+#[cfg(feature = "sql")]
 pub mod sql;
+#[cfg(feature = "swift")]
 pub mod swift;
+#[cfg(feature = "typescript")]
 pub mod typescript;
 
 pub use dispatch::{Extractor, extract_file, extract_path};
 
+#[cfg(feature = "c")]
 pub use c::CExtractor;
+#[cfg(feature = "cpp")]
 pub use cpp::CppExtractor;
+#[cfg(feature = "go")]
 pub use go::GoExtractor;
+#[cfg(feature = "hcl")]
 pub use hcl::HclExtractor;
+#[cfg(feature = "java")]
 pub use java::JavaExtractor;
+#[cfg(feature = "typescript")]
 pub use javascript::JavaScriptExtractor;
+#[cfg(feature = "kotlin")]
 pub use kotlin::KotlinExtractor;
+#[cfg(feature = "php")]
 pub use php::PhpExtractor;
+#[cfg(feature = "python")]
 pub use python::PythonExtractor;
+#[cfg(feature = "ruby")]
 pub use ruby::RubyExtractor;
+#[cfg(feature = "rust")]
 pub use rust::RustExtractor;
+#[cfg(feature = "shell")]
 pub use shell::ShellExtractor;
+#[cfg(feature = "solidity")]
 pub use solidity::SolidityExtractor;
+#[cfg(feature = "sql")]
 pub use sql::SqlExtractor;
+#[cfg(feature = "swift")]
 pub use swift::SwiftExtractor;
+#[cfg(feature = "typescript")]
 pub use typescript::TypeScriptExtractor;
 
+#[allow(unused_imports)]
 pub(crate) use support::{
     MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
     field_text, import_bindings, innermost_scope, is_static, module_symbol, node_occurrence,

@@ -48,6 +48,7 @@
 
 pub mod error;
 pub mod extract;
+pub mod grammar;
 pub mod graph;
 pub mod lang;
 pub mod package;

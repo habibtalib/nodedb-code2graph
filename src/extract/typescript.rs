@@ -15,7 +15,7 @@
 //! extractor, which reuses the TypeScript grammar (a superset of JavaScript);
 //! the two differ only in their language tag.
 
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
@@ -58,13 +58,11 @@ impl Extractor for TypeScriptExtractor {
 /// superset of JavaScript, so both extractors parse with it; `lang` selects the
 /// language tag and SCIP scheme. `.tsx`/`.jsx` files use the TSX grammar.
 pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Result<FileFacts> {
-    let ts_lang = if file.ends_with(".tsx") || file.ends_with(".jsx") {
-        tree_sitter_typescript::LANGUAGE_TSX
+    let ts_language = if file.ends_with(".tsx") || file.ends_with(".jsx") {
+        crate::grammar::tsx()
     } else {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+        crate::grammar::typescript()
     };
-
-    let ts_language = TsLanguage::from(ts_lang);
     let mut parser = Parser::new();
     parser
         .set_language(&ts_language)

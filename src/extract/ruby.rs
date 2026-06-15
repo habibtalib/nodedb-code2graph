@@ -18,7 +18,7 @@
 //!
 //! References: callee identifiers of `(call method: (identifier) @callee)` nodes.
 
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
@@ -49,7 +49,7 @@ impl Extractor for RubyExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
-        let ts_language = TsLanguage::from(tree_sitter_ruby::LANGUAGE);
+        let ts_language = crate::grammar::ruby();
         let mut parser = Parser::new();
         parser
             .set_language(&ts_language)

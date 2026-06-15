@@ -21,7 +21,7 @@
 //! are not nested. `${…}` interpolations wrap the same chain inside
 //! `template_interpolation` → `expression`, so the same traversal applies.
 
-use tree_sitter::{Language as TsLanguage, Node, Parser};
+use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
@@ -41,7 +41,7 @@ impl Extractor for HclExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
-        let ts_language = TsLanguage::from(tree_sitter_hcl::LANGUAGE);
+        let ts_language = crate::grammar::hcl();
         let mut parser = Parser::new();
         parser
             .set_language(&ts_language)

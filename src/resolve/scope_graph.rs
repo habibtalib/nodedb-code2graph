@@ -102,6 +102,22 @@ impl Resolver for ScopeGraphResolver {
                 bindings_by_scope.entry(b.scope).or_default().push(b);
             }
 
+            // Precompute normalized import-path segments once per unique from_path.
+            // Many references in a file can resolve to the same import binding
+            // (e.g. an imported name used 50 times); without this cache,
+            // `normalize_from_path` would re-split and re-filter the same string
+            // on every such reference. The cache borrows `from_path` strings and
+            // segment slices from `f.bindings`, which lives for the whole inner
+            // block — lifetimes are fine.
+            let mut import_segs_cache: HashMap<&str, Vec<&str>> = HashMap::new();
+            for b in &f.bindings {
+                if let BindingTarget::Import(fp) = &b.target {
+                    import_segs_cache
+                        .entry(fp.as_str())
+                        .or_insert_with(|| normalize_from_path(fp.as_str()));
+                }
+            }
+
             for r in &f.references {
                 // Caller attribution — needed by both the qualified and unqualified paths.
                 let Some(from_idx) = syms_by_file
@@ -188,7 +204,10 @@ impl Resolver for ScopeGraphResolver {
                     }
                     BindingKind::Import => {
                         if let BindingTarget::Import(from_path) = &binding.target {
-                            let segs = normalize_from_path(from_path);
+                            let segs: &[&str] = import_segs_cache
+                                .get(from_path.as_str())
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[]);
                             if !segs.is_empty() {
                                 // Among global symbols sharing the imported name, find the
                                 // UNIQUE one whose namespace chain ends with the import path
@@ -197,7 +216,7 @@ impl Resolver for ScopeGraphResolver {
                                     &by_name,
                                     &symbols,
                                     binding.name.as_str(),
-                                    &segs,
+                                    segs,
                                 ) {
                                     edges.push(Edge {
                                         from: symbols[from_idx].id.clone(),

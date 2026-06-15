@@ -1,0 +1,6 @@
+# Same-file call: `Run` calls `Helper`, both defined in main.go.
+# Proves Tier-B same-file Scoped resolution: the `Helper()` call on line 6
+# resolves to the `func Helper` definition on line 3, not fanning out to any
+# external same-named symbol. (Exported names: the extractor captures the
+# public surface only — see is_exported in go.rs.)
+main.go:6 Call main.go:3

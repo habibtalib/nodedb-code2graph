@@ -136,13 +136,52 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
     }
 }
 
+/// Recover the `(file, 1-based def line)` for an edge target that is a
+/// synthesized local symbol, by parsing its SCIP string of the form
+/// `local <file>@<scope>:<name>@<intro>` where `intro` is the 0-based byte
+/// offset of the binding introduction, and converting that offset to a line
+/// number using the file's source text.
+///
+/// Returns `None` if the string isn't in local form, the file has no source
+/// entry, or the byte offset is out of range.
+///
+/// Assumption (noted here): the file basename and binding name contain no `@`
+/// character. This holds for the corpus basenames and all valid identifiers.
+fn local_def_loc(
+    scip: &str,
+    sources: &std::collections::HashMap<String, String>,
+) -> Option<(String, u32)> {
+    let rest = scip.strip_prefix("local ")?;
+    // file is everything before the FIRST '@'
+    let (file, after) = rest.split_once('@')?;
+    // intro is the integer after the LAST '@'
+    let intro: usize = after.rsplit_once('@')?.1.parse().ok()?;
+    let src = sources.get(file)?;
+    if intro > src.len() {
+        return None;
+    }
+    let line = 1 + src.as_bytes()[..intro]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count() as u32;
+    Some((file.to_string(), line))
+}
+
 /// Score a resolved [`CodeGraph`] against SCIP-oracle location pairs.
 ///
 /// Matching is location-only: an emitted edge is a true positive iff
 /// `(ref_file, ref_line, def_file, def_line)` appears in the oracle set.
 /// Role is ignored — SCIP occurrence roles don't map 1-to-1 onto
 /// code2graph's [`RefRole`] taxonomy.
-pub fn score_oracle(graph: &CodeGraph, oracle: &[(String, u32, String, u32)]) -> Scorecard {
+///
+/// `sources` maps each file basename to its full source text, used to
+/// resolve the definition line of local-symbol targets (synthesized locals
+/// carry a byte-offset rather than appearing in `graph.symbols`).
+pub fn score_oracle(
+    graph: &CodeGraph,
+    oracle: &[(String, u32, String, u32)],
+    sources: &std::collections::HashMap<String, String>,
+) -> Scorecard {
     // Build def location map the same way `score` does.
     let mut def_loc = std::collections::HashMap::new();
     for sym in &graph.symbols {
@@ -153,8 +192,12 @@ pub fn score_oracle(graph: &CodeGraph, oracle: &[(String, u32, String, u32)]) ->
         .edges
         .iter()
         .filter_map(|e| {
-            let (def_file, def_line) = def_loc.get(&e.to.to_scip_string())?;
-            Some((e.occ.file.clone(), e.occ.line, def_file.clone(), *def_line))
+            let scip = e.to.to_scip_string();
+            let (def_file, def_line) = def_loc
+                .get(&scip)
+                .cloned()
+                .or_else(|| local_def_loc(&scip, sources))?;
+            Some((e.occ.file.clone(), e.occ.line, def_file, def_line))
         })
         .collect();
 

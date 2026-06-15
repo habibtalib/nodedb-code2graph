@@ -25,7 +25,9 @@ pub fn score_case<R: Resolver>(case: &Case, resolver: &R) -> Scorecard {
         .collect();
     let graph = resolver.resolve(&facts);
     if !case.oracle.is_empty() {
-        score_oracle(&graph, &case.oracle)
+        let sources: std::collections::HashMap<String, String> =
+            case.files.iter().cloned().collect();
+        score_oracle(&graph, &case.oracle, &sources)
     } else {
         score(&graph, &case.expected)
     }

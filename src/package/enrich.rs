@@ -3,7 +3,7 @@
 //! Dep-free enrichment pass: stamps a [`Package`] onto every [`SymbolId`](crate::symbol::SymbolId)-bearing
 //! field in a [`FileFacts`]. Always compiled (no feature gate).
 
-use crate::graph::types::{BindingTarget, FileFacts};
+use crate::graph::types::{BindingTarget, CodeGraph, FileFacts};
 use crate::symbol::Package;
 
 /// Stamp `package` onto every [`SymbolId`](crate::symbol::SymbolId) carried by `facts`.
@@ -26,6 +26,31 @@ pub fn enrich(facts: &mut FileFacts, package: &Package) {
     }
     for export in &mut facts.ffi_exports {
         export.symbol = export.symbol.with_package(package.clone());
+    }
+}
+
+/// Stamp `package` onto every [`SymbolId`](crate::symbol::SymbolId) carried by a
+/// resolved [`CodeGraph`].
+///
+/// Unlike [`enrich`] (which operates on a single file's facts before
+/// resolution), a `CodeGraph`'s edges reference symbols *by* their `SymbolId`,
+/// so identity is matched by SCIP-string equality. This pass therefore rewrites
+/// all three id-bearing slots consistently:
+/// - `graph.symbols[*].id`
+/// - `graph.edges[*].from`
+/// - `graph.edges[*].to`
+///
+/// Both endpoints of every edge get the *same* package as the symbols they
+/// point at, so string-equality matching is preserved (no edge is broken).
+/// `Local` ids are left unchanged by [`SymbolId::with_package`](crate::symbol::SymbolId::with_package)
+/// — locals have no cross-repo coordinate — which is correct.
+pub fn enrich_codegraph(graph: &mut CodeGraph, package: &Package) {
+    for sym in &mut graph.symbols {
+        sym.id = sym.id.with_package(package.clone());
+    }
+    for edge in &mut graph.edges {
+        edge.from = edge.from.with_package(package.clone());
+        edge.to = edge.to.with_package(package.clone());
     }
 }
 
@@ -136,5 +161,72 @@ mod tests {
         assert_eq!(facts.bindings[1].target, BindingTarget::Local);
 
         assert_eq!(facts.ffi_exports[0].symbol.to_scip_string(), expected_scip);
+    }
+
+    #[test]
+    fn enrich_codegraph_restamps_symbols_and_both_edge_endpoints() {
+        use crate::graph::types::{CodeGraph, Confidence, Edge, Occurrence, Provenance, RefRole};
+
+        let pkg = Package {
+            manager: "cargo".into(),
+            name: "demo".into(),
+            version: "1.0.0".into(),
+        };
+
+        let from_id = SymbolId::global("rust", vec![Descriptor::Term("run".into())]);
+        let to_id = SymbolId::global("rust", vec![Descriptor::Term("helper".into())]);
+        // A Local id present as a symbol — must stay unchanged.
+        let local_id = SymbolId::local("src/main.rs", "x0");
+
+        let mut graph = CodeGraph {
+            symbols: vec![
+                make_symbol(from_id.clone()),
+                make_symbol(to_id.clone()),
+                make_symbol(local_id.clone()),
+            ],
+            edges: vec![Edge {
+                from: from_id,
+                to: to_id,
+                role: RefRole::Call,
+                confidence: Confidence::NameOnly,
+                provenance: Provenance::SymbolTable,
+                occ: Occurrence {
+                    file: "src/main.rs".into(),
+                    line: 1,
+                    col: 0,
+                    byte: 0,
+                },
+            }],
+        };
+
+        enrich_codegraph(&mut graph, &pkg);
+
+        // (1) Every global symbol id now carries the package (no '.' placeholders).
+        assert_eq!(
+            graph.symbols[0].id.to_scip_string(),
+            "codegraph cargo demo 1.0.0 run."
+        );
+        assert_eq!(
+            graph.symbols[1].id.to_scip_string(),
+            "codegraph cargo demo 1.0.0 helper."
+        );
+
+        // (3) The Local symbol id is unchanged.
+        assert_eq!(graph.symbols[2].id.to_scip_string(), "local x0");
+        assert_eq!(graph.symbols[2].id, local_id);
+
+        // (2) Both edge endpoints were rewritten and stay consistent with the
+        // enriched symbol ids (string-equality matching preserved).
+        assert_eq!(
+            graph.edges[0].from.to_scip_string(),
+            "codegraph cargo demo 1.0.0 run."
+        );
+        assert_eq!(graph.edges[0].from, graph.symbols[0].id);
+        assert_eq!(graph.edges[0].to, graph.symbols[1].id);
+
+        // SCIP round-trip: the enriched id parses back to the same string.
+        let scip = graph.edges[0].to.to_scip_string();
+        let reparsed = SymbolId::from_scip_string(&scip).expect("should parse");
+        assert_eq!(reparsed.to_scip_string(), scip);
     }
 }

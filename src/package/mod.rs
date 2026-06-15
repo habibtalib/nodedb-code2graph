@@ -12,6 +12,6 @@ pub mod enrich;
 #[cfg(feature = "manifest")]
 pub mod manifest;
 
-pub use enrich::enrich;
+pub use enrich::{enrich, enrich_codegraph};
 #[cfg(feature = "manifest")]
 pub use manifest::from_manifest;

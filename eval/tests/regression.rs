@@ -162,17 +162,23 @@ fn scip_oracle_tier_b_beats_tier_a_on_ambiguous_calls() {
     // Same thesis as `scope_tier_beats_name_tier_on_precision_where_it_resolves`,
     // but locked against an EXTERNAL SCIP oracle instead of hand-authored golden
     // edges: on the oracle lanes that include an ambiguous-call case
-    // ("rust_oracle", "py_oracle", "ts_oracle", "java_oracle"), Tier-B must be
-    // strictly more precise than Tier-A and invent no edges. For "java_oracle"
-    // the ambiguity is a cross-file qualified call: `Service.helper()` where two
-    // imported-vs-not `Service` classes define `helper()` — name-only resolution
-    // fans out to both, the scope tier follows the `import` to exactly one.
-    // "go_oracle" is excluded — it has no ambiguous_call case, so name resolution
-    // never fans out there.
+    // ("rust_oracle", "py_oracle", "ts_oracle", "java_oracle", "kotlin_oracle"),
+    // Tier-B must be strictly more precise than Tier-A and invent no edges. For
+    // the JVM lanes the ambiguity is cross-file: two packages export the same
+    // name (a `Service` class with `helper()` for Java, a top-level `compute()`
+    // for Kotlin) and only one is imported — name-only resolution fans out to
+    // both, the scope tier follows the `import` to exactly one. "go_oracle" is
+    // excluded — it has no ambiguous_call case, so name resolution never fans out.
     let cases = corpus();
     let a = per_language(&cases, &SymbolTableResolver);
     let b = per_language(&cases, &ScopeGraphResolver);
-    for lang in ["rust_oracle", "py_oracle", "ts_oracle", "java_oracle"] {
+    for lang in [
+        "rust_oracle",
+        "py_oracle",
+        "ts_oracle",
+        "java_oracle",
+        "kotlin_oracle",
+    ] {
         let (Some(a_l), Some(b_l)) = (a.get(lang), b.get(lang)) else {
             panic!("corpus must include {lang} cases");
         };

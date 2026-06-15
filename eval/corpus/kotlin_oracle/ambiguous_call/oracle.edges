@@ -1,0 +1,3 @@
+# oracle: SCIP index — location pairs (ref -> def), role-agnostic
+com/example/Main.kt:3 com/example/alpha/util.kt:3
+com/example/Main.kt:6 com/example/alpha/util.kt:3

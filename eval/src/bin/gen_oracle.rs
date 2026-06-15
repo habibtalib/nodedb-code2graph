@@ -45,9 +45,8 @@ fn main() {
         }
     };
 
-    let mut out = String::from(
-        "# oracle: SCIP index \u{2014} location pairs (ref -> def), role-agnostic\n",
-    );
+    let mut out =
+        String::from("# oracle: SCIP index \u{2014} location pairs (ref -> def), role-agnostic\n");
     for (ref_file, ref_line, def_file, def_line) in &edges {
         out.push_str(&format!("{ref_file}:{ref_line} {def_file}:{def_line}\n"));
     }

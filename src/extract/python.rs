@@ -15,14 +15,15 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    import_bindings, node_span, node_text, one_line_signature, push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, import_bindings, node_span, node_text, one_line_signature, push_binding, push_ref,
+    push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -77,6 +78,9 @@ impl Extractor for PythonExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
+        collect_type_references(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -354,6 +358,212 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     // Recurse into all children so nested class definitions are covered.
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: TypeRef / Read / Write ────────────────────────────────────
+
+/// Emit a [`RefRole::TypeRef`] reference by inspecting a `type:` field value.
+///
+/// In tree-sitter-python the `type:` field holds one of:
+/// - `identifier`  — bare name like `int`, `Config`.
+/// - `generic_type` — `List[int]`, `Dict[str, int]`: first named child is the
+///   `identifier` (outer type name); child `type_parameter` node holds the
+///   subscript args, each a `type` expression.
+/// - `union_type`  — `int | str`: two `type` children; recurse each with `ctx`.
+/// - `member_type` — `pkg.Sub`: the leaf `identifier` child (the last one) is
+///   the referenced name; we skip the qualifier.
+/// - Any other expression node (e.g. a string literal `"Foo"` for forward refs)
+///   is silently skipped.
+fn emit_type_node(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    ctx: TypeRefContext,
+    out: &mut Vec<Reference>,
+) {
+    match node.kind() {
+        // Transparent `type` wrapper (the named rule in tree-sitter-python that
+        // wraps a `type:` field value): unwrap and recurse into the single child.
+        "type" => {
+            for child in node.named_children(&mut node.walk()) {
+                emit_type_node(&child, bytes, file, ctx, out);
+            }
+        }
+        "identifier" => {
+            let name = node_text(node, bytes);
+            push_type_ref(out, name, node, file, ctx);
+        }
+        "generic_type" => {
+            // First named child is the base identifier.
+            if let Some(head) = node.named_children(&mut node.walk()).next() {
+                if head.kind() == "identifier" {
+                    push_type_ref(out, node_text(&head, bytes), &head, file, ctx);
+                }
+            }
+            // Second named child is `type_parameter` (`[...]`); its named
+            // children are `type` expressions → recurse as GenericArg.
+            if let Some(tp) = node
+                .named_children(&mut node.walk())
+                .find(|c| c.kind() == "type_parameter")
+            {
+                for child in tp.named_children(&mut tp.walk()) {
+                    emit_type_node(&child, bytes, file, TypeRefContext::GenericArg, out);
+                }
+            }
+        }
+        "union_type" => {
+            // Both sides are `type` expressions; recurse with the same context.
+            for child in node.named_children(&mut node.walk()) {
+                emit_type_node(&child, bytes, file, ctx, out);
+            }
+        }
+        "member_type" => {
+            // `pkg.Sub`: the last `identifier` child is the leaf name.
+            // (grammar: type "." identifier — the identifier is the second child)
+            if let Some(id) = node
+                .named_children(&mut node.walk())
+                .filter(|c| c.kind() == "identifier")
+                .last()
+            {
+                push_type_ref(out, node_text(&id, bytes), &id, file, ctx);
+            }
+        }
+        // Any other expression (string forward ref, etc.) — skip silently.
+        _ => {}
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// type-annotation position in Python source.
+///
+/// Covered positions:
+/// - `typed_parameter` / `typed_default_parameter` — `type:` field → `ParameterType`
+/// - `function_definition` — `return_type:` field → `ReturnType`
+/// - `assignment` with a `type:` field (annotated assignment / class body field)
+///   → `Field`
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "typed_parameter" | "typed_default_parameter" => {
+            if let Some(typ) = node.child_by_field_name("type") {
+                emit_type_node(&typ, bytes, file, TypeRefContext::ParameterType, out);
+            }
+        }
+        "function_definition" => {
+            if let Some(ret) = node.child_by_field_name("return_type") {
+                emit_type_node(&ret, bytes, file, TypeRefContext::ReturnType, out);
+            }
+            // Recurse into the function body to catch nested defs.
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return; // avoid double-recurse at the bottom
+        }
+        "assignment" => {
+            if let Some(typ) = node.child_by_field_name("type") {
+                emit_type_node(&typ, bytes, file, TypeRefContext::Field, out);
+            }
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
+}
+
+/// Returns `true` when `node` (an `identifier`) is in a non-read position —
+/// already captured by another collector — and must NOT also be emitted as a
+/// [`RefRole::Read`] reference.
+///
+/// Skipped positions:
+/// - Call callee: `call` node's `function:` field.
+/// - Declaration name: `function_definition` / `class_definition` `name:` field.
+/// - Parameter name: bare `identifier` directly in `parameters`; or the
+///   `identifier` inside `typed_parameter`, `default_parameter`,
+///   `typed_default_parameter`, `list_splat_pattern`, `dictionary_splat_pattern`.
+/// - Import binding: inside `import_statement` or `import_from_statement` or
+///   `dotted_name` or `aliased_import`.
+/// - Assignment LHS: `assignment` `left:` field (handled by writes).
+/// - Attribute name: `attribute` node's `attribute:` field.
+/// - Inside a `type` position: already a TypeRef; skip to avoid duplication.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true,
+    };
+    match parent.kind() {
+        // Call callee — `function:` field of a `call` node.
+        "call" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Declaration names.
+        "function_definition" | "class_definition" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Parameter: bare identifier directly inside `parameters`.
+        "parameters" => true,
+        // Typed / default parameter forms: the bound name identifier.
+        "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            // The name is the first named child (an identifier); not the type.
+            // We skip ALL identifier children of typed_parameter that are not
+            // in the `type:` field — those are the param names.
+            parent.child_by_field_name("type").as_ref() != Some(node) && node.kind() == "identifier"
+        }
+        "default_parameter" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "typed_default_parameter" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Import contexts — already Import refs.
+        "import_statement" | "import_from_statement" | "dotted_name" | "aliased_import" => true,
+        // Assignment LHS — handled by collect_write_references.
+        "assignment" => parent.child_by_field_name("left").as_ref() == Some(node),
+        // Attribute name (`obj.attr` — skip the `attr` identifier only).
+        "attribute" => parent.child_by_field_name("attribute").as_ref() == Some(node),
+        // Inside a `type` node (type annotation position) — already a TypeRef.
+        "type" => true,
+        // `generic_type`'s first identifier is the type name — already TypeRef.
+        "generic_type" => true,
+        // `union_type`, `member_type` — inside type position.
+        "union_type" | "member_type" => true,
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions. Applies [`MIN_REF_LEN`].
+///
+/// Skips positions handled by other collectors (call callees, declaration names,
+/// parameter names, import bindings, assignment LHS, attribute property names,
+/// type-annotation positions).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment` nodes (e.g. `x = 5`, `base = helper()`).
+///
+/// Attribute/subscript LHS (`obj.attr = …`, `arr[i] = …`) are not covered in
+/// v1. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
     }
 }
 
@@ -775,6 +985,147 @@ MAX_RETRIES = 3
                 r.name
             );
         }
+    }
+
+    // ── Edge richness: TypeRef / Read / Write ────────────────────────────────
+
+    #[test]
+    fn py_param_type_ref_emitted() {
+        // `def f(c: Config): pass` → TypeRef "Config" with ParameterType ctx.
+        let src = "def f(c: Config): pass\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn py_return_type_ref_emitted() {
+        // `def f() -> Config: pass` → TypeRef "Config" with ReturnType ctx.
+        let src = "def f() -> Config: pass\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn py_annotated_field_type_ref_emitted() {
+        // `class C:\n    name: Config` → TypeRef "Config" with Field ctx.
+        let src = "class C:\n    name: Config\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn py_read_ref_emitted_for_use_not_declaration() {
+        // `def f():\n    base = 1\n    return base`
+        // → Read ref for `base` in `return base`; the LHS `base` is a Write, not a Read.
+        let src = "def f():\n    base = 1\n    return base\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none"
+        );
+        // `return base` starts after the assignment line (byte > 20).
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 20)
+            .expect("expected Read ref for 'base' in the return statement (byte > 20)");
+        assert!(
+            use_ref.occ.byte > 20,
+            "Read ref should be at the use site, not the declaration"
+        );
+    }
+
+    #[test]
+    fn py_write_ref_emitted_for_assignment() {
+        // `def f():\n    xxx = 5` → Write ref for `xxx`.
+        let src = "def f():\n    xxx = 5\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "xxx")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'xxx', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn py_call_not_also_read() {
+        // `helper()` → a Call ref for "helper", but NOT also a Read ref.
+        let src = "def run():\n    helper()\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn py_attribute_not_a_read_of_property() {
+        // `obj.foo` → no Read ref named "foo" (only `obj` can be a Read).
+        let src = "def run():\n    return obj.foo\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let foo_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "foo")
+            .collect();
+        assert!(
+            foo_reads.is_empty(),
+            "attribute 'foo' must NOT be a Read ref; got: {foo_reads:?}"
+        );
     }
 
     // --- from_path tests ---

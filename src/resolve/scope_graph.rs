@@ -171,6 +171,13 @@ impl Resolver for ScopeGraphResolver {
 
                 match binding.kind {
                     BindingKind::Local | BindingKind::Param => {
+                        // A name-use exactly at its own binding's introduction site is the
+                        // definition, not a reference — emit no self-edge. (In Python,
+                        // `base = helper()` both defines `base` and is its write site; the
+                        // write must not resolve to itself.)
+                        if binding.intro == r.occ.byte {
+                            continue;
+                        }
                         // Stable, unique id for the local: file + scope + name +
                         // intro byte distinguishes shadowing bindings of one name.
                         let local_id = format!(

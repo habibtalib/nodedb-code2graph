@@ -117,10 +117,14 @@ impl GlobalIndex {
 
     /// The UNIQUE SymbolId whose leaf name is `name` and whose namespace chain
     /// ends with `segs`; `None` if zero or two-or-more candidates match (never
-    /// fake precision).
+    /// fake precision). Empty `segs` matches by name alone (used by cross-artifact
+    /// `TypeRef`s, whose target may live in a different artifact's namespace) —
+    /// uniqueness still decides, so precision is preserved.
     fn unique_match(&self, name: &str, segs: &[String]) -> Option<&SymbolId> {
         self.by_name.get(name).and_then(|cands| {
-            let mut it = cands.iter().filter(|id| namespaces_end_with(id, segs));
+            let mut it = cands
+                .iter()
+                .filter(|id| segs.is_empty() || namespaces_end_with(id, segs));
             match (it.next(), it.next()) {
                 (Some(only), None) => Some(only), // exactly one match
                 _ => None,                        // zero or ambiguous → no edge

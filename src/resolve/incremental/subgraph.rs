@@ -159,6 +159,28 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
 
         let Some(binding) = scope_walk(&r.name, r.occ.byte, start, &f.scopes, &bindings_by_scope)
         else {
+            // CROSS-ARTIFACT TYPE REFERENCE: a `TypeRef` that no in-file binding
+            // satisfies may name a definition in a DIFFERENT artifact/namespace
+            // entirely — e.g. a Rust field type `users: Repo<users>` naming a SQL
+            // `users` table symbol that carries an EMPTY namespace. Scoping it to
+            // THIS file's namespace (below) would never match such a target, so a
+            // TypeRef instead defers with EMPTY segs: stitch matches it to the
+            // globally UNIQUE symbol of that name across all artifacts/namespaces.
+            // Precision is preserved by stitch's `unique_match` — zero or 2+
+            // candidates yield no edge, so this never fakes precision; it only
+            // adds recall where the name is globally unambiguous.
+            if r.role == RefRole::TypeRef {
+                pending.push(PendingRef {
+                    from,
+                    name: r.name.clone(),
+                    segs: Vec::new(),
+                    role: r.role,
+                    occ: r.occ.clone(),
+                    confidence: Confidence::Scoped,
+                });
+                continue;
+            }
+
             // Not bound anywhere visible in this file. It may be a same-namespace
             // definition in ANOTHER file (e.g. a Go same-package call with no
             // import). Defer it scoped to THIS file's namespace so stitch matches
@@ -293,5 +315,129 @@ fn is_visible(b: &Binding, ref_byte: usize) -> bool {
     match b.kind {
         BindingKind::Local => b.intro <= ref_byte,
         BindingKind::Param | BindingKind::Definition | BindingKind::Import => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::{Extractor, RustExtractor};
+
+    /// All `TypeRef` pending refs `build_subgraph` defers for `f`.
+    fn typeref_pendings(f: &FileFacts) -> Vec<PendingRef> {
+        build_subgraph(f)
+            .pending
+            .into_iter()
+            .filter(|p| p.role == RefRole::TypeRef)
+            .collect()
+    }
+
+    /// A cross-artifact-style `TypeRef` — a field type whose definition lives in
+    /// a DIFFERENT namespace and is unbound in this file — is deferred with EMPTY
+    /// `segs`, so the stitch phase can match it by globally-unique name alone
+    /// rather than by this file's namespace (which would never match a target in
+    /// another artifact/namespace). This is the recall fix for cross_artifact.
+    #[test]
+    fn unbound_typeref_defers_with_empty_segs() {
+        // `src/model.rs` → file namespace ["model"]. The field type `Users` has
+        // no in-file binding (it is defined elsewhere), so it must defer empty.
+        let consumer = RustExtractor
+            .extract("pub struct Order { who: Users }", "src/model.rs")
+            .unwrap();
+
+        let users_pending: Vec<PendingRef> = typeref_pendings(&consumer)
+            .into_iter()
+            .filter(|p| p.name == "Users")
+            .collect();
+
+        assert_eq!(
+            users_pending.len(),
+            1,
+            "expected exactly one deferred TypeRef for the unbound `Users`"
+        );
+        let p = &users_pending[0];
+        assert!(
+            p.segs.is_empty(),
+            "cross-artifact TypeRef must defer with empty segs (match by unique \
+             name across artifacts), got {:?}",
+            p.segs
+        );
+        assert_eq!(
+            p.confidence,
+            Confidence::Scoped,
+            "deferred TypeRef stays Scoped (never fakes Exact)"
+        );
+    }
+
+    /// Precision contract: an empty-`segs` TypeRef matches the target only when
+    /// it is GLOBALLY UNIQUE by name. With a single `Users` definition (in an
+    /// empty-namespace `src/lib.rs`, a different namespace than the consumer)
+    /// the unique-name match resolves to exactly one edge.
+    #[test]
+    fn cross_artifact_unique_typeref_resolves_one_edge() {
+        use super::super::stitch::{GlobalIndex, stitch};
+
+        // Target lives in an EMPTY namespace (src/lib.rs); consumer in ["model"].
+        let provider = RustExtractor
+            .extract("pub struct Users {}", "src/lib.rs")
+            .unwrap();
+        let consumer = RustExtractor
+            .extract("pub struct Order { who: Users }", "src/model.rs")
+            .unwrap();
+
+        let provider_sub = build_subgraph(&provider);
+        let consumer_sub = build_subgraph(&consumer);
+
+        let mut index = GlobalIndex::new();
+        index.insert_symbols(&provider_sub.symbols);
+
+        let type_edges: Vec<Edge> = stitch(&consumer_sub.pending, &index)
+            .into_iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.leaf_name() == Some("Users"))
+            .collect();
+
+        assert_eq!(
+            type_edges.len(),
+            1,
+            "a globally-unique cross-namespace TypeRef must resolve to exactly \
+             one ScopeGraph edge"
+        );
+        assert_eq!(type_edges[0].provenance, Provenance::ScopeGraph);
+        assert_eq!(type_edges[0].confidence, Confidence::Scoped);
+    }
+
+    /// Precision contract (the other side): when TWO definitions share the name
+    /// `Users`, the empty-`segs` match is ambiguous → stitch's `unique_match`
+    /// emits NO edge. Empty segs widen recall but never fake precision.
+    #[test]
+    fn ambiguous_typeref_resolves_no_edge() {
+        use super::super::stitch::{GlobalIndex, stitch};
+
+        // Two distinct `Users` defs in different namespaces.
+        let p1 = RustExtractor
+            .extract("pub struct Users {}", "src/a.rs")
+            .unwrap();
+        let p2 = RustExtractor
+            .extract("pub struct Users {}", "src/b.rs")
+            .unwrap();
+        let consumer = RustExtractor
+            .extract("pub struct Order { who: Users }", "src/model.rs")
+            .unwrap();
+
+        let consumer_sub = build_subgraph(&consumer);
+
+        let mut index = GlobalIndex::new();
+        index.insert_symbols(&build_subgraph(&p1).symbols);
+        index.insert_symbols(&build_subgraph(&p2).symbols);
+
+        let type_edges = stitch(&consumer_sub.pending, &index)
+            .into_iter()
+            .filter(|e| e.role == RefRole::TypeRef && e.to.leaf_name() == Some("Users"))
+            .count();
+
+        assert_eq!(
+            type_edges, 0,
+            "two same-named definitions → ambiguous → no edge (precision preserved)"
+        );
     }
 }

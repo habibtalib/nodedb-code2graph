@@ -1,0 +1,6 @@
+# Same-file call: `deploy` calls `helper`, both defined in deploy.sh.
+# Proves Tier-B same-file Scoped resolution: the `helper` bare-word command
+# on line 6 resolves to the `function helper` definition on line 1.
+# Shell captures all top-level function definitions; the call is a bare-word
+# command_name inside a function body, attributed to the enclosing Function scope.
+deploy.sh:6 Call deploy.sh:1

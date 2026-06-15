@@ -2,9 +2,11 @@
 
 //! Loads golden evaluation cases from the on-disk corpus.
 //!
-//! Layout: `corpus/<lang>/<case>/` holds the case's source files plus one
-//! `expected.edges` manifest. Each case resolves in isolation — references use
-//! plain basenames, so cases never collide.
+//! Layout: `corpus/<lang>/<case>/` holds the case's source files (at any depth)
+//! plus one `expected.edges` manifest at the case root. Each case resolves in
+//! isolation, so cases never collide. Source files are stored under their path
+//! relative to the case root (`/`-separated); for a flat case that path is just
+//! the basename.
 //!
 //! `expected.edges` lists one ground-truth ref→def edge per line:
 //!
@@ -32,7 +34,9 @@ pub struct Case {
     pub lang: String,
     /// Case directory name (used only for reporting).
     pub name: String,
-    /// `(basename, source)` for every source file in the case.
+    /// `(case_relative_path, source)` for every source file in the case, where
+    /// the path uses `/` separators (e.g. `main.rs`, `alpha/alpha.go`). For a
+    /// flat case the relative path equals the basename.
     pub files: Vec<(String, String)>,
     /// Ground-truth located ref→def edges (hand-authored, role-typed).
     pub expected: Vec<ExpectedEdge>,
@@ -59,17 +63,29 @@ fn load_case(lang: &str, name: &str, dir: &Path) -> io::Result<Case> {
     let mut files = Vec::new();
     let mut expected = Vec::new();
     let mut oracle = Vec::new();
-    let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-    entries.sort_by_key(|e| e.path());
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_file() {
+
+    // Collect every file at any depth, sorted by full path for stable output.
+    let mut all_files = Vec::new();
+    collect_files(dir, &mut all_files)?;
+    all_files.sort();
+
+    for path in all_files {
+        // The case-relative path with `/` separators (e.g. `alpha/alpha.go`,
+        // `main.rs`). For a flat case this equals the basename.
+        let Some(rel) = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .map(|s| s.replace(std::path::MAIN_SEPARATOR, "/"))
+        else {
+            // Non-UTF-8 path — skip rather than panic.
             continue;
-        }
-        let fname = file_name(&path);
-        // Skip binary oracle and non-source files — never feed to extract_path.
-        if fname == "index.scip" || fname == "oracle.edges" || fname == "expected.edges" {
-            if fname == "expected.edges" {
+        };
+
+        // Control files are recognised ONLY at the case root.
+        let is_root = !rel.contains('/');
+        if is_root && (rel == "index.scip" || rel == "oracle.edges" || rel == "expected.edges") {
+            if rel == "expected.edges" {
                 let text = fs::read_to_string(&path)?;
                 expected = parse_expected(&text).map_err(|msg| {
                     io::Error::new(
@@ -77,7 +93,7 @@ fn load_case(lang: &str, name: &str, dir: &Path) -> io::Result<Case> {
                         format!("{}/{}/expected.edges: {msg}", lang, name),
                     )
                 })?;
-            } else if fname == "oracle.edges" {
+            } else if rel == "oracle.edges" {
                 let text = fs::read_to_string(&path)?;
                 oracle = parse_oracle(&text).map_err(|msg| {
                     io::Error::new(
@@ -88,8 +104,9 @@ fn load_case(lang: &str, name: &str, dir: &Path) -> io::Result<Case> {
             }
             continue;
         }
+
         let text = fs::read_to_string(&path)?;
-        files.push((fname, text));
+        files.push((rel, text));
     }
     Ok(Case {
         lang: lang.to_string(),
@@ -98,6 +115,19 @@ fn load_case(lang: &str, name: &str, dir: &Path) -> io::Result<Case> {
         expected,
         oracle,
     })
+}
+
+/// Recursively collect every regular file under `dir` into `out`.
+fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Parse an `oracle.edges` file into location-only pairs.
@@ -238,6 +268,33 @@ mod tests {
     #[test]
     fn rejects_non_numeric_line() {
         assert!(parse_expected("main.rs:x Call util.rs:1").is_err());
+    }
+
+    #[test]
+    fn load_case_stores_case_relative_paths() {
+        use std::io::Write as _;
+
+        let tmp = std::env::temp_dir().join(format!("c2g_corpus_{}", std::process::id()));
+        let case = tmp.join("rust").join("nested");
+        fs::create_dir_all(case.join("sub")).unwrap();
+
+        // Flat file at root → basename.
+        let mut f = fs::File::create(case.join("x.rs")).unwrap();
+        f.write_all(b"// flat\n").unwrap();
+        // Nested file → `sub/y.rs`.
+        let mut f = fs::File::create(case.join("sub").join("y.rs")).unwrap();
+        f.write_all(b"// nested\n").unwrap();
+        // Control file at root only — parsed, not stored as a source file.
+        let mut f = fs::File::create(case.join("expected.edges")).unwrap();
+        f.write_all(b"x.rs:1 Call sub/y.rs:1\n").unwrap();
+
+        let loaded = load_case("rust", "nested", &case).unwrap();
+        let paths: Vec<&str> = loaded.files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["sub/y.rs", "x.rs"]);
+        assert_eq!(loaded.expected.len(), 1);
+        assert_eq!(loaded.expected[0].def_file, "sub/y.rs");
+
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

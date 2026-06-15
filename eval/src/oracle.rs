@@ -10,9 +10,10 @@ use scip::types::Index;
 use std::collections::HashMap;
 
 /// Parse a binary SCIP index and return sorted, deduplicated location pairs
-/// `(ref_basename, ref_line, def_basename, def_line)` where lines are 1-based.
+/// `(ref_path, ref_line, def_path, def_line)` where lines are 1-based and paths
+/// are the SCIP document's case-relative `relative_path` (e.g. `alpha/alpha.go`).
 ///
-/// - Pass 1: build a map from symbol string → (basename, 1-based line) for
+/// - Pass 1: build a map from symbol string → (relative_path, 1-based line) for
 ///   every occurrence whose `symbol_roles` has the Definition bit set (`& 1 != 0`).
 /// - Pass 2: for every non-definition occurrence whose symbol has a known
 ///   definition, emit a location pair. Self-loops (ref and def at the same
@@ -24,7 +25,7 @@ pub fn oracle_edges_from_scip(bytes: &[u8]) -> Result<Vec<(String, u32, String, 
     // Pass 1: collect definition sites keyed by symbol string.
     let mut def_by_symbol: HashMap<String, (String, u32)> = HashMap::new();
     for doc in &index.documents {
-        let basename = basename_of(&doc.relative_path);
+        let path = doc.relative_path.clone();
         for occ in &doc.occurrences {
             if occ.symbol.is_empty() {
                 continue;
@@ -34,7 +35,7 @@ pub fn oracle_edges_from_scip(bytes: &[u8]) -> Result<Vec<(String, u32, String, 
                 let line = occ.range.first().copied().unwrap_or(0) as u32 + 1;
                 def_by_symbol
                     .entry(occ.symbol.clone())
-                    .or_insert_with(|| (basename.clone(), line));
+                    .or_insert_with(|| (path.clone(), line));
             }
         }
     }
@@ -43,7 +44,7 @@ pub fn oracle_edges_from_scip(bytes: &[u8]) -> Result<Vec<(String, u32, String, 
     let mut edges: std::collections::BTreeSet<(String, u32, String, u32)> =
         std::collections::BTreeSet::new();
     for doc in &index.documents {
-        let ref_basename = basename_of(&doc.relative_path);
+        let ref_path = doc.relative_path.clone();
         for occ in &doc.occurrences {
             if occ.symbol.is_empty() {
                 continue;
@@ -55,17 +56,13 @@ pub fn oracle_edges_from_scip(bytes: &[u8]) -> Result<Vec<(String, u32, String, 
             if let Some((def_file, def_line)) = def_by_symbol.get(&occ.symbol) {
                 let ref_line = occ.range.first().copied().unwrap_or(0) as u32 + 1;
                 // Drop trivial self-loops (same file AND same line).
-                if &ref_basename == def_file && ref_line == *def_line {
+                if &ref_path == def_file && ref_line == *def_line {
                     continue;
                 }
-                edges.insert((ref_basename.clone(), ref_line, def_file.clone(), *def_line));
+                edges.insert((ref_path.clone(), ref_line, def_file.clone(), *def_line));
             }
         }
     }
 
     Ok(edges.into_iter().collect())
-}
-
-fn basename_of(path: &str) -> String {
-    path.split('/').next_back().unwrap_or(path).to_string()
 }

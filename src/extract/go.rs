@@ -33,11 +33,16 @@ use super::{
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
+///
+/// For a selector call (`pkg.Func()` / `recv.Method()`) the operand is captured
+/// as `@qualifier`. A package receiver (`alpha`) yields segs `["alpha"]` that the
+/// resolver matches to that package's symbol; a value/complex receiver simply
+/// matches no namespace, so Tier-B abstains (never a false edge).
 const CALL_QUERY: &str = r#"
 (call_expression
   function: [
     (identifier) @callee
-    (selector_expression field: (field_identifier) @callee)
+    (selector_expression operand: (_) @qualifier field: (field_identifier) @callee)
   ]
 )
 "#;
@@ -1212,6 +1217,38 @@ func main() {
             block_scope_id,
             h_ref.scope
         );
+    }
+
+    #[test]
+    fn selector_call_captures_package_qualifier() {
+        // `alpha.Helper()` → the Call ref for `Helper` carries qualifier `alpha`
+        // (the selector operand), so Tier-B can resolve the cross-package call.
+        let facts = GoExtractor
+            .extract(
+                "package main\nfunc Run() {\n\talpha.Helper()\n}\n",
+                "main.go",
+            )
+            .unwrap();
+        let call = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "Helper")
+            .expect("expected a Call ref for 'Helper'");
+        assert_eq!(call.qualifier.as_deref(), Some("alpha"));
+
+        // A bare same-package call carries no qualifier.
+        let bare = GoExtractor
+            .extract(
+                "package main\nfunc Helper() {}\nfunc Run() {\n\tHelper()\n}\n",
+                "main.go",
+            )
+            .unwrap();
+        let bare_call = bare
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "Helper")
+            .expect("expected a Call ref for 'Helper'");
+        assert_eq!(bare_call.qualifier, None);
     }
 
     #[test]

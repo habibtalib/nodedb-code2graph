@@ -25,8 +25,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding,
+    push_ref, push_scope,
 };
 
 // NOTE: SymbolKind has no Union variant; unions map to Struct. Preprocessor
@@ -82,6 +83,8 @@ impl Extractor for CppExtractor {
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Cpp, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -782,6 +785,118 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
     }
 }
 
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a position already
+/// captured by another collector and must NOT also be emitted as a
+/// [`RefRole::Read`] reference.
+///
+/// Skipped positions (C++ grammar):
+/// - Call callee: `call_expression` `function:` field bare `identifier`.
+/// - Declaration names extracted via the declarator chain: any `identifier`
+///   that is the leaf of a `declarator` field under `function_definition`,
+///   `declaration`, or `field_declaration`.
+/// - Parameter declarator names: bare `identifier` inside
+///   `parameter_declaration`, `optional_parameter_declaration`, or
+///   `variadic_parameter_declaration` (reached via the `declarator` field).
+/// - Field access name: `field_expression` `field:` field (`field_identifier`,
+///   a different node kind — but guard defensively in case grammar emits
+///   `identifier` there too).
+/// - Assignment LHS: `assignment_expression` `left:` — handled by writes.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true,
+    };
+    match parent.kind() {
+        // Call callee: free call `f()` — identifier is the `function:` field.
+        "call_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Qualified call callee: `Ns::f()` — `name:` field of qualified_identifier
+        // which is the `function:` of the call.  The `qualified_identifier` case
+        // is caught by is_non_read_position on the qualifier check below; here
+        // we skip the immediate `name:` identifier.
+        "qualified_identifier" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Declarator leaf names — the `declarator:` field chain of
+        // function_definition / declaration / field_declaration / init_declarator etc.
+        // declarator_name walks this chain; we skip every identifier that sits
+        // directly inside any declarator-family node's `declarator` field.
+        "function_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "array_declarator"
+        | "init_declarator"
+        | "attributed_declarator" => {
+            parent.child_by_field_name("declarator").as_ref() == Some(node)
+        }
+        // Parameter declarator binding — the identifier reached via the
+        // `declarator` field inside parameter_declaration / optional_parameter /
+        // variadic_parameter.
+        "parameter_declaration"
+        | "optional_parameter_declaration"
+        | "variadic_parameter_declaration" => {
+            // The `declarator` field is the binding; skip it.
+            parent.child_by_field_name("declarator").as_ref() == Some(node)
+        }
+        // Field access name (`obj->field` / `obj.field`): the `field:` field is a
+        // `field_identifier`, not an `identifier`, so this arm is defensive only.
+        "field_expression" => parent.child_by_field_name("field").as_ref() == Some(node),
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions. Applies [`MIN_REF_LEN`].
+///
+/// Skips:
+/// - Call callees (already [`RefRole::Call`]).
+/// - Declarator-chain leaf names (declaration names, parameter names).
+/// - `qualified_identifier` `name:` parts (the callee in qualified calls).
+/// - `field_expression` `field:` identifiers (field_identifier kind, excluded by
+///   node kind; guard in `is_non_read_position` handles any identifier there).
+/// - Assignment LHS (handled by [`collect_write_references`]).
+///
+/// The object/base of a `field_expression` (e.g. `ptr` in `ptr->field`) IS
+/// emitted as a Read because it is an `identifier` in the `argument:` position.
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` nodes (e.g. `x = 5`,
+/// `x += 1`, `x -= 1`).
+///
+/// Note: `int x = 5;` is a `declaration` with an `init_declarator` (a
+/// definition), NOT an `assignment_expression`, so it is not emitted here.
+/// Member / subscript / dereference LHS (`obj.field = …`, `arr[i] = …`,
+/// `*p = …`) are not covered in v1 — only bare identifiers. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_expression" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 /// Recursively walk `node` collecting `Inherit` references for every
 /// `class_specifier` and `struct_specifier` in the tree (including nested
 /// classes and those inside namespace blocks).
@@ -1263,6 +1378,106 @@ void run() {
             facts.scopes[a.scope].kind,
             ScopeKind::Function,
             "param 'a' should be in a Function scope"
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn read_ref_at_use_not_at_decl() {
+        // `int f() { int base = 1; return base; }`
+        // → Read ref for `base` at `return base`; the declarator `base` must NOT be Read.
+        let src = "int f() { int base = 1; return base; }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none"
+        );
+        // The `return base` starts after the init declarator (byte > 20).
+        // In `int f() { int base = 1; return base; }`, `return` is near byte 27.
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 20)
+            .expect("expected Read ref for 'base' in the return statement (byte > 20)");
+        assert!(
+            use_ref.occ.byte > 20,
+            "Read ref should be at the use site, not the declaration"
+        );
+    }
+
+    #[test]
+    fn write_ref_emitted_for_assignment() {
+        // `void f() { int cnt = 0; cnt = 5; }` → Write ref for `cnt` in `cnt = 5`.
+        let src = "void f() { int cnt = 0; cnt = 5; }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_not_also_read() {
+        // `void f() { helper(); }` → Call ref "helper", but NOT also a Read ref.
+        let src = "void f() { helper(); }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn field_access_reads_ptr_not_field() {
+        // `int f(S* ptr) { return ptr->field; }`
+        // → Read "ptr" (the object), no Read "field" (field_identifier, not identifier).
+        let src = "struct S { int field; };\nint f(S* ptr) { return ptr->field; }\n";
+        let facts = CppExtractor.extract(src, "src/f.cpp").unwrap();
+        // `ptr` should be a Read ref (it is an identifier in value position).
+        let ptr_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "ptr")
+            .collect();
+        assert!(
+            !ptr_reads.is_empty(),
+            "expected a Read ref for 'ptr', got none"
+        );
+        // `field` is a `field_identifier` — must NOT appear as a Read ref.
+        let field_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "field")
+            .collect();
+        assert!(
+            field_reads.is_empty(),
+            "field_identifier 'field' must NOT be a Read ref; got: {field_reads:?}"
         );
     }
 }

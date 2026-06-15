@@ -16,15 +16,16 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
+    ScopeId, ScopeKind, Symbol, SymbolKind,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding,
+    push_ref, push_scope,
 };
 
 // NOTE: SymbolKind has no Union or Macro variants; unions map to Struct,
@@ -76,6 +77,8 @@ impl Extractor for CExtractor {
         ));
         let mut references =
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::C, bytes, file)?;
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -526,6 +529,122 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
     }
 }
 
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a position that is already
+/// captured by another collector and must NOT also be emitted as a Read reference.
+///
+/// Skipped positions in tree-sitter-c:
+/// - **Call callee**: `call_expression` `function:` field → already [`RefRole::Call`].
+/// - **Declarator-chain names**: an `identifier` whose parent is any declarator
+///   wrapper (`pointer_declarator`, `function_declarator`, `init_declarator`,
+///   `array_declarator`, `attributed_declarator`) under the `declarator:` field,
+///   or a `parenthesized_declarator` (no named field, any child position).
+///   Also handles the outermost case: `declaration`, `type_definition`, or
+///   `function_definition` with `declarator:` field pointing at a bare `identifier`
+///   (e.g. `int x;` where the declarator IS the identifier).
+///   Same logic as [`declarator_name`] — those are binding introductions, not reads.
+/// - **Parameter names**: `parameter_declaration` `declarator:` field — the same
+///   declarator-chain logic catches these (the `declarator:` child of
+///   `parameter_declaration` is an `identifier` for simple `int x` params, or a
+///   deeper chain for `int *p` params; the chain terminus is always excluded via
+///   the parent-kind checks above).
+/// - **Field member**: `field_expression` `field:` is a `field_identifier` node
+///   (different kind), so bare `identifier` nodes never appear there — naturally
+///   excluded.
+/// - **Type identifiers**: `type_identifier` is a different node kind — naturally
+///   excluded (this function is only called for `identifier` nodes).
+/// - **Assignment LHS**: `assignment_expression` `left:` — handled by
+///   [`collect_write_references`].
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee: `helper()` — function: field of call_expression.
+        "call_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Declarator wrappers: the identifier is the bound name, not a read.
+        // These are the node kinds that declarator_name() traverses via their
+        // `declarator:` field. We check `declarator:` field to avoid false-skipping
+        // the `value:` side of an init_declarator (`int x = expr` — `expr` is a read).
+        "pointer_declarator"
+        | "function_declarator"
+        | "init_declarator"
+        | "array_declarator"
+        | "attributed_declarator" => {
+            parent.child_by_field_name("declarator").as_ref() == Some(node)
+        }
+        // parenthesized_declarator has no named field — any child is a decl name.
+        "parenthesized_declarator" => true,
+        // Outermost declarator slots in declaration / type_definition:
+        // a bare `int x;` has the identifier directly as the `declarator:` child
+        // of the `declaration` node. Same for typedef aliases in `type_definition`.
+        "declaration" | "type_definition" | "function_definition" => {
+            parent.child_by_field_name("declarator").as_ref() == Some(node)
+        }
+        // parameter_declaration `declarator:` field for simple `int x` params.
+        "parameter_declaration" => parent.child_by_field_name("declarator").as_ref() == Some(node),
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes in value/expression positions.
+///
+/// Skips identifiers that are:
+/// - Call callees (already [`RefRole::Call`]).
+/// - Declaration names (any position in a declarator chain: function name,
+///   variable name, typedef name, parameter name — detected by
+///   [`is_non_read_position`] which mirrors the traversal in [`declarator_name`]).
+/// - Assignment LHS (handled by [`collect_write_references`]).
+///
+/// `type_identifier` and `field_identifier` are distinct node kinds and are
+/// naturally excluded — only `identifier` nodes are examined.
+///
+/// Applies [`MIN_REF_LEN`] (same threshold as call references).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // `identifier` nodes have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` nodes (covers `=`, `+=`,
+/// `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`, `&=`, `^=`, `|=` — tree-sitter-c
+/// uses a single `assignment_expression` node for all operator variants).
+///
+/// Member / subscript / dereference LHS (`obj->f = …`, `arr[i] = …`, `*p = …`)
+/// are not covered in v1 — only bare `identifier` nodes. Applies [`MIN_REF_LEN`].
+///
+/// Note: `int x = 5;` is a `declaration` with an `init_declarator` (a binding
+/// introduction), NOT an `assignment_expression` — correctly excluded.
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_expression" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +1000,119 @@ int main(void) {
             call_ref.scope.is_some() && call_ref.scope != Some(0),
             "helper() call ref must be in a non-zero scope, got {:?}",
             call_ref.scope
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn read_at_use_not_at_decl() {
+        // `int f(void) { int base = 1; return base; }`
+        // → Read ref for the `base` in `return base`, NOT at the declarator.
+        let src = "int f(void) { int base = 1; return base; }\n";
+        let facts = CExtractor.extract(src, "src/r.c").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // `int base = 1;` spans the start of the body; `return base` is later.
+        // The declarator identifier sits early; the read must be after the `=`.
+        // In the snippet the `return` keyword is at byte ~36; verify use-site byte.
+        let use_ref = read_refs
+            .iter()
+            .find(|r| r.occ.byte > 20)
+            .expect("Read ref for 'base' should be at the return site (byte > 20)");
+        assert!(
+            use_ref.occ.byte > 20,
+            "Read ref byte {} should be in the return stmt, not the declarator",
+            use_ref.occ.byte
+        );
+    }
+
+    #[test]
+    fn write_ref_emitted_for_assignment() {
+        // `void f(void) { int cnt = 0; cnt = 5; }` → Write ref for `cnt = 5`.
+        let src = "void f(void) { int cnt = 0; cnt = 5; }\n";
+        let facts = CExtractor.extract(src, "src/w.c").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_not_also_read() {
+        // `void f(void) { helper(); }` → Call ref for "helper", but NOT also Read.
+        let src = "void f(void) { helper(); }\n";
+        let facts = CExtractor.extract(src, "src/nd.c").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn field_access_ptr_is_read_field_is_not() {
+        // `int f(struct S *ptr) { return ptr->field; }`
+        // → Read ref for `ptr` (the struct pointer), NO Read ref for `field`
+        //   (a `field_identifier`, not an `identifier`).
+        let src = "struct S { int val; };\nint f(struct S *ptr) { return ptr->val; }\n";
+        let facts = CExtractor.extract(src, "src/fa.c").unwrap();
+        // `ptr` is used as a read (RHS of `->`)
+        let ptr_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "ptr")
+            .collect();
+        assert!(
+            !ptr_reads.is_empty(),
+            "expected a Read ref for 'ptr', got none — all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // `val` is a field_identifier, not an identifier — must not appear as Read.
+        let val_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "val")
+            .collect();
+        assert!(
+            val_reads.is_empty(),
+            "field 'val' in field_expression must NOT produce a Read ref; got: {val_reads:?}"
         );
     }
 }

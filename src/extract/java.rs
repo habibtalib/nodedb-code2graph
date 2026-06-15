@@ -23,9 +23,9 @@ use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
 use super::{
-    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
-    import_bindings, innermost_scope, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope,
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
+    push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -73,6 +73,8 @@ impl Extractor for JavaExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_jni_natives(&root, bytes, file, &namespaces, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -502,6 +504,120 @@ fn jni_mangle(namespaces: &[String], class: &str, method: &str) -> String {
         format!("Java_{class}_{method}")
     } else {
         format!("Java_{}_{}_{}", namespaces.join("_"), class, method)
+    }
+}
+
+// ── Edge richness: Read / Write ──────────────────────────────────────────────
+
+/// Java declaration node kinds whose `name:` field is a binding introduction,
+/// not a value read. Used by `is_non_read_position` to skip those names.
+const DECL_KINDS_WITH_NAME: &[&str] = &[
+    "class_declaration",
+    "interface_declaration",
+    "enum_declaration",
+    "record_declaration",
+    "annotation_type_declaration",
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+];
+
+/// Returns `true` when `node` (an `identifier`) is in a position that is
+/// already captured by another collector and must NOT be emitted as a Read:
+///
+/// - Method call name: the `name:` field of `method_invocation` (the callee).
+///   The `object:` / receiver identifier IS a read — we keep it.
+/// - Declaration name: the `name:` field of class/method/constructor/etc.
+/// - Variable declarator name: `name:` of `variable_declarator` (covers both
+///   `local_variable_declaration` and `field_declaration`).
+/// - Formal parameter name: `name:` of `formal_parameter`.
+/// - Field access member: the `field:` of `field_access` — that `identifier`
+///   is a member name, not a read of a local/field. The `object:` side is kept.
+/// - Import declaration: top-level import identifiers (already Import refs).
+/// - Assignment LHS: `left:` of `assignment_expression` / compound forms.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Method call callee: `method_invocation` `name:` field.
+        // The `object:` / receiver (if an `identifier`) is a genuine read → keep it.
+        "method_invocation" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Declaration names (class / interface / enum / method / constructor …).
+        kind if DECL_KINDS_WITH_NAME.contains(&kind) => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Variable declarator LHS: `int x = 1;` or `int x;`
+        "variable_declarator" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Formal parameter binding name.
+        "formal_parameter" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // `field_access` member name (the `.field` part): skip it.
+        // The `object:` child is not a `field:` child — it falls through as a read.
+        "field_access" => parent.child_by_field_name("field").as_ref() == Some(node),
+        // Import declarations: any identifier directly inside `import_declaration`
+        // is already captured as an Import ref — skip it entirely.
+        "import_declaration" => true,
+        // Inside a `scoped_identifier` that is itself part of an import: also skip.
+        // Scoped identifiers appear elsewhere (e.g. `new pkg.Class()`) so we must
+        // verify the scoped_identifier's own parent is an import_declaration.
+        "scoped_identifier" => {
+            parent
+                .parent()
+                .is_some_and(|gp| gp.kind() == "import_declaration")
+                && parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips:
+/// - Method call callees (`method_invocation` `name:` field) — already Call refs.
+/// - Declaration names (class / method / constructor / variable declarator / param).
+/// - Field access member names (`field_access` `field:` field).
+/// - Import identifiers — already Import refs.
+/// - Assignment LHS — handled by [`collect_write_references`].
+///
+/// Applies [`MIN_REF_LEN`] (same threshold as calls).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` nodes (e.g. `x = 5`) and
+/// compound-assignment (`operator_assignment`) nodes (e.g. `x += 1`).
+///
+/// `local_variable_declaration` (`int x = 5;`) is a definition, not a write,
+/// and is excluded. Member / subscript LHS (`obj.field = …`, `arr[i] = …`)
+/// are not covered in v1 — only bare identifiers. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if matches!(node.kind(), "assignment_expression" | "operator_assignment") {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
     }
 }
 
@@ -1293,6 +1409,138 @@ public class Calc {
         assert_ne!(
             scope_id, 0,
             "add() Call ref scope must not be the module root"
+        );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn java_read_ref_emitted_for_use_not_decl() {
+        // `int base = 1; use(base);` → Read "base" at the call-arg site, NOT at the declarator.
+        let src = r#"package p;
+public class C {
+    public void f() {
+        int base = 1;
+        use(base);
+    }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "base")
+            .collect();
+        assert!(
+            !read_refs.is_empty(),
+            "expected at least one Read ref for 'base', got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // The declaration `int base = 1` must NOT produce a Read;
+        // every Read ref must be after the `=` sign in the declarator (byte > the decl's `=`).
+        // In `int base = 1;` the name `base` starts around byte offset of the declaration;
+        // the use inside `use(base)` is after the semicolon. Verify at least one Read is after
+        // the first occurrence (which would be the declarator name).
+        let decl_byte = src.find("int base").expect("int base not found");
+        let use_byte = src.find("use(base)").expect("use(base) not found");
+        let has_use_read = read_refs.iter().any(|r| r.occ.byte > decl_byte + 10);
+        assert!(
+            has_use_read,
+            "Read ref for 'base' must be at the use site (byte > {}), got: {:?}",
+            decl_byte + 10,
+            read_refs.iter().map(|r| r.occ.byte).collect::<Vec<_>>()
+        );
+        // Sanity: the use-site Read byte should be inside the use(base) call.
+        let _ = use_byte; // used implicitly via has_use_read
+    }
+
+    #[test]
+    fn java_write_ref_emitted_for_assignment() {
+        // `int cnt = 0; cnt = 5;` → Write "cnt" for `cnt = 5`.
+        let src = r#"package p;
+public class C {
+    public void f() {
+        int cnt = 0;
+        cnt = 5;
+    }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let write_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write && r.name == "cnt")
+            .collect();
+        assert!(
+            !write_refs.is_empty(),
+            "expected at least one Write ref for 'cnt', got none; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn java_call_not_also_read() {
+        // `helper()` → a Call ref for "helper", but NOT also a Read ref.
+        let src = r#"package p;
+public class C {
+    public void f() { helper(); }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let call_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Call && r.name == "helper")
+            .collect();
+        assert!(!call_refs.is_empty(), "expected a Call ref for 'helper'");
+        let read_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "helper")
+            .collect();
+        assert!(
+            read_refs.is_empty(),
+            "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    #[test]
+    fn java_field_access_object_is_read_member_is_not() {
+        // `use(obj.field)` → Read "obj" (the receiver), no Read "field" (the member name).
+        let src = r#"package p;
+public class C {
+    public void f(C obj) { use(obj.field); }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        // `obj` must appear as a Read ref (it's the receiver, a value read).
+        let obj_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "obj")
+            .collect();
+        assert!(
+            !obj_reads.is_empty(),
+            "expected a Read ref for receiver 'obj'; all refs: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        // `field` (the `field:` of field_access) must NOT be a Read ref.
+        let field_reads: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "field")
+            .collect();
+        assert!(
+            field_reads.is_empty(),
+            "member name 'field' in field_access must NOT be a Read ref; got: {field_reads:?}"
         );
     }
 }

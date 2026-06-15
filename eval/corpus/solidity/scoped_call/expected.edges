@@ -1,0 +1,6 @@
+# Same-file call: `compute` calls `helper`, both defined in Token.sol.
+# Proves Tier-B same-file Scoped resolution: the `helper()` call on line 10
+# resolves to the `function helper` definition on line 5, not fanning out to
+# any external same-named symbol. Both are non-private contract methods with
+# Solidity's default internal visibility (helper is explicitly `internal`).
+Token.sol:10 Call Token.sol:5

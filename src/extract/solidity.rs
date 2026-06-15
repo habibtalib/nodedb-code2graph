@@ -33,11 +33,18 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
+    import_bindings, innermost_scope, node_span, node_text, one_line_signature, push_binding,
+    push_scope,
+};
 
 /// Tree-sitter query capturing call-callee identifiers.
 ///
@@ -82,8 +89,10 @@ impl Extractor for SolidityExtractor {
             .map(Descriptor::Namespace)
             .collect();
 
-        let mut symbols = Vec::new();
-        collect_decls(root, &ns_descriptors, false, bytes, file, &mut symbols);
+        let mut defs = Vec::new();
+        collect_decls(root, &ns_descriptors, false, bytes, file, &mut defs);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         symbols.push(super::module_symbol(
             Language::Solidity,
             &ns_strings,
@@ -102,13 +111,19 @@ impl Extractor for SolidityExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Solidity.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -624,6 +639,175 @@ fn handle_typedef(
     );
 }
 
+// ── Scope tree (Tier-B) ─────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one Solidity file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// Solidity opens `Type` scopes for contract/library/interface bodies, `Function`
+/// scopes for function/modifier/constructor/fallback-receive definitions, and
+/// `Block` scopes for bare `block_statement` nodes not consumed as a function body.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening scopes for the Solidity AST.
+///
+/// - `contract_declaration` | `library_declaration` | `interface_declaration` →
+///   `ScopeKind::Type`; the `contract_body` field is peeled under the Type scope.
+/// - `function_definition` | `modifier_definition` | `constructor_definition` |
+///   `fallback_receive_definition` → `ScopeKind::Function`; the `body` field
+///   (a `function_body`, may be absent for abstract/interface functions) is peeled.
+/// - `block_statement` not already consumed as a function body → `ScopeKind::Block`.
+/// - Everything else: recurse under `parent`.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "contract_declaration" | "library_declaration" | "interface_declaration" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            // Peel the contract_body to avoid wrapping its own scope.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            }
+        }
+        "function_definition"
+        | "modifier_definition"
+        | "constructor_definition"
+        | "fallback_receive_definition" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            // Peel the body (a `function_body`) if present; absent for abstract/interface fns.
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "block_statement" => {
+            // A bare block NOT already consumed as a function body.
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one Solidity file.
+///
+/// Covers:
+/// - `function_definition` / `modifier_definition` / `constructor_definition` /
+///   `fallback_receive_definition` parameters → [`BindingKind::Param`].
+/// - `variable_declaration` inside a `Function` or `Block` scope →
+///   [`BindingKind::Local`]. This covers both `variable_declaration_statement`
+///   children and tuple destructuring children. The Function|Block scope guard
+///   excludes state variables at contract-body (Type) scope.
+/// - `variable_declaration_tuple` bare `identifier` children (tuple LHS names
+///   like `(a, b) = ...`) → [`BindingKind::Local`] with the same guard.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_definition"
+        | "modifier_definition"
+        | "constructor_definition"
+        | "fallback_receive_definition" => {
+            // Parameters: direct children of kind "parameter" with a "name" field.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "parameter" {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let name = node_text(&name_node, bytes).to_owned();
+                        if !name.is_empty() {
+                            push_binding(
+                                out,
+                                name,
+                                name_node.start_byte(),
+                                BindingKind::Param,
+                                scopes,
+                            );
+                        }
+                    }
+                }
+            }
+            // Recurse into all children to pick up body bindings.
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "variable_declaration" => {
+            // Emit Local only when the innermost scope is Function or Block.
+            // State variables at contract-body (Type) scope are excluded.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(&name_node, bytes).to_owned();
+                if !name.is_empty() {
+                    let intro = name_node.start_byte();
+                    if let Some(sid) = innermost_scope(intro, scopes) {
+                        if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                            push_binding(out, name, intro, BindingKind::Local, scopes);
+                        }
+                    }
+                }
+            }
+            // Recurse into children (initializer may contain nested constructs).
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "variable_declaration_tuple" => {
+            // Tuple destructuring: `(a, b) = expr` — emit Local for each bare identifier.
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "identifier" {
+                    let name = node_text(&child, bytes).to_owned();
+                    if !name.is_empty() {
+                        let intro = child.start_byte();
+                        if let Some(sid) = innermost_scope(intro, scopes) {
+                            if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                                push_binding(out, name, intro, BindingKind::Local, scopes);
+                            }
+                        }
+                    }
+                } else {
+                    collect_bindings_dfs(&child, bytes, scopes, out);
+                }
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
 // ── Import-edge helpers ──────────────────────────────────────────────────────
 
 /// Recursively walk `node` collecting `Import` references for every
@@ -1047,6 +1231,189 @@ contract Caller {
         assert!(
             imports.is_empty(),
             "expected no import refs but got {imports:?}"
+        );
+    }
+
+    // ── Tier-B scope / binding tests ─────────────────────────────────────────
+
+    #[test]
+    fn params_emit_param_bindings() {
+        // `contract C { function add(uint256 a, uint256 b) public {} }` → Param `a`, `b` in Function scope.
+        let src = "contract C { function add(uint256 a, uint256 b) public {} }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("a", fn_scope_id), ("b", fn_scope_id)],
+            "expected Param bindings for a and b, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn unnamed_param_skipped() {
+        // `contract C { function f(uint256) public {} }` → zero Param bindings.
+        let src = "contract C { function f(uint256) public {} }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let params: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(
+            params.is_empty(),
+            "unnamed param must not produce a Param binding, got {params:?}"
+        );
+    }
+
+    #[test]
+    fn modifier_params_emit_param_bindings() {
+        // `contract C { modifier onlyRole(bytes32 role) { _; } }` → Param `role`.
+        let src = "contract C { modifier onlyRole(bytes32 role) { _; } }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let role = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "role")
+            .expect("expected Param binding for 'role'");
+        assert_eq!(
+            facts.scopes[role.scope].kind,
+            ScopeKind::Function,
+            "modifier param 'role' should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn local_var_emits_local_binding() {
+        // `contract C { function f() public { uint256 x = 0; } }` → Local `x`.
+        let src = "contract C { function f() public { uint256 x = 0; } }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_ne!(x.scope, 0, "local 'x' must NOT be in scope 0 (file root)");
+        assert!(
+            matches!(
+                facts.scopes[x.scope].kind,
+                ScopeKind::Function | ScopeKind::Block
+            ),
+            "local 'x' scope must be Function or Block, got {:?}",
+            facts.scopes[x.scope].kind
+        );
+    }
+
+    #[test]
+    fn for_init_var_emits_local_binding() {
+        // `contract C { function f(uint256[] memory xs) public { for (uint256 i = 0; ...) {} } }`
+        // → Local `i`.
+        let src = "contract C { function f(uint256[] memory xs) public { for (uint256 i = 0; i < xs.length; i++) {} } }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let i_binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "i")
+            .expect("expected a Local binding for 'i'");
+        assert_ne!(i_binding.scope, 0, "for-init 'i' must NOT be in scope 0");
+    }
+
+    #[test]
+    fn state_var_not_local_but_is_definition() {
+        // `contract C { uint256 public totalSupply; }` → NO Local `totalSupply`; Definition exists.
+        let src = "contract C { uint256 public totalSupply; }";
+        let facts = extract(src, "contracts/C.sol");
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "totalSupply"),
+            "state variable 'totalSupply' must NOT be a Local binding"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "totalSupply"),
+            "state variable 'totalSupply' must have a Definition binding"
+        );
+    }
+
+    #[test]
+    fn nesting_produces_type_and_function_scopes() {
+        // `contract C { function m() public {} }` → Type scope (contract body) + Function scope.
+        let src = "contract C { function m() public {} }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let has_type = facts.scopes.iter().any(|s| s.kind == ScopeKind::Type);
+        let has_fn = facts.scopes.iter().any(|s| s.kind == ScopeKind::Function);
+        assert!(has_type, "expected a Type scope for contract body");
+        assert!(has_fn, "expected a Function scope for method body");
+    }
+
+    #[test]
+    fn same_file_call_ref_has_non_zero_scope() {
+        let src = r#"
+pragma solidity ^0.8.0;
+contract C {
+    function helper() internal returns (uint256) { return 42; }
+    function compute() public returns (uint256) { return helper(); }
+}
+"#;
+        let facts = extract(src, "contracts/C.sol");
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "helper"),
+            "expected a Definition binding for 'helper'"
+        );
+
+        let call_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        assert!(
+            call_ref.scope.is_some() && call_ref.scope != Some(0),
+            "helper() call ref must be in a non-zero scope, got {:?}",
+            call_ref.scope
+        );
+    }
+
+    #[test]
+    fn import_binding_emitted() {
+        // `pragma solidity ^0.8.0; import {ERC20} from "./ERC20.sol";` → Import binding `ERC20`.
+        let src = r#"pragma solidity ^0.8.0; import {ERC20} from "./ERC20.sol";"#;
+        let facts = extract(src, "contracts/Token.sol");
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Import && b.name == "ERC20"),
+            "expected an Import binding for 'ERC20', got {:?}",
+            facts.bindings
         );
     }
 }

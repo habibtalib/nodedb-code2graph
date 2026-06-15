@@ -127,6 +127,38 @@ pub fn score(graph: &CodeGraph, expected: &[ExpectedEdge]) -> Scorecard {
     }
 }
 
+/// Score a resolved [`CodeGraph`] against SCIP-oracle location pairs.
+///
+/// Matching is location-only: an emitted edge is a true positive iff
+/// `(ref_file, ref_line, def_file, def_line)` appears in the oracle set.
+/// Role is ignored — SCIP occurrence roles don't map 1-to-1 onto
+/// code2graph's [`RefRole`] taxonomy.
+pub fn score_oracle(graph: &CodeGraph, oracle: &[(String, u32, String, u32)]) -> Scorecard {
+    // Build def location map the same way `score` does.
+    let mut def_loc = std::collections::HashMap::new();
+    for sym in &graph.symbols {
+        def_loc.insert(sym.id.to_scip_string(), (sym.file.clone(), sym.line));
+    }
+
+    let emitted: HashSet<(String, u32, String, u32)> = graph
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let (def_file, def_line) = def_loc.get(&e.to.to_scip_string())?;
+            Some((e.occ.file.clone(), e.occ.line, def_file.clone(), *def_line))
+        })
+        .collect();
+
+    let expected: HashSet<(String, u32, String, u32)> = oracle.iter().cloned().collect();
+
+    let true_positives = emitted.intersection(&expected).count();
+    Scorecard {
+        true_positives,
+        false_positives: emitted.len() - true_positives,
+        false_negatives: expected.len() - true_positives,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,5 +10,7 @@
 //! the fixture format.
 
 pub mod corpus;
+#[cfg(feature = "oracle-regen")]
+pub mod oracle;
 pub mod runner;
 pub mod score;

@@ -10,6 +10,23 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 publish = false
+# The scorecard binary (src/main.rs) is the default; `gen-oracle` is opt-in and
+# only buildable with --features oracle-regen.
+default-run = "code2graph-eval"
+
+[features]
+# Off by default: the SCIP-oracle generation path. Only maintainers run this to
+# regenerate committed `oracle.edges` from a committed `index.scip`. The default
+# build and `cargo test` never compile it, so `scip`/`protobuf` stay out of the
+# normal dependency graph. (`scip` 0.8 is rust-protobuf based, hence `protobuf`.)
+oracle-regen = ["dep:scip", "dep:protobuf"]
 
 [dependencies]
 code2graph = { path = ".." }
+scip = { version = "0.8", optional = true }
+protobuf = { version = "3", optional = true }
+
+[[bin]]
+name = "gen-oracle"
+path = "src/bin/gen_oracle.rs"
+required-features = ["oracle-regen"]

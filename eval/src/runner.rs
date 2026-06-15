@@ -8,12 +8,15 @@
 //! (loading, scoring) is independent of the library.
 
 use crate::corpus::Case;
-use crate::score::{Scorecard, score};
+use crate::score::{Scorecard, score, score_oracle};
 use code2graph::{Resolver, extract_path};
 use std::collections::BTreeMap;
 
 /// Extract every file in `case`, resolve with `resolver`, and score the graph
-/// against the case's expected edges.
+/// against the case's ground truth.
+///
+/// Dispatches to [`score_oracle`] when the case has SCIP-oracle location pairs
+/// (i.e. `oracle.edges` was present), and to [`score`] otherwise.
 pub fn score_case<R: Resolver>(case: &Case, resolver: &R) -> Scorecard {
     let facts: Vec<_> = case
         .files
@@ -21,7 +24,11 @@ pub fn score_case<R: Resolver>(case: &Case, resolver: &R) -> Scorecard {
         .filter_map(|(name, src)| extract_path(name, src).ok())
         .collect();
     let graph = resolver.resolve(&facts);
-    score(&graph, &case.expected)
+    if !case.oracle.is_empty() {
+        score_oracle(&graph, &case.oracle)
+    } else {
+        score(&graph, &case.expected)
+    }
 }
 
 /// Aggregate scorecard over every case, grouped by language directory.

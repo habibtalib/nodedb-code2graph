@@ -34,8 +34,11 @@ pub struct Case {
     pub name: String,
     /// `(basename, source)` for every source file in the case.
     pub files: Vec<(String, String)>,
-    /// Ground-truth located ref→def edges.
+    /// Ground-truth located ref→def edges (hand-authored, role-typed).
     pub expected: Vec<ExpectedEdge>,
+    /// SCIP-oracle location pairs `(ref_file, ref_line, def_file, def_line)`.
+    /// Non-empty only when the case dir contains `oracle.edges`.
+    pub oracle: Vec<(String, u32, String, u32)>,
 }
 
 /// Load every case under `root` (the corpus directory), sorted by `lang` then
@@ -55,6 +58,7 @@ pub fn load_corpus(root: &Path) -> io::Result<Vec<Case>> {
 fn load_case(lang: &str, name: &str, dir: &Path) -> io::Result<Case> {
     let mut files = Vec::new();
     let mut expected = Vec::new();
+    let mut oracle = Vec::new();
     let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.path());
     for entry in entries {
@@ -63,24 +67,70 @@ fn load_case(lang: &str, name: &str, dir: &Path) -> io::Result<Case> {
             continue;
         }
         let fname = file_name(&path);
-        let text = fs::read_to_string(&path)?;
-        if fname == "expected.edges" {
-            expected = parse_expected(&text).map_err(|msg| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{}/{}/expected.edges: {msg}", lang, name),
-                )
-            })?;
-        } else {
-            files.push((fname, text));
+        // Skip binary oracle and non-source files — never feed to extract_path.
+        if fname == "index.scip" || fname == "oracle.edges" || fname == "expected.edges" {
+            if fname == "expected.edges" {
+                let text = fs::read_to_string(&path)?;
+                expected = parse_expected(&text).map_err(|msg| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}/{}/expected.edges: {msg}", lang, name),
+                    )
+                })?;
+            } else if fname == "oracle.edges" {
+                let text = fs::read_to_string(&path)?;
+                oracle = parse_oracle(&text).map_err(|msg| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{}/{}/oracle.edges: {msg}", lang, name),
+                    )
+                })?;
+            }
+            continue;
         }
+        let text = fs::read_to_string(&path)?;
+        files.push((fname, text));
     }
     Ok(Case {
         lang: lang.to_string(),
         name: name.to_string(),
         files,
         expected,
+        oracle,
     })
+}
+
+/// Parse an `oracle.edges` file into location-only pairs.
+///
+/// Format (one non-comment line per edge):
+/// ```text
+/// # oracle: scip-typescript — location pairs (ref -> def), role-agnostic
+/// alpha.ts:1 main.ts:4
+/// ```
+fn parse_oracle(text: &str) -> Result<Vec<(String, u32, String, u32)>, String> {
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(
+            parse_oracle_line(line)
+                .ok_or_else(|| format!("line {}: bad oracle edge `{raw}`", i + 1))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Split one `ref_file:ref_line def_file:def_line` line into a location pair.
+fn parse_oracle_line(line: &str) -> Option<(String, u32, String, u32)> {
+    let mut parts = line.split_whitespace();
+    let (ref_file, ref_line) = parse_loc(parts.next()?)?;
+    let (def_file, def_line) = parse_loc(parts.next()?)?;
+    if parts.next().is_some() {
+        return None; // trailing garbage
+    }
+    Some((ref_file, ref_line, def_file, def_line))
 }
 
 /// Parse an `expected.edges` manifest into located edges.

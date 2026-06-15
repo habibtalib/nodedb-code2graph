@@ -38,6 +38,10 @@
 //! - **Cross-language bridges** ([`FfiBridgeResolver`]) link call sites to FFI
 //!   exports (Rust `#[no_mangle]` → C, today) across a language boundary,
 //!   deterministically and with honest confidence — composable on top of any tier.
+//! - **Incremental maintenance** ([`IncrementalGraph`]) keeps a resolved graph
+//!   current as files change: each file is resolved in isolation and cross-file
+//!   edges are stitched on demand, so re-extracting one file rebuilds only that
+//!   file's subgraph — never the whole workspace.
 //! - **No storage, no source bodies** — [`graph::Symbol`]s carry a byte span;
 //!   consumers slice what they need.
 //!

@@ -2,14 +2,13 @@
 
 //! Stateful incremental Tier-B resolution store.
 //!
-//! [`IncrementalGraph`] caches one isolated [`FileSubgraph`] per file plus a
-//! [`GlobalIndex`] of all current definitions. Re-extracting a single changed
-//! file rebuilds ONLY that file's subgraph (via [`build_subgraph`], which never
-//! looks at any file but the one passed) and patches the index — the rest of
-//! the graph is untouched. [`graph`] then [`stitch`]es the current cross-file
-//! edges on demand.
+//! [`IncrementalGraph`] caches one isolated per-file subgraph plus a global
+//! index of all current definitions. Re-extracting a single changed file
+//! rebuilds ONLY that file's subgraph (the per-file build never looks at any
+//! file but the one passed) and patches the index — the rest of the graph is
+//! untouched. [`graph`] then stitches the current cross-file edges on demand.
 //!
-//! The store wraps the SAME pieces (`build_subgraph` + `stitch`) the batch
+//! The store wraps the SAME per-file build and stitch passes the batch
 //! [`ScopeGraphResolver`] uses, so its output is identical (up to ordering) to
 //! running that resolver over the same file set — the two paths never drift.
 //!
@@ -26,10 +25,34 @@ use super::subgraph::{FileSubgraph, build_subgraph};
 /// Incremental Tier-B resolution store. Holds one isolated subgraph per file
 /// plus a global definition index, so re-extracting a single changed file
 /// rebuilds only that file's subgraph — never the whole graph — while
-/// `graph()` stitches the current cross-file edges on demand.
+/// [`graph`](IncrementalGraph::graph) stitches the current cross-file edges on
+/// demand.
 ///
-/// Output is identical (up to ordering) to running `ScopeGraphResolver` over
-/// the same file set: both share `build_subgraph` + `stitch`.
+/// Output is identical (up to ordering) to running [`ScopeGraphResolver`] over
+/// the same file set: both share the same per-file build and stitch passes.
+///
+/// ```
+/// use code2graph::{extract_path, resolve::IncrementalGraph};
+///
+/// // `app` imports `Config` from `conf`.
+/// let conf = extract_path("src/conf.rs", "pub struct Config {}").unwrap();
+/// let app = extract_path("src/app.rs", "use conf::Config;\npub fn run() {}").unwrap();
+///
+/// // Keep a resolved graph current as files change: each file is resolved in
+/// // isolation and cross-file edges are stitched on demand.
+/// let mut graph = IncrementalGraph::from_files(&[conf, app]);
+/// let resolves_import = |g: code2graph::graph::CodeGraph| {
+///     g.edges.iter().any(|e| e.to.to_scip_string().ends_with("conf/Config#"))
+/// };
+/// assert!(resolves_import(graph.graph()));
+///
+/// // Re-extract only the changed file; `conf` is never reprocessed.
+/// let app = extract_path("src/app.rs", "use conf::Config;\npub fn helper() {}").unwrap();
+/// graph.upsert(&app);
+/// assert!(resolves_import(graph.graph()));
+/// ```
+///
+/// [`ScopeGraphResolver`]: super::super::ScopeGraphResolver
 pub struct IncrementalGraph {
     files: HashMap<String, FileSubgraph>,
     index: GlobalIndex,
@@ -59,7 +82,7 @@ impl IncrementalGraph {
     /// Insert or replace the subgraph for `facts.file`.
     ///
     /// Re-extracting a file rebuilds ONLY that file's subgraph — structurally
-    /// guaranteed, because [`build_subgraph`] reads no file but the one passed.
+    /// guaranteed, because the per-file build reads no file but the one passed.
     /// If a subgraph already existed for this key, its definitions are removed
     /// from the global index first, so the index reflects only the current set.
     pub fn upsert(&mut self, facts: &FileFacts) {

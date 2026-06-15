@@ -1,0 +1,3 @@
+# oracle: SCIP index — location pairs (ref -> def), role-agnostic
+lib.rs:1 util.rs:1
+lib.rs:4 util.rs:1

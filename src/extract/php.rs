@@ -27,7 +27,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -35,7 +35,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -89,6 +89,7 @@ impl Extractor for PhpExtractor {
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Php, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -502,6 +503,114 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: TypeRef ───────────────────────────────────────────────────
+
+/// Resolve a PHP type node to its leaf name node(s) and emit a
+/// [`RefRole::TypeRef`] reference for each user-defined type encountered.
+///
+/// PHP type grammar (tree-sitter-php):
+/// - `named_type` — wraps a `name` (simple) or `qualified_name` (namespaced).
+/// - `primitive_type` — `int`, `string`, `bool`, `void`, `float`, `array`,
+///   `callable`, `iterable`, `never`, `null`, `true`, `false` — SKIPPED.
+/// - `union_type` — `A|B` — recurse each named child.
+/// - `intersection_type` — `A&B` — recurse each named child.
+/// - `optional_type` — `?T` (nullable shorthand) — recurse the named child.
+/// - `name` / `qualified_name` (bare leaves in some grammar versions) — emit.
+fn type_leaf(
+    type_node: &Node,
+    bytes: &[u8],
+    file: &str,
+    ctx: TypeRefContext,
+    out: &mut Vec<Reference>,
+) {
+    match type_node.kind() {
+        // Primitive types: int, string, bool, void, float, array, callable,
+        // iterable, never, null, true, false — skip entirely.
+        "primitive_type" => {}
+        // `named_type` wraps either a `name` or a `qualified_name`.
+        "named_type" => {
+            for child in type_node.named_children(&mut type_node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        // Union `A|B`, intersection `A&B`, optional `?T` — recurse each arm.
+        "union_type" | "intersection_type" | "optional_type" => {
+            for child in type_node.named_children(&mut type_node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        // Simple unqualified name — emit directly.
+        "name" => {
+            let name = node_text(type_node, bytes);
+            push_type_ref(out, name, type_node, file, ctx);
+        }
+        // Fully-qualified name like `App\Models\User` — emit the last segment.
+        "qualified_name" => {
+            let raw = node_text(type_node, bytes);
+            let leaf = raw.rsplit('\\').next().unwrap_or(raw).trim();
+            if !leaf.is_empty() {
+                push_type_ref(out, leaf, type_node, file, ctx);
+            }
+        }
+        // Relative name `namespace\Foo` — same strategy.
+        "relative_name" => {
+            let raw = node_text(type_node, bytes);
+            let leaf = raw.rsplit('\\').next().unwrap_or(raw).trim();
+            if !leaf.is_empty() {
+                push_type_ref(out, leaf, type_node, file, ctx);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// user-defined type that appears in a typed annotation position.
+///
+/// Covered positions (tree-sitter-php grammar):
+/// - `simple_parameter` / `property_promotion_parameter` `type:` field → `ParameterType`
+/// - `function_definition` / `method_declaration` `return_type:` field → `ReturnType`
+/// - `property_declaration` `type:` field → `Field`
+///
+/// Primitive types (`int`, `string`, `bool`, `void`, …) are skipped via
+/// [`type_leaf`]. No minimum-length filter is applied — short class names (e.g.
+/// `IO`) are legitimate type references.
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Function / method parameters: `function f(Config $c)` or
+        // constructor promotion: `public function __construct(public Config $c)`.
+        "simple_parameter" | "property_promotion_parameter" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+        }
+        // Function / method return types: `function f(): Config`.
+        "function_definition" | "method_declaration" => {
+            if let Some(ret_node) = node.child_by_field_name("return_type") {
+                // The `return_type` field in tree-sitter-php is the type node
+                // directly (no wrapping annotation node).
+                type_leaf(&ret_node, bytes, file, TypeRefContext::ReturnType, out);
+            }
+            // Recurse into body so nested function definitions are covered.
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return; // avoid double-recurse
+        }
+        // Typed property declarations: `public Config $conf;`
+        "property_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
     }
 }
 
@@ -1381,6 +1490,78 @@ function run() {
             decl_read.is_none(),
             "param declaration '$val' must NOT be a Read ref; found one at byte {:?}",
             decl_read.map(|r| r.occ.byte)
+        );
+    }
+
+    // ── TypeRef tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn php_param_type_ref_emitted() {
+        // `function f(Config $c) {}` → TypeRef "Config" with ParameterType ctx.
+        let src = "<?php\nfunction f(Config $c) {}\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn php_return_type_ref_emitted() {
+        // `function f(): Config { return x(); }` → TypeRef "Config" with ReturnType ctx.
+        let src = "<?php\nfunction f(): Config { return x(); }\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn php_typed_property_type_ref_emitted() {
+        // `class C { public Config $conf; }` → TypeRef "Config" with Field ctx.
+        let src = "<?php\nclass C { public Config $conf; }\n";
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    #[test]
+    fn php_primitive_param_type_not_emitted() {
+        // `function f(int $n) {}` → NO TypeRef for "int" (primitive_type).
+        let src = "<?php\nfunction f(int $n) {}\n";
+        let facts = PhpExtractor.extract(src, "src/f.php").unwrap();
+        let prim_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef && r.name == "int")
+            .collect();
+        assert!(
+            prim_refs.is_empty(),
+            "primitive 'int' must NOT produce a TypeRef; got: {prim_refs:?}"
         );
     }
 }

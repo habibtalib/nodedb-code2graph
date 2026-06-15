@@ -31,7 +31,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -39,7 +39,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -106,6 +106,7 @@ impl Extractor for KotlinExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -685,6 +686,180 @@ fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec
     }
     for child in node.children(&mut node.walk()) {
         collect_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: TypeRef ───────────────────────────────────────────────────
+
+/// Recursively resolve a Kotlin type node down to its `type_identifier` leaf(s)
+/// and emit a [`RefRole::TypeRef`] reference for each one.
+///
+/// Kotlin type shapes handled:
+/// - `type_identifier` — the leaf: emit directly with `ctx`.
+/// - `user_type` — the normal qualified type (`MyClass`, `com.example.Foo`):
+///   the leaf `type_identifier` is a direct named child; a `type_arguments`
+///   sibling child carries generics → recurse those with `GenericArg`.
+/// - `nullable_type` (`T?`) — a wrapper: recurse named children (the inner type).
+/// - `type_arguments` — the `<A, B>` bracket: each named `type_projection`
+///   child contains the actual type; recurse with `GenericArg`.
+/// - `type_projection` — a slot inside `type_arguments`; recurse named children.
+/// - `function_type` / `parenthesized_type` / `definitely_non_nullable_type` /
+///   any other container: recurse all named children with `ctx` so compound
+///   types (e.g. `(A) -> B`) are covered without special-casing every form.
+fn type_leaf(node: &Node, bytes: &[u8], file: &str, ctx: TypeRefContext, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "type_identifier" => {
+            let name = node_text(node, bytes);
+            push_type_ref(out, name, node, file, ctx);
+        }
+        "user_type" => {
+            // A `user_type` has one or more `simple_user_type` named children,
+            // each of which contains a `type_identifier` and an optional
+            // `type_arguments`. Walk the named children directly.
+            for child in node.named_children(&mut node.walk()) {
+                match child.kind() {
+                    "simple_user_type" => {
+                        // Emit the type_identifier inside this simple_user_type.
+                        for inner in child.named_children(&mut child.walk()) {
+                            match inner.kind() {
+                                "type_identifier" => {
+                                    let name = node_text(&inner, bytes);
+                                    push_type_ref(out, name, &inner, file, ctx);
+                                }
+                                "type_arguments" => {
+                                    // Generic args inside `<A, B, ...>`.
+                                    type_leaf(&inner, bytes, file, TypeRefContext::GenericArg, out);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // tree-sitter-kotlin-ng: a `user_type`'s name is a direct
+                    // `identifier` child (older variants used `type_identifier`).
+                    "type_identifier" | "identifier" => {
+                        let name = node_text(&child, bytes);
+                        push_type_ref(out, name, &child, file, ctx);
+                    }
+                    "type_arguments" => {
+                        type_leaf(&child, bytes, file, TypeRefContext::GenericArg, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "nullable_type" => {
+            // `T?` — the inner type is the first named child.
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        "type_arguments" => {
+            // `<A, B>` — each named child is a `type_projection` (or `*`).
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, TypeRefContext::GenericArg, out);
+            }
+        }
+        "type_projection" => {
+            // A slot inside `type_arguments`: may be a type or `*` (star projection).
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        // function_type, parenthesized_type, definitely_non_nullable_type, etc.:
+        // recurse named children to pick up all leaves.
+        _ => {
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+    }
+}
+
+/// The type-annotation child of a `parameter`/`class_parameter`/`variable_declaration`.
+///
+/// Kotlin carries the type as an unnamed-field child whose kind is one of the type
+/// shapes (not a `type:` field), so it is found by kind rather than by field name.
+fn kotlin_type_child<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    node.named_children(&mut node.walk()).find(|c| {
+        matches!(
+            c.kind(),
+            "user_type"
+                | "nullable_type"
+                | "function_type"
+                | "parenthesized_type"
+                | "type_identifier"
+        )
+    })
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// type identifier that appears in a typed annotation position.
+///
+/// Covered positions (tree-sitter-kotlin-ng grammar):
+/// - `parameter` / `class_parameter` type child → [`TypeRefContext::ParameterType`].
+/// - `function_declaration` return type → [`TypeRefContext::ReturnType`].
+/// - `variable_declaration` (property/field) type child → [`TypeRefContext::Field`].
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Function value parameters: `fun f(c: Config)` and primary-ctor params.
+        "parameter" | "class_parameter" => {
+            if let Some(type_node) = kotlin_type_child(node) {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+            // No further recursion: parameter bodies don't nest declarations.
+            return;
+        }
+        // Function return types.
+        "function_declaration" => {
+            // tree-sitter-kotlin-ng: a function_declaration's children in order are:
+            //   modifiers? fun type_parameters? receiver_type? (simple_identifier | identifier)
+            //   function_value_parameters type_parameters? (':' type)? type_constraints? function_body?
+            //
+            // The return type sits after function_value_parameters. Walk named children
+            // and look for type-shape nodes that appear after we see function_value_parameters.
+            let mut past_params = false;
+            for child in node.named_children(&mut node.walk()) {
+                match child.kind() {
+                    "function_value_parameters" => {
+                        past_params = true;
+                        // Recurse into parameter children for ParameterType.
+                        for param in child.named_children(&mut child.walk()) {
+                            collect_type_references(&param, bytes, file, out);
+                        }
+                    }
+                    // After function_value_parameters, the next type-shaped child
+                    // is the return type (before function_body).
+                    "user_type" | "nullable_type" | "function_type" | "parenthesized_type" => {
+                        if past_params {
+                            type_leaf(&child, bytes, file, TypeRefContext::ReturnType, out);
+                        }
+                    }
+                    // function_body — recurse to catch nested functions.
+                    "function_body" => {
+                        collect_type_references(&child, bytes, file, out);
+                    }
+                    _ => {
+                        // Recurse into other children (e.g. modifiers, type_parameters).
+                        collect_type_references(&child, bytes, file, out);
+                    }
+                }
+            }
+            return; // avoid double-recurse at the bottom
+        }
+        // Property/field type: `val conf: Config` — type lives in variable_declaration
+        // as an unnamed-field type-shaped child (after the identifier).
+        "variable_declaration" => {
+            if let Some(type_node) = kotlin_type_child(node) {
+                type_leaf(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+            // No further recursion: variable_declaration doesn't nest functions.
+            return;
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
     }
 }
 
@@ -1564,6 +1739,91 @@ fun main() {
                 .filter(|b| b.kind == BindingKind::Import)
                 .map(|b| b.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── TypeRef tests ─────────────────────────────────────────────────────────
+
+    // Test T1: function parameter type → TypeRef "Config" with ParameterType ctx.
+    #[test]
+    fn type_ref_param_type_emitted() {
+        let src = "fun f(c: Config) {}";
+        let facts = extract(src, "src/F.kt");
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    // Test T2: property/field type → TypeRef "Config" with Field ctx.
+    #[test]
+    fn type_ref_field_type_emitted() {
+        let src = "class C { val conf: Config = null }";
+        let facts = extract(src, "src/C.kt");
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    // Test T3: generic param type → TypeRef "List" (ParameterType) + "Config" (GenericArg).
+    #[test]
+    fn type_ref_generic_param_emitted() {
+        let src = "fun f(xs: List<Config>) {}";
+        let facts = extract(src, "src/F.kt");
+        let list_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "List")
+            .expect("expected TypeRef ref for 'List'");
+        assert_eq!(
+            list_ref.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx for 'List', got {:?}",
+            list_ref.type_ref_ctx
+        );
+        let config_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            config_ref.type_ref_ctx,
+            Some(TypeRefContext::GenericArg),
+            "expected GenericArg ctx for 'Config', got {:?}",
+            config_ref.type_ref_ctx
+        );
+    }
+
+    // Test T4: function return type → TypeRef "Config" with ReturnType ctx.
+    #[test]
+    fn type_ref_return_type_emitted() {
+        let src = "fun f(): Config = TODO()";
+        let facts = extract(src, "src/F.kt");
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
         );
     }
 

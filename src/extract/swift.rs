@@ -27,7 +27,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -35,7 +35,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope,
+    push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -102,6 +102,7 @@ impl Extractor for SwiftExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -636,6 +637,135 @@ fn handle_enum_entry(
     );
 }
 
+// ── Type-annotation references (TypeRef) ────────────────────────────────────
+
+/// Walk a single Swift type node and emit [`RefRole::TypeRef`] references for
+/// every named type identifier leaf found inside it.
+///
+/// Tree-sitter-swift type node shapes handled:
+/// - `user_type` → first `type_identifier` child is the leaf name; if a
+///   `type_arguments` sibling is present each `name:` field child recurses with
+///   `GenericArg`.
+/// - `optional_type` → `wrapped:` field recurses with the outer `ctx`.
+/// - `array_type` → `element:` field recurses with the outer `ctx`.
+/// - `dictionary_type` → `key:` and `value:` fields recurse with the outer `ctx`.
+/// - All other container type nodes (tuple, function, protocol composition,
+///   existential, opaque, …) → recurse all named children with the outer `ctx`
+///   as a best-effort catch.
+fn type_leaf_swift(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    ctx: TypeRefContext,
+    out: &mut Vec<Reference>,
+) {
+    match node.kind() {
+        "user_type" => {
+            // user_type children: one `type_identifier` (the name) and optionally
+            // a `type_arguments` node.  Walk named children to find them.
+            let mut type_args_node: Option<Node> = None;
+            for child in node.named_children(&mut node.walk()) {
+                match child.kind() {
+                    "type_identifier" => {
+                        let name = node_text(&child, bytes);
+                        push_type_ref(out, name, &child, file, ctx);
+                    }
+                    "type_arguments" => {
+                        type_args_node = Some(child);
+                    }
+                    _ => {}
+                }
+            }
+            // Recurse into generic type arguments with GenericArg context.
+            if let Some(args) = type_args_node {
+                // type_arguments `name:` field carries each argument type.
+                // tree-sitter exposes them as named children; the field is
+                // repeated so we walk all named children instead.
+                for child in args.named_children(&mut args.walk()) {
+                    type_leaf_swift(&child, bytes, file, TypeRefContext::GenericArg, out);
+                }
+            }
+        }
+        "optional_type" => {
+            // `T?` — the inner type is the `wrapped:` field.
+            if let Some(inner) = node.child_by_field_name("wrapped") {
+                type_leaf_swift(&inner, bytes, file, ctx, out);
+            }
+        }
+        "array_type" => {
+            // `[T]` — the element type is the `element:` field.
+            if let Some(elem) = node.child_by_field_name("element") {
+                type_leaf_swift(&elem, bytes, file, ctx, out);
+            }
+        }
+        "dictionary_type" => {
+            // `[K: V]` — key and value fields.
+            if let Some(key) = node.child_by_field_name("key") {
+                type_leaf_swift(&key, bytes, file, ctx, out);
+            }
+            if let Some(val) = node.child_by_field_name("value") {
+                type_leaf_swift(&val, bytes, file, ctx, out);
+            }
+        }
+        // tuple_type, function_type, protocol_composition_type, existential_type,
+        // opaque_type, metatype, type_pack_expansion, etc. — recurse named children.
+        _ => {
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf_swift(&child, bytes, file, ctx, out);
+            }
+        }
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for every
+/// type identifier in an annotation position.
+///
+/// Covered positions (tree-sitter-swift grammar):
+/// - `parameter` `type:` field → [`TypeRefContext::ParameterType`]
+/// - `function_declaration` `return_type:` field → [`TypeRefContext::ReturnType`]
+/// - `init_declaration` parameter types (via `parameter` children) → `ParameterType`
+/// - `property_declaration` → `type_annotation` child → `type:` field
+///   → [`TypeRefContext::Field`]
+///
+/// Generic type arguments are handled recursively inside [`type_leaf_swift`]
+/// with [`TypeRefContext::GenericArg`].
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Function/init parameter types: `parameter` has a `type:` field.
+        "parameter" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf_swift(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+            // No further recursion needed for a parameter node.
+            return;
+        }
+        // Function return type: `function_declaration` has a `return_type:` field.
+        "function_declaration" => {
+            if let Some(ret) = node.child_by_field_name("return_type") {
+                type_leaf_swift(&ret, bytes, file, TypeRefContext::ReturnType, out);
+            }
+            // Fall through to recurse into children (body, parameter list).
+        }
+        // Property type annotation: `property_declaration` has a `type_annotation`
+        // child (not a named field) carrying the declared type in its `type:` field.
+        "property_declaration" | "protocol_property_declaration" => {
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "type_annotation" {
+                    if let Some(type_node) = child.child_by_field_name("type") {
+                        type_leaf_swift(&type_node, bytes, file, TypeRefContext::Field, out);
+                    }
+                }
+            }
+            // Fall through to recurse into children.
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
+}
+
 // ── Edge richness: Read / Write ─────────────────────────────────────────────
 
 /// Returns `true` when `node` (a `simple_identifier`) is in a position already
@@ -1030,6 +1160,7 @@ fn collect_params_dfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::types::TypeRefContext;
 
     fn extract(src: &str, path: &str) -> FileFacts {
         SwiftExtractor.extract(src, path).unwrap()
@@ -1655,6 +1786,114 @@ func main() {
         assert!(
             read_refs.is_empty(),
             "helper() must NOT produce a Read ref; got: {read_refs:?}"
+        );
+    }
+
+    // ── TypeRef tests ────────────────────────────────────────────────────────
+
+    // Test TR1: parameter type emits TypeRef with ParameterType context.
+    #[test]
+    fn type_ref_parameter_type() {
+        let src = "func f(c: Config) {}";
+        let facts = extract(src, "Sources/F.swift");
+
+        let type_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::ParameterType)
+            })
+            .collect();
+        assert!(
+            !type_refs.is_empty(),
+            "expected TypeRef 'Config' with ParameterType context; refs = {:?}",
+            facts
+                .references
+                .iter()
+                .filter(|r| r.role == RefRole::TypeRef)
+                .map(|r| (&r.name, r.type_ref_ctx))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Test TR2: property type emits TypeRef with Field context.
+    #[test]
+    fn type_ref_property_field() {
+        let src = "class C { let conf: Config }";
+        let facts = extract(src, "Sources/C.swift");
+
+        let type_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::Field)
+            })
+            .collect();
+        assert!(
+            !type_refs.is_empty(),
+            "expected TypeRef 'Config' with Field context; refs = {:?}",
+            facts
+                .references
+                .iter()
+                .filter(|r| r.role == RefRole::TypeRef)
+                .map(|r| (&r.name, r.type_ref_ctx))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Test TR3: generic type argument emits TypeRef with GenericArg context.
+    // `func f(xs: Array<Config>) {}` → "Config" with GenericArg.
+    #[test]
+    fn type_ref_generic_arg() {
+        let src = "func f(xs: Array<Config>) {}";
+        let facts = extract(src, "Sources/F.swift");
+
+        let type_refs_all: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef)
+            .map(|r| (&r.name, r.type_ref_ctx))
+            .collect();
+
+        let has_config_generic_arg = facts.references.iter().any(|r| {
+            r.role == RefRole::TypeRef
+                && r.name == "Config"
+                && r.type_ref_ctx == Some(TypeRefContext::GenericArg)
+        });
+        assert!(
+            has_config_generic_arg,
+            "expected TypeRef 'Config' with GenericArg context; type_refs = {type_refs_all:?}"
+        );
+    }
+
+    // Test TR4: function return type emits TypeRef with ReturnType context.
+    #[test]
+    fn type_ref_return_type() {
+        let src = "func f() -> Config { fatalError() }";
+        let facts = extract(src, "Sources/F.swift");
+
+        let type_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| {
+                r.role == RefRole::TypeRef
+                    && r.name == "Config"
+                    && r.type_ref_ctx == Some(TypeRefContext::ReturnType)
+            })
+            .collect();
+        assert!(
+            !type_refs.is_empty(),
+            "expected TypeRef 'Config' with ReturnType context; refs = {:?}",
+            facts
+                .references
+                .iter()
+                .filter(|r| r.role == RefRole::TypeRef)
+                .map(|r| (&r.name, r.type_ref_ctx))
+                .collect::<Vec<_>>()
         );
     }
 

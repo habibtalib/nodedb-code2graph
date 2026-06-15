@@ -35,7 +35,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser};
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
     Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind,
+    Symbol, SymbolKind, TypeRefContext,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -43,7 +43,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope,
+    push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -110,6 +110,7 @@ impl Extractor for SolidityExtractor {
         )?;
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references);
+        collect_type_references(&root, bytes, file, &mut references);
         collect_read_references(&root, bytes, file, &mut references);
         collect_write_references(&root, bytes, file, &mut references);
 
@@ -639,6 +640,177 @@ fn handle_typedef(
         bytes,
         file,
     );
+}
+
+// ── Type-reference collection ────────────────────────────────────────────────
+
+/// Extract the user-defined type name from a Solidity `type_name` node, pushing
+/// a [`RefRole::TypeRef`] reference via [`push_type_ref`] if a user-defined type
+/// leaf is found.
+///
+/// Solidity type nodes that can appear in any type position:
+/// - `user_defined_type` — a leaf or dotted path like `MyContract` / `Lib.Type`.
+///   Contains one or more `identifier` children joined by `.`; we emit the last
+///   identifier (the leaf name) as the type reference.
+/// - `primitive_type` — keyword like `uint256`, `address`, `bool`, `bytes32` →
+///   **skip** (builtin, not a user symbol).
+/// - `mapping` (`mapping(K => V)`) — recurse key type (`key:` field) and value
+///   type (`value:` field); either may be a user type.
+/// - `array_type` (`T[]`) — the element is always the first named child → recurse.
+/// - Anything else (e.g. `function_type`) → ignore (no user-type leaf to emit).
+fn type_leaf(
+    type_node: &Node,
+    bytes: &[u8],
+    file: &str,
+    ctx: TypeRefContext,
+    out: &mut Vec<Reference>,
+) {
+    match type_node.kind() {
+        "user_defined_type" => {
+            // A user_defined_type contains one or more `identifier` children,
+            // possibly separated by `.` punctuation (e.g. `Lib.Token`).
+            // We emit only the last identifier (the leaf / most-specific name).
+            let last_ident = type_node
+                .children(&mut type_node.walk())
+                .filter(|c| c.kind() == "identifier")
+                .last();
+            if let Some(ident) = last_ident {
+                let name = node_text(&ident, bytes);
+                push_type_ref(out, name, &ident, file, ctx);
+            }
+        }
+        // Elementary/builtin types — skip entirely.
+        "primitive_type" => {}
+        // mapping(K => V): recurse into key and value.
+        "mapping" => {
+            if let Some(key) = type_node.child_by_field_name("key") {
+                type_leaf(&key, bytes, file, ctx, out);
+            }
+            if let Some(value) = type_node.child_by_field_name("value") {
+                type_leaf(&value, bytes, file, ctx, out);
+            }
+        }
+        // T[]: the element type is the first named child.
+        "array_type" => {
+            if let Some(elem) = type_node.named_children(&mut type_node.walk()).next() {
+                type_leaf(&elem, bytes, file, TypeRefContext::Other, out);
+            }
+        }
+        // `type_name` is the wrapper carried by the `type:` field; its named
+        // children are the actual type(s) — a `user_defined_type`, a
+        // `primitive_type`, or nested `type_name`s (mapping key/value, array
+        // element). Recurse them with the same context.
+        "type_name" => {
+            for child in type_node.named_children(&mut type_node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        // function_type, tuple_type, or any other form — skip.
+        _ => {}
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::TypeRef`] references for
+/// user-defined types that appear in annotation positions.
+///
+/// Covered positions:
+/// - `parameter` `type:` field → [`TypeRefContext::ParameterType`] (covers both
+///   function/constructor parameters and modifier parameters).
+/// - `function_definition` return parameters: the `returns` clause is modelled in
+///   tree-sitter-solidity as a sequence of `parameter` children that follow the
+///   `returns` keyword; the function node's `return_type` field points at the
+///   `return_parameters` node whose `parameter` children each carry a `type:` field
+///   → [`TypeRefContext::ReturnType`].
+/// - `struct_member` `type:` field (inside `struct_declaration`) →
+///   [`TypeRefContext::Field`].
+/// - `state_variable_declaration` `type:` field →
+///   [`TypeRefContext::Field`].
+///
+/// Elementary/builtin types (`primitive_type` nodes) are silently skipped inside
+/// [`type_leaf`]. No minimum-length filter is applied.
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Function/constructor/modifier parameters: `parameter` has a `type:` field.
+        // The parent determines whether this is a regular param or a return param;
+        // the context is set by the parent arm below.
+        "parameter" => {
+            // This arm is reached from the generic recursion below. The context
+            // (ParameterType vs ReturnType) is determined by the parent handler.
+            // We emit ParameterType here as the default; the return-parameter arm
+            // below overrides by calling type_leaf directly with ReturnType.
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+            }
+            // Recurse into children (parameter body is a leaf; no meaningful sub-nodes).
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return;
+        }
+        // Function definitions: return parameters live under the `return_type` field,
+        // which is a `return_parameters` node containing `parameter` children.
+        "function_definition"
+        | "constructor_definition"
+        | "modifier_definition"
+        | "fallback_receive_definition" => {
+            // Process non-return parameters (type: field of each direct `parameter` child)
+            // with ParameterType context. Return parameters (under `return_type`) get
+            // ReturnType context.
+            for child in node.children(&mut node.walk()) {
+                match child.kind() {
+                    "parameter" => {
+                        if let Some(type_node) = child.child_by_field_name("type") {
+                            type_leaf(&type_node, bytes, file, TypeRefContext::ParameterType, out);
+                        }
+                    }
+                    "return_type_definition" => {
+                        // Each parameter inside the return type definition is a return type.
+                        for ret_param in child.children(&mut child.walk()) {
+                            if ret_param.kind() == "parameter" {
+                                if let Some(type_node) = ret_param.child_by_field_name("type") {
+                                    type_leaf(
+                                        &type_node,
+                                        bytes,
+                                        file,
+                                        TypeRefContext::ReturnType,
+                                        out,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        collect_type_references(&child, bytes, file, out);
+                    }
+                }
+            }
+            return; // avoid double-recurse at the bottom
+        }
+        // Struct fields: `struct_member` has a `type:` field.
+        "struct_member" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+            // struct_member children are leaves; no further recursion needed.
+            return;
+        }
+        // State variables: `state_variable_declaration` has a `type:` field.
+        "state_variable_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                type_leaf(&type_node, bytes, file, TypeRefContext::Field, out);
+            }
+            // Recurse into the initializer expression (may contain calls/reads).
+            for child in node.children(&mut node.walk()) {
+                collect_type_references(&child, bytes, file, out);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
 }
 
 // ── Scope tree (Tier-B) ─────────────────────────────────────────────────────
@@ -1587,6 +1759,83 @@ contract C {
                 .any(|b| b.kind == BindingKind::Import && b.name == "ERC20"),
             "expected an Import binding for 'ERC20', got {:?}",
             facts.bindings
+        );
+    }
+
+    // ── TypeRef collection tests ──────────────────────────────────────────────
+
+    // Test (T1): function parameter with user-defined type → TypeRef "Config", ctx ParameterType.
+    #[test]
+    fn type_ref_param_type_emitted() {
+        let src = "contract C { function f(Config c) public {} }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ParameterType),
+            "expected ParameterType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    // Test (T2): function return type with user-defined type → TypeRef "Config", ctx ReturnType.
+    #[test]
+    fn type_ref_return_type_emitted() {
+        let src = "contract C { function f() public returns (Config) {} }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::ReturnType),
+            "expected ReturnType ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    // Test (T3): struct field with user-defined type → TypeRef "Config", ctx Field.
+    #[test]
+    fn type_ref_struct_field_emitted() {
+        let src = "contract C { struct T { Config conf; } }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let r = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "Config")
+            .expect("expected TypeRef ref for 'Config'");
+        assert_eq!(
+            r.type_ref_ctx,
+            Some(TypeRefContext::Field),
+            "expected Field ctx, got {:?}",
+            r.type_ref_ctx
+        );
+    }
+
+    // Test (T4): elementary type parameter → NO TypeRef for "uint".
+    #[test]
+    fn type_ref_elementary_not_emitted() {
+        let src = "contract C { function f(uint n) public {} }";
+        let facts = extract(src, "contracts/C.sol");
+
+        let type_refs: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::TypeRef)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            !type_refs.contains(&"uint"),
+            "elementary type 'uint' must NOT produce a TypeRef, got {type_refs:?}"
         );
     }
 

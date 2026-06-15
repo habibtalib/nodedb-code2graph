@@ -1,0 +1,4 @@
+# CTE reference resolves to its CTE definition in the same statement scope.
+# Tier-B Scoped resolution: `FROM revenue` on line 2 resolves to the
+# `WITH revenue AS (...)` definition on line 1.
+revenue_cte.sql:2 TypeRef revenue_cte.sql:1

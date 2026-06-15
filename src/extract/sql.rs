@@ -1,20 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! SQL extractor — extracts DDL symbols (tables, views, columns) via tree-sitter-sequel.
+//! SQL extractor — extracts DDL symbols (tables, views, columns) and CTE
+//! definitions via tree-sitter-sequel.
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies. References
-//! (table use-sites in FROM/JOIN/INSERT/UPDATE/DELETE/REFERENCES clauses) are now
+//! (table use-sites in FROM/JOIN/INSERT/UPDATE/DELETE/REFERENCES clauses) are
 //! emitted as [`RefRole::TypeRef`] so the language-agnostic resolver can link them
 //! to their table/view definitions automatically.
+//!
+//! Tier-B scope/binding extraction: CTE names introduced by `WITH … AS (…)` are
+//! emitted as [`BindingKind::Definition`] bindings in the enclosing statement scope
+//! (not scope 0 — the file root). A `FROM revenue` reference inside the same
+//! statement therefore resolves with [`Confidence::Scoped`].
+
+use std::collections::HashMap;
 
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, BindingTarget, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::Extractor;
+use super::{
+    Extractor, attach_reference_scopes, definition_bindings, innermost_scope, node_span, push_scope,
+};
 
 /// Extracts SQL symbols and references (tables, views, columns).
 pub struct SqlExtractor;
@@ -41,19 +54,38 @@ impl Extractor for SqlExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
 
-        let mut symbols = collect_symbols(&root, bytes, file);
-        let mod_sym = super::module_symbol(Language::Sql, &[], file, source.len());
-        symbols.push(mod_sym);
+        // DDL symbols (CREATE TABLE / VIEW / columns) — bound at file-root scope (0).
+        let defs = collect_symbols(&root, bytes, file);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
 
-        let references = collect_references(&root, bytes, file);
+        // CTE symbols: each `WITH name AS (…)` introduces a name local to its
+        // enclosing statement scope — NOT the file root.
+        let cte_symbols = collect_cte_symbols(&root, bytes, file);
+        symbols.extend(cte_symbols.iter().cloned());
+
+        // Module symbol: stable SCIP identity for the whole file.
+        symbols.push(super::module_symbol(Language::Sql, &[], file, source.len()));
+
+        // References (all object_reference nodes that aren't DDL definition names).
+        let mut references = collect_references(&root, bytes, file);
+
+        // Scope tree: scope[0] = Module over whole file; each `statement` or
+        // `subquery` node gets its own `Other` scope.
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+
+        // CTE bindings (Definition in statement scope) + DDL bindings (scope 0).
+        let mut bindings = collect_cte_bindings(&root, bytes, &scopes, &cte_symbols);
+        bindings.extend(def_bindings);
 
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Sql.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -264,6 +296,152 @@ fn collect_references_recursive(node: &Node, bytes: &[u8], file: &str, out: &mut
     }
     for child in node.children(&mut node.walk()) {
         collect_references_recursive(&child, bytes, file, out);
+    }
+}
+
+// ── Tier-B: scope tree ────────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one SQL file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// Each `statement` or `subquery` node opens a `ScopeKind::Other` scope; other
+/// constructs do not introduce new name-resolution regions.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    // Walk the root's children (the top-level statements in the program node).
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS that opens `Other` scopes for `statement` and `subquery` nodes.
+fn scope_dfs(node: &Node, parent: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "statement" | "subquery" => {
+            let new_id = push_scope(scopes, Some(parent), node_span(node), ScopeKind::Other);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, new_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent, scopes);
+            }
+        }
+    }
+}
+
+// ── Tier-B: CTE symbol extraction ────────────────────────────────────────────
+
+/// Return the first `identifier` child of a `cte` node (the CTE name node).
+///
+/// Both CTE symbol and CTE binding collection need to locate this same node;
+/// this helper avoids duplicating the traversal.
+#[inline]
+fn cte_identifier_node<'a>(cte_node: &Node<'a>) -> Option<Node<'a>> {
+    cte_node
+        .children(&mut cte_node.walk())
+        .find(|c| c.kind() == "identifier")
+}
+
+/// Collect a [`Symbol`] for every CTE name introduced by `WITH … AS (…)`.
+///
+/// The CTE name is the first `identifier` child of a `cte` node. The symbol
+/// uses the same [`Descriptor::Type`] leaf as DDL table/view definitions (no
+/// schema prefix — CTEs are always local to their statement scope).
+fn collect_cte_symbols(root: &Node, bytes: &[u8], file: &str) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    collect_cte_symbols_dfs(root, bytes, file, &mut out);
+    out
+}
+
+fn collect_cte_symbols_dfs(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
+    if node.kind() == "cte" {
+        // The first child of kind `identifier` is the CTE name.
+        if let Some(name_node) = cte_identifier_node(node) {
+            let name = super::unquote(super::node_text(&name_node, bytes)).to_owned();
+            if !name.is_empty() {
+                // Mirror DDL SymbolId style: Descriptor::Type as the single leaf.
+                let descriptors = vec![Descriptor::Type(name.clone())];
+                out.push(Symbol {
+                    id: SymbolId::global(Language::Sql.as_str(), descriptors),
+                    name,
+                    kind: SymbolKind::Other,
+                    file: file.to_owned(),
+                    line: (node.start_position().row + 1) as u32,
+                    span: node_span(node),
+                    signature: String::new(),
+                });
+            }
+        }
+        // Do NOT recurse into `cte` children to avoid re-entering nested CTEs
+        // from within this one's body statement — those will be visited by the
+        // outer DFS as siblings of the parent `statement`.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_cte_symbols_dfs(&child, bytes, file, out);
+    }
+}
+
+// ── Tier-B: CTE binding collection ───────────────────────────────────────────
+
+/// Collect [`BindingKind::Definition`] bindings for each CTE name.
+///
+/// Each binding lives in the innermost scope containing the CTE's name node —
+/// that is the `statement` or `subquery` scope opened by the enclosing WITH
+/// clause, never scope 0 (the file root). This is what enables the scope-graph
+/// resolver to prefer the CTE definition over any global table of the same name.
+fn collect_cte_bindings(
+    root: &Node,
+    bytes: &[u8],
+    scopes: &[Scope],
+    cte_symbols: &[Symbol],
+) -> Vec<Binding> {
+    // Index CTE symbols by name for O(1) lookup.
+    let by_name: HashMap<&str, &Symbol> =
+        cte_symbols.iter().map(|s| (s.name.as_str(), s)).collect();
+    let mut out = Vec::new();
+    collect_cte_bindings_dfs(root, bytes, scopes, &by_name, &mut out);
+    out
+}
+
+fn collect_cte_bindings_dfs<'a>(
+    node: &Node,
+    bytes: &[u8],
+    scopes: &[Scope],
+    by_name: &HashMap<&'a str, &'a Symbol>,
+    out: &mut Vec<Binding>,
+) {
+    if node.kind() == "cte" {
+        if let Some(name_node) = cte_identifier_node(node) {
+            let name = super::unquote(super::node_text(&name_node, bytes));
+            if let Some(sym) = by_name.get(name) {
+                let scope = innermost_scope(name_node.start_byte(), scopes).unwrap_or(0);
+                out.push(Binding {
+                    scope,
+                    name: name.to_owned(),
+                    intro: name_node.start_byte(),
+                    kind: BindingKind::Definition,
+                    target: BindingTarget::Def(sym.id.clone()),
+                });
+            }
+        }
+        // Do not recurse further — same rationale as collect_cte_symbols_dfs.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_cte_bindings_dfs(&child, bytes, scopes, by_name, out);
     }
 }
 
@@ -569,6 +747,132 @@ mod tests {
             "pure DDL CREATE TABLE should NOT emit a TypeRef ref for 'users' (it's the definition name), \
              got: {:?}",
             typeref_users
+        );
+    }
+
+    // ── Tier-B scope / CTE tests ──────────────────────────────────────────────
+
+    /// A WITH statement opens at least one non-module (Other) scope.
+    #[test]
+    fn cte_statement_opens_other_scope() {
+        let src = "WITH r AS (SELECT 1) SELECT * FROM r;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+        // scope[0] = Module; at least one more scope with kind Other.
+        assert!(
+            facts.scopes.len() >= 2,
+            "expected at least two scopes (Module + statement), got: {:?}",
+            facts.scopes
+        );
+        let has_other = facts.scopes.iter().any(|s| s.kind == ScopeKind::Other);
+        assert!(has_other, "expected at least one ScopeKind::Other scope");
+        // Every Other scope has Some(parent) leading back toward 0.
+        for scope in &facts.scopes {
+            if scope.kind == ScopeKind::Other {
+                assert!(
+                    scope.parent.is_some(),
+                    "Other scope should have a parent, got: {:?}",
+                    scope
+                );
+            }
+        }
+    }
+
+    /// CTE name → Definition binding in a non-zero Other scope.
+    #[test]
+    fn cte_name_gets_definition_binding_in_statement_scope() {
+        let src = "WITH revenue AS (SELECT amount FROM sales) SELECT * FROM revenue;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+
+        let binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "revenue" && b.kind == BindingKind::Definition);
+        let binding = binding.expect("expected a Definition binding for 'revenue'");
+
+        // Binding must be in a non-zero scope (not the file root).
+        assert_ne!(
+            binding.scope, 0,
+            "CTE binding should be in a statement scope, not the file root (scope 0)"
+        );
+        // The scope it lives in must be ScopeKind::Other.
+        assert_eq!(
+            facts.scopes[binding.scope].kind,
+            ScopeKind::Other,
+            "CTE binding scope should be ScopeKind::Other, got: {:?}",
+            facts.scopes[binding.scope]
+        );
+    }
+
+    /// The `FROM revenue` reference inside a CTE statement has its scope set.
+    #[test]
+    fn cte_from_ref_has_scope_set() {
+        let src = "WITH revenue AS (SELECT amount FROM sales) SELECT * FROM revenue;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+
+        let revenue_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "revenue");
+        let revenue_ref =
+            revenue_ref.expect("expected a TypeRef reference named 'revenue' (FROM revenue)");
+        assert!(
+            revenue_ref.scope.is_some(),
+            "FROM revenue reference should have scope set, got None"
+        );
+    }
+
+    /// CTE definition emits a Symbol with kind Other and the correct name/line.
+    #[test]
+    fn cte_emits_symbol() {
+        let src = "WITH revenue AS (SELECT amount FROM sales) SELECT * FROM revenue;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+
+        let sym = find_by_name(&facts.symbols, "revenue")
+            .expect("expected a Symbol named 'revenue' for the CTE definition");
+        assert_eq!(
+            sym.kind,
+            SymbolKind::Other,
+            "CTE symbol kind should be Other"
+        );
+        assert_eq!(sym.line, 1, "CTE symbol should be on line 1");
+    }
+
+    /// A plain `SELECT * FROM users` (no CTE) still produces scopes and the
+    /// `users` reference has its scope set.
+    #[test]
+    fn plain_select_scopes_and_ref_scope() {
+        let src = "SELECT * FROM users;";
+        let facts = SqlExtractor.extract(src, "db/query.sql").unwrap();
+
+        assert!(
+            !facts.scopes.is_empty(),
+            "plain SELECT should still produce scopes"
+        );
+        let users_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::TypeRef && r.name == "users")
+            .expect("expected TypeRef ref for 'users'");
+        assert!(
+            users_ref.scope.is_some(),
+            "plain SELECT FROM ref should have scope set"
+        );
+    }
+
+    /// DDL `CREATE TABLE orders (id INT)` still gets a Definition binding at scope 0.
+    #[test]
+    fn ddl_gets_definition_binding_at_scope_0() {
+        let src = "CREATE TABLE orders (id INT);";
+        let facts = SqlExtractor.extract(src, "db/schema.sql").unwrap();
+
+        let binding = facts
+            .bindings
+            .iter()
+            .find(|b| b.name == "orders" && b.kind == BindingKind::Definition);
+        let binding = binding.expect("expected a Definition binding for 'orders'");
+        assert_eq!(
+            binding.scope, 0,
+            "DDL Definition binding should be at file-root scope (0)"
         );
     }
 }

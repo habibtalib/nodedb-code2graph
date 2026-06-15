@@ -21,11 +21,17 @@
 use tree_sitter::{Language as TsLanguage, Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{ByteSpan, FileFacts, RefRole, Reference, Symbol, SymbolKind};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
+};
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
 
-use super::{Extractor, collect_call_references, field_text, node_text, one_line_signature};
+use super::{
+    Extractor, attach_reference_scopes, collect_call_references, definition_bindings, field_text,
+    innermost_scope, node_span, node_text, one_line_signature, push_binding, push_scope,
+};
 
 /// Tree-sitter query capturing explicit call-callee identifiers.
 const CALL_QUERY: &str = r#"
@@ -65,8 +71,10 @@ impl Extractor for RubyExtractor {
             .map(Descriptor::Namespace)
             .collect();
 
-        let mut symbols = Vec::new();
-        walk(&root, &namespaces, bytes, file, &mut symbols);
+        let mut defs = Vec::new();
+        walk(&root, &namespaces, bytes, file, &mut defs);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         symbols.push(super::module_symbol(
             Language::Ruby,
             &ns_strings,
@@ -78,13 +86,18 @@ impl Extractor for RubyExtractor {
             collect_call_references(&root, &ts_language, CALL_QUERY, Language::Ruby, bytes, file)?;
         collect_inheritance(&root, bytes, file, &mut references);
 
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+
         Ok(FileFacts {
             file: file.to_owned(),
             lang: Language::Ruby.as_str().to_owned(),
             symbols,
             references,
-            scopes: Vec::new(),
-            bindings: Vec::new(),
+            scopes,
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -236,6 +249,222 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
 }
 
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one Ruby file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0, source_len)`.
+/// Ruby opens scopes for:
+/// - `class`, `module`, `singleton_class` → `Type` scope
+/// - `method`, `singleton_method` → `Function` scope
+/// - `block`, `do_block` → `Function` scope (blocks are closure-like; their locals
+///   are distinct from the enclosing method)
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening scopes for Ruby declaration nodes.
+///
+/// Body peeling strategy (mirrors go.rs/php.rs):
+/// - `class` / `module` / `singleton_class`: body field is a `body_statement`;
+///   recurse its children under the Type scope so the body node itself does not
+///   re-open a redundant scope.
+/// - `method` / `singleton_method`: body field may be a `body_statement`
+///   (normal def), an expression (endless method: `def f = expr`), or absent
+///   (abstract-like). Recurse body_statement children; else recurse the body
+///   node itself; if absent, do nothing.
+/// - `do_block`: body field is a `body_statement`; recurse its children under
+///   the Function scope.
+/// - `block`: body field is a `block_body`; recurse its children under the
+///   Function scope.
+/// - All other nodes: recurse children under the same parent.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "class" | "module" | "singleton_class" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            if let Some(body) = node.child_by_field_name("body") {
+                // body is a body_statement — recurse its children
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            }
+            // If no body, nothing to recurse into.
+        }
+        "method" | "singleton_method" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            if let Some(body) = node.child_by_field_name("body") {
+                if body.kind() == "body_statement" {
+                    // Normal method — peel the body_statement
+                    for child in body.children(&mut body.walk()) {
+                        scope_dfs(&child, fn_id, scopes);
+                    }
+                } else {
+                    // Endless method (`def f = expr`) — body is the expression
+                    scope_dfs(&body, fn_id, scopes);
+                }
+            }
+            // Abstract-ish / empty method: no body field at all → nothing more to do.
+        }
+        "do_block" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            if let Some(body) = node.child_by_field_name("body") {
+                // body is a body_statement
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "block" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            if let Some(body) = node.child_by_field_name("body") {
+                // body is a block_body
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings (Tier-B) ────────────────────────────────────────────────────────
+
+/// Collect parameter and local-variable [`Binding`]s for one Ruby file.
+///
+/// Covers:
+/// - `method` / `singleton_method` parameters → [`BindingKind::Param`].
+/// - `block` / `do_block` parameters → [`BindingKind::Param`].
+/// - `assignment` with an `identifier` on the left → [`BindingKind::Local`]
+///   (only when the innermost scope is `Function` or `Block`).
+///
+/// Class-level constant assignments (`BAR = 1` in a class body) are **not**
+/// emitted as `Local` because their enclosing scope is `Type`, which fails the
+/// Function|Block guard. Instance variables (`@x = ...`), class variables
+/// (`@@x`), and global variables (`$x`) are also excluded — the LHS kind is
+/// `instance_variable`, `class_variable`, or `global_variable`, not
+/// `identifier`, so the guard fires before any scope check.
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "method" | "singleton_method" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                // parameters field is a method_parameters node
+                collect_params(&params, bytes, scopes, out);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "block" | "do_block" => {
+            if let Some(params) = node.child_by_field_name("parameters") {
+                // parameters field is a block_parameters node
+                collect_params(&params, bytes, scopes, out);
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        "assignment" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "identifier" {
+                    let name = node_text(&left, bytes).to_owned();
+                    let intro = left.start_byte();
+                    if let Some(sid) = innermost_scope(intro, scopes) {
+                        if matches!(scopes[sid].kind, ScopeKind::Function | ScopeKind::Block) {
+                            push_binding(out, name, intro, BindingKind::Local, scopes);
+                        }
+                    }
+                }
+            }
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                collect_bindings_dfs(&child, bytes, scopes, out);
+            }
+        }
+    }
+}
+
+/// Emit a [`BindingKind::Param`] for each named parameter in a Ruby
+/// `method_parameters` or `block_parameters` node.
+///
+/// Handles:
+/// - `identifier` (positional param) — name is the node text directly.
+/// - `optional_parameter` (`a = 1`) — name from `name` field.
+/// - `keyword_parameter` (`a:` or `a: default`) — name from `name` field.
+/// - `splat_parameter` (`*a`) — name from `name` field (absent for bare `*`).
+/// - `block_parameter` (`&b`) — name from `name` field.
+/// - `hash_splat_parameter` (`**kw`) — name from `name` field (absent for bare `**`).
+/// - Other kinds (e.g. `destructured_parameter`, `forward_parameter`) are skipped.
+///
+/// No Function|Block guard is needed: params are always introduced inside a
+/// method/block, which is a Function scope by construction.
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        match child.kind() {
+            "identifier" => {
+                let name = node_text(&child, bytes).to_owned();
+                let intro = child.start_byte();
+                push_binding(out, name, intro, BindingKind::Param, scopes);
+            }
+            "optional_parameter"
+            | "keyword_parameter"
+            | "splat_parameter"
+            | "block_parameter"
+            | "hash_splat_parameter" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = node_text(&name_node, bytes).to_owned();
+                    let intro = name_node.start_byte();
+                    push_binding(out, name, intro, BindingKind::Param, scopes);
+                }
+                // Bare `*` (splat_parameter with no `name` field) and bare `**`
+                // (hash_splat_parameter with no `name` field) have no binding.
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +613,207 @@ end
         assert!(
             inherit.is_empty(),
             "expected no Inherit refs, got {inherit:?}"
+        );
+    }
+
+    // ── Tier-B scope / binding tests ─────────────────────────────────────────
+
+    #[test]
+    fn method_params_emit_param_bindings() {
+        // `def greet(name, age)\nend` → Param `name`, `age` in a Function scope.
+        let src = "def greet(name, age)\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/greet.rb").unwrap();
+
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope");
+
+        let mut param_names: Vec<(&str, ScopeId)> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| (b.name.as_str(), b.scope))
+            .collect();
+        param_names.sort_by_key(|(n, _)| *n);
+
+        assert_eq!(
+            param_names,
+            vec![("age", fn_scope_id), ("name", fn_scope_id)],
+            "expected Param bindings for name and age, got {param_names:?}"
+        );
+    }
+
+    #[test]
+    fn optional_keyword_splat_block_params() {
+        // `def f(a, b: 1, *c, &d)\nend` → Params a, b, c, d.
+        let src = "def f(a, b: 1, *c, &d)\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        let params: Vec<&str> = facts
+            .bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::Param)
+            .map(|b| b.name.as_str())
+            .collect();
+        assert!(params.contains(&"a"), "expected Param 'a', got {params:?}");
+        assert!(params.contains(&"b"), "expected Param 'b', got {params:?}");
+        assert!(params.contains(&"c"), "expected Param 'c', got {params:?}");
+        assert!(params.contains(&"d"), "expected Param 'd', got {params:?}");
+    }
+
+    #[test]
+    fn assignment_local_in_method() {
+        // `def f\n  x = 1\nend` → Local `x` in a Function scope.
+        let src = "def f\n  x = 1\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_eq!(
+            facts.scopes[x.scope].kind,
+            ScopeKind::Function,
+            "Local 'x' should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn block_params_emit_param_bindings() {
+        // `[1].each { |item| }` → Param `item` in a Function scope.
+        let src = "[1].each { |item| }\n";
+        let facts = RubyExtractor.extract(src, "lib/blk.rb").unwrap();
+
+        let _fn_scope = facts
+            .scopes
+            .iter()
+            .find(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope for the block");
+
+        let item = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Param && b.name == "item")
+            .expect("expected a Param binding for 'item'");
+        assert_eq!(
+            facts.scopes[item.scope].kind,
+            ScopeKind::Function,
+            "block param 'item' should be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn class_level_constant_is_definition_not_local() {
+        // `class Foo\n  BAR = 1\nend` → NO Local `BAR`; Definition `BAR` exists.
+        let src = "class Foo\n  BAR = 1\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/foo.rb").unwrap();
+
+        assert!(
+            !facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Local && b.name == "BAR"),
+            "class-level constant 'BAR' must NOT be a Local binding"
+        );
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "BAR"),
+            "expected a Definition binding for 'BAR'"
+        );
+    }
+
+    #[test]
+    fn ivar_assignment_is_not_local() {
+        // `def f\n  @x = 1\nend` → NO Local binding for `@x`.
+        // The LHS kind is `instance_variable`, not `identifier`.
+        let src = "def f\n  @x = 1\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/f.rb").unwrap();
+
+        assert!(
+            !facts.bindings.iter().any(|b| b.kind == BindingKind::Local),
+            "instance variable assignment must NOT produce a Local binding"
+        );
+    }
+
+    #[test]
+    fn nesting_class_method_produces_correct_scopes_and_local() {
+        // `class S\n  def h\n    x = 1\n  end\nend`
+        // → Module(0); Type scope (class, parent 0); Function scope (method, parent=Type);
+        //   Local `x` in the Function scope.
+        let src = "class S\n  def h\n    x = 1\n  end\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/s.rb").unwrap();
+
+        assert_eq!(
+            facts.scopes[0].kind,
+            ScopeKind::Module,
+            "scopes[0] must be Module"
+        );
+
+        let type_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Type)
+            .expect("expected a Type scope for the class");
+        let fn_scope_id = facts
+            .scopes
+            .iter()
+            .position(|s| s.kind == ScopeKind::Function)
+            .expect("expected a Function scope for the method");
+
+        assert_eq!(
+            facts.scopes[type_scope_id].parent,
+            Some(0),
+            "Type scope parent must be Module (0)"
+        );
+        assert_eq!(
+            facts.scopes[fn_scope_id].parent,
+            Some(type_scope_id),
+            "Function scope parent must be the Type scope"
+        );
+
+        let x = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Local && b.name == "x")
+            .expect("expected a Local binding for 'x'");
+        assert_eq!(
+            facts.scopes[x.scope].kind,
+            ScopeKind::Function,
+            "Local 'x' must be in a Function scope"
+        );
+    }
+
+    #[test]
+    fn same_file_call_ref_has_non_zero_scope() {
+        // `def helper\n  0\nend\ndef run\n  helper()\nend`
+        // → Definition `helper` exists AND the `helper` Call ref has scope == Some(non-zero).
+        let src = "def helper\n  0\nend\ndef run\n  helper()\nend\n";
+        let facts = RubyExtractor.extract(src, "lib/main.rb").unwrap();
+
+        assert!(
+            facts
+                .bindings
+                .iter()
+                .any(|b| b.kind == BindingKind::Definition && b.name == "helper"),
+            "expected a Definition binding for 'helper'"
+        );
+
+        let helper_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Call && r.name == "helper")
+            .expect("expected a Call ref for 'helper'");
+        let scope_id = helper_ref
+            .scope
+            .expect("helper() Call ref must have a scope attached");
+        assert_ne!(
+            scope_id, 0,
+            "helper() Call ref scope must not be the module root"
         );
     }
 }

@@ -1,0 +1,7 @@
+# Same-file call: `run` calls `helper`, both defined in main.rb.
+# Proves Tier-B same-file Scoped resolution: the `helper()` call on line 6
+# resolves to the `def helper` definition on line 1, not fanning out to any
+# external same-named symbol. Ruby captures all top-level methods as
+# Definition bindings. Note: paren-less calls (e.g. `helper` without `()`)
+# are not captured — only explicit call nodes with parens are recorded.
+main.rb:6 Call main.rb:1

@@ -1,0 +1,1174 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Dart extractor — one tree-sitter pass yielding definitions and references.
+//!
+//! Definitions: classes, mixins, enums, extensions, type aliases, top-level
+//! functions, top-level variables, and their members (methods, constructors,
+//! fields). Identity is file-path-derived (Dart has no explicit namespace
+//! declaration in source; convention is library/file-based).
+//!
+//! References: call expressions (free and member/chained), import directives
+//! with `show` combinators or `as` aliases, type references in parameter and
+//! return-type positions, and superclass/interface/mixin `IsImplementation` refs.
+//!
+//! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
+
+use tree_sitter::{Node, Parser};
+
+use crate::error::{CodegraphError, Result};
+use crate::graph::types::{
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind, TypeRefContext,
+};
+use crate::lang::Language;
+use crate::symbol::{Descriptor, SymbolId};
+
+use super::{
+    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
+    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
+    push_binding, push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+};
+
+/// Tree-sitter query capturing call-callee identifiers.
+///
+/// Pattern 1: free call `foo()` — identifier directly as `function` field.
+/// Pattern 2: member call `a.bar()` — member_expression under `function` field;
+///            receiver captured as `@qualifier`, method name as `@callee`.
+const CALL_QUERY: &str = r#"
+[
+  (call_expression function: (identifier) @callee)
+  (call_expression function: (member_expression object: (_) @qualifier property: (identifier) @callee))
+]
+"#;
+
+/// Extracts Dart symbols and references.
+pub struct DartExtractor;
+
+impl Extractor for DartExtractor {
+    fn lang(&self) -> Language {
+        Language::Dart
+    }
+
+    fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
+        let ts_language = crate::grammar::dart();
+        let mut parser = Parser::new();
+        parser
+            .set_language(&ts_language)
+            .map_err(|_| CodegraphError::Parse {
+                path: file.to_owned(),
+            })?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| CodegraphError::Parse {
+                path: file.to_owned(),
+            })?;
+
+        let root = tree.root_node();
+        let bytes = source.as_bytes();
+        let namespaces = dart_namespaces(file);
+
+        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
+        let mod_sym = super::module_symbol(Language::Dart, &namespaces, file, source.len());
+        let module_id = mod_sym.id.to_scip_string();
+        symbols.push(mod_sym);
+
+        let mut references =
+            collect_call_references(&root, &ts_language, CALL_QUERY, Language::Dart, bytes, file)?;
+        collect_inheritance(&root, bytes, file, &mut references);
+        collect_imports(&root, bytes, file, &mut references, &module_id);
+        collect_type_references(&root, bytes, file, &mut references);
+
+        let scopes = collect_scopes(&root, source.len());
+        attach_reference_scopes(&mut references, &scopes);
+        let mut bindings = collect_bindings(&root, bytes, &scopes);
+        bindings.extend(def_bindings);
+        bindings.extend(import_bindings(&references, &scopes));
+
+        Ok(FileFacts {
+            file: file.to_owned(),
+            lang: Language::Dart.as_str().to_owned(),
+            symbols,
+            references,
+            scopes,
+            bindings,
+            ffi_exports: Vec::new(),
+        })
+    }
+}
+
+// ── Namespace derivation ─────────────────────────────────────────────────────
+
+/// Derive namespace descriptors purely from the file path.
+///
+/// Dart has no namespace/package declaration in source — identity is
+/// file/library-based. We strip `.dart`, strip leading `src/` and `lib/`
+/// (Dart's conventional source roots), then split on `/`.
+///
+/// `lib/models/user.dart` → `["models", "user"]`
+/// `src/utils/helper.dart` → `["utils", "helper"]`
+fn dart_namespaces(file: &str) -> Vec<String> {
+    let p = file.strip_suffix(".dart").unwrap_or(file);
+    let p = p
+        .strip_prefix("lib/")
+        .or_else(|| p.strip_prefix("src/"))
+        .unwrap_or(p);
+    p.split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+// ── Symbol collection ────────────────────────────────────────────────────────
+
+fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+    let ns_descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    let mut out = Vec::new();
+    collect_top_level(root, bytes, file, &ns_descriptors, &mut out);
+    out
+}
+
+/// Walk the `source_file` node and collect top-level definitions.
+fn collect_top_level(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    for child in node.children(&mut node.walk()) {
+        match child.kind() {
+            "class_declaration" => {
+                collect_class(&child, bytes, file, prefix, SymbolKind::Class, out);
+            }
+            "mixin_declaration" => {
+                collect_mixin(&child, bytes, file, prefix, out);
+            }
+            "enum_declaration" => {
+                collect_enum(&child, bytes, file, prefix, out);
+            }
+            "extension_declaration" => {
+                collect_extension(&child, bytes, file, prefix, out);
+            }
+            "type_alias" => {
+                collect_type_alias(&child, bytes, file, prefix, out);
+            }
+            "function_declaration" => {
+                collect_top_function(&child, bytes, file, prefix, out);
+            }
+            "top_level_variable_declaration" => {
+                collect_top_level_vars(&child, bytes, file, prefix, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Emit a class or extension symbol and recurse into its `class_body` for members.
+fn collect_class(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    kind: SymbolKind,
+    out: &mut Vec<Symbol>,
+) {
+    let Some(name) = field_text(node, "name", bytes) else {
+        return;
+    };
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Type(name.clone()));
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
+        name: name.clone(),
+        kind,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
+    });
+
+    // Recurse into class_body for members.
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_class_members(&body, bytes, file, &descriptors, out);
+    }
+}
+
+/// Emit a mixin declaration and its body members.
+///
+/// Mixins are trait-like constructs: `mixin Foo on Bar { ... }`.
+fn collect_mixin(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    let Some(name) = field_text(node, "name", bytes) else {
+        return;
+    };
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Type(name.clone()));
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
+        name: name.clone(),
+        kind: SymbolKind::Trait,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
+    });
+
+    // Recurse into class_body (mixins share the same body shape as classes).
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_class_members(&body, bytes, file, &descriptors, out);
+    }
+}
+
+/// Emit an enum and its constants.
+fn collect_enum(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    let Some(name) = field_text(node, "name", bytes) else {
+        return;
+    };
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Type(name.clone()));
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
+        name: name.clone(),
+        kind: SymbolKind::Enum,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
+    });
+
+    // Collect enum constants from enum_body.
+    if let Some(body) = node.child_by_field_name("body") {
+        for member in body.children(&mut body.walk()) {
+            if member.kind() == "enum_constant" {
+                if let Some(const_name) = field_text(&member, "name", bytes) {
+                    let mut const_desc = descriptors.clone();
+                    const_desc.push(Descriptor::Term(const_name.clone()));
+                    out.push(Symbol {
+                        id: SymbolId::global(Language::Dart.as_str(), const_desc),
+                        name: const_name,
+                        kind: SymbolKind::Const,
+                        file: file.to_owned(),
+                        line: (member.start_position().row + 1) as u32,
+                        span: ByteSpan {
+                            start: member.start_byte(),
+                            end: member.end_byte(),
+                        },
+                        signature: one_line_signature(node_text(&member, bytes), &['{', ';', ',']),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Emit an extension declaration and its body members.
+///
+/// Extensions extend an existing type: `extension FooExt on Foo { ... }`.
+fn collect_extension(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    let Some(name) = field_text(node, "name", bytes) else {
+        return;
+    };
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Type(name.clone()));
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors.clone()),
+        name: name.clone(),
+        kind: SymbolKind::Class,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
+    });
+
+    // Recurse into extension_body for members (same shape as class_body).
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_class_members(&body, bytes, file, &descriptors, out);
+    }
+}
+
+/// Emit a type alias: `typedef MyType = SomeOtherType;`
+fn collect_type_alias(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    // The name is the FIRST type_identifier child (no field name in the grammar).
+    let name_node = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "type_identifier");
+    let Some(name_node) = name_node else { return };
+    let name = node_text(&name_node, bytes).to_owned();
+
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Type(name.clone()));
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors),
+        name,
+        kind: SymbolKind::TypeAlias,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
+    });
+}
+
+/// Emit a top-level function: `void foo() { ... }`
+///
+/// The name lives on the inner `function_signature` child via its `name` field.
+fn collect_top_function(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    // function_declaration has a `signature` field → function_signature with `name`.
+    let name_opt = node
+        .child_by_field_name("signature")
+        .and_then(|sig| sig.child_by_field_name("name"))
+        .map(|n| node_text(&n, bytes).to_owned());
+    let Some(name) = name_opt else { return };
+
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Method {
+        name: name.clone(),
+        disambiguator: String::new(),
+    });
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors),
+        name,
+        kind: SymbolKind::Function,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
+    });
+}
+
+/// Emit top-level variable declarations.
+///
+/// Grammar: `top_level_variable_declaration → type? initialized_identifier_list`
+/// where `initialized_identifier_list → initialized_identifier* `,` ...`
+/// Each `initialized_identifier` has a `name` field (identifier).
+fn collect_top_level_vars(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    for child in node.children(&mut node.walk()) {
+        if child.kind() == "initialized_identifier_list" {
+            emit_initialized_identifiers(&child, node, bytes, file, prefix, out);
+        }
+    }
+}
+
+/// Emit one `Symbol` per `initialized_identifier` found inside an
+/// `initialized_identifier_list`.
+fn emit_initialized_identifiers(
+    list_node: &Node,
+    decl_node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    for item in list_node.children(&mut list_node.walk()) {
+        if item.kind() == "initialized_identifier" {
+            if let Some(name) = field_text(&item, "name", bytes) {
+                let mut descriptors = prefix.to_vec();
+                descriptors.push(Descriptor::Term(name.clone()));
+                out.push(Symbol {
+                    id: SymbolId::global(Language::Dart.as_str(), descriptors),
+                    name,
+                    kind: SymbolKind::Static,
+                    file: file.to_owned(),
+                    line: (decl_node.start_position().row + 1) as u32,
+                    span: ByteSpan {
+                        start: decl_node.start_byte(),
+                        end: decl_node.end_byte(),
+                    },
+                    signature: one_line_signature(node_text(decl_node, bytes), &['{', ';']),
+                });
+            }
+        }
+    }
+}
+
+/// Walk a `class_body` or `extension_body` and emit member symbols.
+fn collect_class_members(
+    body: &Node,
+    bytes: &[u8],
+    file: &str,
+    type_prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    for wrapper in body.children(&mut body.walk()) {
+        if wrapper.kind() != "class_member" {
+            continue;
+        }
+        // Each class_member wraps exactly one inner node.
+        for member in wrapper.children(&mut wrapper.walk()) {
+            match member.kind() {
+                "method_declaration" => {
+                    // method_declaration → signature: method_signature → function_signature → name
+                    let name_opt = member
+                        .child_by_field_name("signature")
+                        .and_then(|ms| {
+                            // method_signature may itself contain a function_signature
+                            ms.children(&mut ms.walk())
+                                .find(|c| c.kind() == "function_signature")
+                        })
+                        .and_then(|fs| fs.child_by_field_name("name"))
+                        .map(|n| node_text(&n, bytes).to_owned())
+                        // Fallback: getter_signature has its name directly
+                        .or_else(|| {
+                            member
+                                .child_by_field_name("signature")
+                                .and_then(|ms| ms.child_by_field_name("name"))
+                                .map(|n| node_text(&n, bytes).to_owned())
+                        });
+                    if let Some(name) = name_opt {
+                        emit_method(name, &member, bytes, file, type_prefix, out);
+                    }
+                }
+                "declaration" => {
+                    // Could be a constructor or a field.
+                    // constructor_signature: has a `name` field (identifier, possibly "ClassName.named").
+                    // field: has initialized_identifier_list.
+                    let has_constructor = member
+                        .children(&mut member.walk())
+                        .any(|c| c.kind() == "constructor_signature");
+
+                    if has_constructor {
+                        // Find constructor_signature → name
+                        for child in member.children(&mut member.walk()) {
+                            if child.kind() == "constructor_signature" {
+                                if let Some(name) = field_text(&child, "name", bytes) {
+                                    emit_method(name, &child, bytes, file, type_prefix, out);
+                                }
+                            }
+                        }
+                    } else {
+                        // Field declaration: find initialized_identifier_list
+                        for child in member.children(&mut member.walk()) {
+                            if child.kind() == "initialized_identifier_list" {
+                                emit_initialized_identifiers(
+                                    &child,
+                                    &member,
+                                    bytes,
+                                    file,
+                                    type_prefix,
+                                    out,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Emit a method/constructor symbol with `Descriptor::Method`.
+fn emit_method(
+    name: String,
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    out: &mut Vec<Symbol>,
+) {
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Method {
+        name: name.clone(),
+        disambiguator: String::new(),
+    });
+    out.push(Symbol {
+        id: SymbolId::global(Language::Dart.as_str(), descriptors),
+        name,
+        kind: SymbolKind::Method,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
+    });
+}
+
+// ── Inheritance ──────────────────────────────────────────────────────────────
+
+/// Walk the tree and emit `IsImplementation` references for superclass and
+/// interface type references.
+///
+/// Covers:
+/// - `class_declaration` → `superclass` field → `type` → `type_identifier`
+/// - `class_declaration` / `mixin_declaration` → `interfaces` field → `type` nodes
+/// - `mixin_declaration` → `on` type constraint (child `type` node)
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "class_declaration" => {
+            // superclass field
+            if let Some(superclass) = node.child_by_field_name("superclass") {
+                emit_type_identifier_refs(&superclass, bytes, file, RefRole::IsImplementation, out);
+            }
+            // interfaces field
+            if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                emit_type_identifier_refs(&interfaces, bytes, file, RefRole::IsImplementation, out);
+            }
+        }
+        "mixin_declaration" => {
+            // `on` constraint: the `type` child (not a named field — it's a positional child
+            // after `on` keyword); walk children for type nodes.
+            let mut saw_on = false;
+            for child in node.children(&mut node.walk()) {
+                match child.kind() {
+                    "on" => saw_on = true,
+                    "type" if saw_on => {
+                        emit_type_identifier_refs(
+                            &child,
+                            bytes,
+                            file,
+                            RefRole::IsImplementation,
+                            out,
+                        );
+                    }
+                    "class_body" => break,
+                    _ => {}
+                }
+            }
+            // interfaces field
+            if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                emit_type_identifier_refs(&interfaces, bytes, file, RefRole::IsImplementation, out);
+            }
+        }
+        _ => {}
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+/// Walk `node` and emit `IsImplementation` refs for every `type_identifier` found.
+fn emit_type_identifier_refs(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    role: RefRole,
+    out: &mut Vec<Reference>,
+) {
+    if node.kind() == "type_identifier" {
+        push_ref(out, node_text(node, bytes), node, file, role);
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        emit_type_identifier_refs(&child, bytes, file, role, out);
+    }
+}
+
+// ── Imports ──────────────────────────────────────────────────────────────────
+
+/// Walk the tree emitting `Import` references for `library_import` nodes.
+///
+/// Dart import syntax:
+/// ```dart
+/// import 'package:a/b.dart';                 // bare — skip (no specific name)
+/// import 'package:a/b.dart' as alias;        // alias form → emit alias name
+/// import 'package:a/b.dart' show Foo, Bar;   // show combinator → emit Foo, Bar
+/// import 'package:a/b.dart' hide Foo;        // hide combinator → skip
+/// ```
+///
+/// The `from_path` is the URI string (quotes stripped).
+fn collect_imports(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
+    if node.kind() == "import_or_export" {
+        collect_import_or_export(node, bytes, file, out, module_id);
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_imports(&child, bytes, file, out, module_id);
+    }
+}
+
+fn collect_import_or_export(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
+    // Find the library_import child.
+    for child in node.children(&mut node.walk()) {
+        if child.kind() == "library_import" {
+            collect_library_import(&child, bytes, file, out, module_id);
+        }
+    }
+}
+
+fn collect_library_import(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
+    // Find import_specification.
+    for child in node.children(&mut node.walk()) {
+        if child.kind() == "import_specification" {
+            collect_import_specification(&child, bytes, file, out, module_id);
+        }
+    }
+}
+
+fn collect_import_specification(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    out: &mut Vec<Reference>,
+    module_id: &str,
+) {
+    // Get URI from the `uri` field → configurable_uri → uri → string_literal.
+    let uri_text = extract_uri_text(node, bytes);
+    let Some(from_path) = uri_text else { return };
+
+    // Collect combinators and alias.
+    let mut show_names: Vec<(String, Node)> = Vec::new();
+    let mut alias_node: Option<Node> = None;
+    let mut has_show = false;
+
+    for child in node.children(&mut node.walk()) {
+        match child.kind() {
+            "combinator" => {
+                // combinator: `show Foo, Bar` or `hide Foo`
+                // First keyword child: `show` or `hide`
+                let keyword = child
+                    .children(&mut child.walk())
+                    .find(|c| matches!(c.kind(), "show" | "hide"))
+                    .map(|c| c.kind());
+                if keyword == Some("show") {
+                    has_show = true;
+                    for id in child.children(&mut child.walk()) {
+                        if id.kind() == "identifier" {
+                            let name = node_text(&id, bytes).to_owned();
+                            show_names.push((name, id));
+                        }
+                    }
+                }
+                // hide → skip (we don't reference those names)
+            }
+            "identifier" => {
+                // The `as alias` identifier — appears as a direct child
+                // after the `as` keyword.
+                alias_node = Some(child);
+            }
+            _ => {}
+        }
+    }
+
+    if has_show {
+        for (name, id_node) in &show_names {
+            push_import_ref(out, name, id_node, file, module_id, &from_path);
+        }
+    } else if let Some(alias) = alias_node {
+        let name = node_text(&alias, bytes);
+        push_import_ref(out, name, &alias, file, module_id, &from_path);
+    }
+    // Bare import with no alias/show → nothing specific to reference.
+}
+
+/// Extract the URI string content (quotes stripped) from an `import_specification`.
+fn extract_uri_text(node: &Node, bytes: &[u8]) -> Option<String> {
+    // Walk: import_specification → uri field → configurable_uri → uri → string_literal
+    let uri_field = node.child_by_field_name("uri")?;
+    // uri_field might be configurable_uri or uri directly — walk down to string_literal.
+    let raw = find_string_literal(&uri_field, bytes)?;
+    // Strip surrounding quotes (single or double).
+    let stripped = raw
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(raw);
+    Some(stripped.to_owned())
+}
+
+fn find_string_literal<'a>(node: &Node, bytes: &'a [u8]) -> Option<&'a str> {
+    if node.kind() == "string_literal" {
+        return Some(node_text(node, bytes));
+    }
+    for child in node.children(&mut node.walk()) {
+        if let Some(s) = find_string_literal(&child, bytes) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+// ── TypeRef edges ────────────────────────────────────────────────────────────
+
+/// Recursively walk `node` emitting [`RefRole::TypeRef`] references for
+/// user-defined type names in typed positions.
+fn collect_type_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    match node.kind() {
+        "function_declaration" => {
+            // return type lives on the function_signature under `signature`
+            if let Some(sig) = node.child_by_field_name("signature") {
+                if let Some(ret) = sig.child_by_field_name("return_type") {
+                    type_leaf(&ret, bytes, file, TypeRefContext::ReturnType, out);
+                }
+            }
+        }
+        "method_declaration" => {
+            if let Some(sig) = node.child_by_field_name("signature") {
+                // method_signature wraps function_signature
+                let fs = sig
+                    .children(&mut sig.walk())
+                    .find(|c| c.kind() == "function_signature");
+                if let Some(fs) = fs {
+                    if let Some(ret) = fs.child_by_field_name("return_type") {
+                        type_leaf(&ret, bytes, file, TypeRefContext::ReturnType, out);
+                    }
+                }
+            }
+        }
+        "formal_parameter" => {
+            // type child (not a named field — walk children for `type` node).
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "type" {
+                    type_leaf(&child, bytes, file, TypeRefContext::ParameterType, out);
+                    break;
+                }
+            }
+        }
+        "top_level_variable_declaration" | "declaration" => {
+            // type child for field/variable declarations
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "type" {
+                    type_leaf(&child, bytes, file, TypeRefContext::Field, out);
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_type_references(&child, bytes, file, out);
+    }
+}
+
+fn type_leaf(node: &Node, bytes: &[u8], file: &str, ctx: TypeRefContext, out: &mut Vec<Reference>) {
+    match node.kind() {
+        // Built-in/void types — skip.
+        "void_type" => {}
+        "type_identifier" => {
+            let name = node_text(node, bytes);
+            // Skip common primitives.
+            if !matches!(
+                name,
+                "int" | "double" | "num" | "bool" | "String" | "Object" | "dynamic" | "Never"
+            ) {
+                push_type_ref(out, name, node, file, ctx);
+            }
+        }
+        "type" => {
+            // Recurse into the inner type.
+            for child in node.named_children(&mut node.walk()) {
+                type_leaf(&child, bytes, file, ctx, out);
+            }
+        }
+        _ => {
+            // Qualified or generic types — take the simple leaf name.
+            let name = simple_type_name(node_text(node, bytes), ".");
+            if !name.is_empty() {
+                push_type_ref(out, name, node, file, ctx);
+            }
+        }
+    }
+}
+
+// ── Scope tree ───────────────────────────────────────────────────────────────
+
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    match node.kind() {
+        "class_declaration"
+        | "mixin_declaration"
+        | "enum_declaration"
+        | "extension_declaration" => {
+            let type_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Type);
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, type_id, scopes);
+                }
+            }
+        }
+        "function_declaration" | "method_declaration" => {
+            let fn_id = push_scope(
+                scopes,
+                Some(parent_id),
+                node_span(node),
+                ScopeKind::Function,
+            );
+            if let Some(body) = node.child_by_field_name("body") {
+                for child in body.children(&mut body.walk()) {
+                    scope_dfs(&child, fn_id, scopes);
+                }
+            }
+        }
+        "block" => {
+            let block_id = push_scope(scopes, Some(parent_id), node_span(node), ScopeKind::Block);
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, block_id, scopes);
+            }
+        }
+        _ => {
+            for child in node.children(&mut node.walk()) {
+                scope_dfs(&child, parent_id, scopes);
+            }
+        }
+    }
+}
+
+// ── Bindings ─────────────────────────────────────────────────────────────────
+
+fn collect_bindings(root: &Node, bytes: &[u8], scopes: &[Scope]) -> Vec<Binding> {
+    let mut out = Vec::new();
+    collect_bindings_dfs(root, bytes, scopes, &mut out);
+    out
+}
+
+fn collect_bindings_dfs(node: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    match node.kind() {
+        "function_declaration" | "method_declaration" => {
+            // Collect formal parameters.
+            // The parameters live on the function_signature child under `parameters` field.
+            let sig = node.child_by_field_name("signature");
+            let fs = sig.as_ref().and_then(|s| {
+                s.children(&mut s.walk())
+                    .find(|c| c.kind() == "function_signature")
+            });
+            let params_node = fs
+                .as_ref()
+                .and_then(|f| f.child_by_field_name("parameters"))
+                .or_else(|| {
+                    sig.as_ref()
+                        .and_then(|s| s.child_by_field_name("parameters"))
+                });
+            if let Some(params) = params_node {
+                collect_params(&params, bytes, scopes, out);
+            }
+        }
+        "local_variable_declaration" => {
+            // local_variable_declaration → initialized_identifier_list → initialized_identifier
+            for child in node.children(&mut node.walk()) {
+                if child.kind() == "initialized_identifier_list" {
+                    for item in child.children(&mut child.walk()) {
+                        if item.kind() == "initialized_identifier" {
+                            if let Some(name) = field_text(&item, "name", bytes) {
+                                let intro = item.start_byte();
+                                if name.len() >= MIN_REF_LEN
+                                    && innermost_scope(intro, scopes) != Some(0)
+                                {
+                                    push_binding(out, name, intro, BindingKind::Local, scopes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_bindings_dfs(&child, bytes, scopes, out);
+    }
+}
+
+fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<Binding>) {
+    for child in params.named_children(&mut params.walk()) {
+        // formal_parameter has a `name` field (identifier).
+        if child.kind() == "formal_parameter" {
+            if let Some(name) = field_text(&child, "name", bytes) {
+                let intro = child.start_byte();
+                push_binding(out, name, intro, BindingKind::Param, scopes);
+            }
+        }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract(src: &str, file: &str) -> FileFacts {
+        DartExtractor.extract(src, file).unwrap()
+    }
+
+    fn by_name(facts: &FileFacts, name: &str) -> Option<Symbol> {
+        facts.symbols.iter().find(|s| s.name == name).cloned()
+    }
+
+    // ── Definitions ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn class_and_method_get_correct_scip_strings() {
+        // File `lib/models/user.dart` → namespace = ["models", "user"]
+        let src = r#"
+class User {
+  String getName() { return ''; }
+}
+"#;
+        let facts = extract(src, "lib/models/user.dart");
+
+        let user = by_name(&facts, "User").unwrap();
+        assert_eq!(user.kind, SymbolKind::Class);
+        assert_eq!(
+            user.id.to_scip_string(),
+            "codegraph . . . models/user/User#"
+        );
+
+        let get_name = by_name(&facts, "getName").unwrap();
+        assert_eq!(get_name.kind, SymbolKind::Method);
+        assert_eq!(
+            get_name.id.to_scip_string(),
+            "codegraph . . . models/user/User#getName()."
+        );
+
+        assert_eq!(facts.lang, "dart");
+    }
+
+    #[test]
+    fn top_level_function_is_extracted() {
+        let src = r#"
+void greet(String name) {
+  print(name);
+}
+"#;
+        let facts = extract(src, "lib/utils/greeter.dart");
+        let greet = by_name(&facts, "greet").unwrap();
+        assert_eq!(greet.kind, SymbolKind::Function);
+        assert_eq!(
+            greet.id.to_scip_string(),
+            "codegraph . . . utils/greeter/greet()."
+        );
+    }
+
+    #[test]
+    fn mixin_is_extracted_as_trait() {
+        let src = r#"
+mixin Flyable on Animal {
+  void fly() {}
+}
+"#;
+        let facts = extract(src, "lib/mixins/flyable.dart");
+        let mixin = by_name(&facts, "Flyable").unwrap();
+        assert_eq!(mixin.kind, SymbolKind::Trait);
+        assert_eq!(
+            mixin.id.to_scip_string(),
+            "codegraph . . . mixins/flyable/Flyable#"
+        );
+    }
+
+    #[test]
+    fn enum_and_constants_are_extracted() {
+        let src = r#"
+enum Color { red, green, blue }
+"#;
+        let facts = extract(src, "lib/models/color.dart");
+
+        let color = by_name(&facts, "Color").unwrap();
+        assert_eq!(color.kind, SymbolKind::Enum);
+        assert_eq!(
+            color.id.to_scip_string(),
+            "codegraph . . . models/color/Color#"
+        );
+
+        let red = by_name(&facts, "red").unwrap();
+        assert_eq!(red.kind, SymbolKind::Const);
+        assert_eq!(
+            red.id.to_scip_string(),
+            "codegraph . . . models/color/Color#red."
+        );
+    }
+
+    #[test]
+    fn type_alias_is_extracted() {
+        let src = r#"
+typedef Callback = void Function(String);
+"#;
+        let facts = extract(src, "lib/types/aliases.dart");
+        let alias = by_name(&facts, "Callback").unwrap();
+        assert_eq!(alias.kind, SymbolKind::TypeAlias);
+    }
+
+    #[test]
+    fn top_level_variable_is_extracted_as_static() {
+        let src = r#"
+String appName = 'MyApp';
+"#;
+        let facts = extract(src, "lib/config/constants.dart");
+        let var_sym = by_name(&facts, "appName").unwrap();
+        assert_eq!(var_sym.kind, SymbolKind::Static);
+    }
+
+    // ── References ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn qualified_call_captures_qualifier() {
+        let src = r#"
+class Client {
+  void run() {
+    var svc = Service();
+    svc.process();
+  }
+}
+"#;
+        let facts = extract(src, "lib/client.dart");
+
+        let process = facts
+            .references
+            .iter()
+            .find(|r| r.name == "process")
+            .expect("expected Call ref for 'process'");
+        assert_eq!(process.role, RefRole::Call);
+        assert_eq!(
+            process.qualifier.as_deref(),
+            Some("svc"),
+            "expected qualifier 'svc' on the process call ref",
+        );
+    }
+
+    #[test]
+    fn import_show_produces_import_references() {
+        let src = r#"
+import 'package:a/b.dart' show Foo, Bar;
+class C {}
+"#;
+        let facts = extract(src, "lib/c.dart");
+
+        let import_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Import)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        assert!(
+            import_names.contains(&"Foo"),
+            "expected 'Foo' in import refs: {import_names:?}"
+        );
+        assert!(
+            import_names.contains(&"Bar"),
+            "expected 'Bar' in import refs: {import_names:?}"
+        );
+
+        let foo_ref = facts
+            .references
+            .iter()
+            .find(|r| r.role == RefRole::Import && r.name == "Foo")
+            .unwrap();
+        assert!(
+            foo_ref
+                .from_path
+                .as_deref()
+                .is_some_and(|p| p.contains("package:a/b.dart")),
+            "from_path should contain the URI, got {:?}",
+            foo_ref.from_path
+        );
+    }
+
+    #[test]
+    fn superclass_and_interface_produce_is_implementation_refs() {
+        let src = r#"
+class Dog extends Animal implements Pet {
+  void bark() {}
+}
+"#;
+        let facts = extract(src, "lib/dog.dart");
+
+        let inherit_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::IsImplementation)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        assert!(
+            inherit_names.contains(&"Animal"),
+            "expected 'Animal' in IsImplementation refs: {inherit_names:?}"
+        );
+        assert!(
+            inherit_names.contains(&"Pet"),
+            "expected 'Pet' in IsImplementation refs: {inherit_names:?}"
+        );
+    }
+}

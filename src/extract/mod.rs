@@ -18,6 +18,8 @@ pub mod c;
 pub mod cpp;
 #[cfg(feature = "csharp")]
 pub mod csharp;
+#[cfg(feature = "dart")]
+pub mod dart;
 #[cfg(feature = "go")]
 pub mod go;
 #[cfg(feature = "hcl")]
@@ -57,6 +59,8 @@ pub use c::CExtractor;
 pub use cpp::CppExtractor;
 #[cfg(feature = "csharp")]
 pub use csharp::CSharpExtractor;
+#[cfg(feature = "dart")]
+pub use dart::DartExtractor;
 #[cfg(feature = "go")]
 pub use go::GoExtractor;
 #[cfg(feature = "hcl")]

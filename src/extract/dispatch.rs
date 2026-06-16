@@ -13,6 +13,8 @@ use super::CExtractor;
 use super::CSharpExtractor;
 #[cfg(feature = "cpp")]
 use super::CppExtractor;
+#[cfg(feature = "dart")]
+use super::DartExtractor;
 #[cfg(feature = "go")]
 use super::GoExtractor;
 #[cfg(feature = "hcl")]
@@ -98,6 +100,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::TypeScript => TypeScriptExtractor.extract(source, file),
         #[cfg(feature = "scala")]
         Language::Scala => ScalaExtractor.extract(source, file),
+        #[cfg(feature = "dart")]
+        Language::Dart => DartExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

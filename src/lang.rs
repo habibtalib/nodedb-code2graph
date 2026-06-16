@@ -26,6 +26,7 @@ pub enum Language {
     Hcl,        // .tf, .hcl, .tfvars
     CSharp,     // .cs
     Scala,      // .scala, .sc
+    Dart,       // .dart
 }
 
 impl Language {
@@ -50,6 +51,7 @@ impl Language {
             Language::Hcl => "hcl",
             Language::CSharp => "csharp",
             Language::Scala => "scala",
+            Language::Dart => "dart",
         }
     }
 
@@ -74,6 +76,7 @@ impl Language {
             "tf" | "hcl" | "tfvars" => Some(Self::Hcl),
             "cs" => Some(Self::CSharp),
             "scala" | "sc" => Some(Self::Scala),
+            "dart" => Some(Self::Dart),
             _ => None,
         }
     }

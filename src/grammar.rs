@@ -117,6 +117,12 @@ pub fn scala() -> Language {
     tree_sitter_scala::LANGUAGE.into()
 }
 
+#[cfg(feature = "dart")]
+/// Returns the tree-sitter grammar for Dart.
+pub fn dart() -> Language {
+    tree_sitter_dart::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -167,5 +173,7 @@ mod tests {
         check("csharp", super::csharp());
         #[cfg(feature = "scala")]
         check("scala", super::scala());
+        #[cfg(feature = "dart")]
+        check("dart", super::dart());
     }
 }

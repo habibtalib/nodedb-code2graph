@@ -5,8 +5,40 @@
 //! Resolver-internal utilities that don't belong to any single tier. Kept here
 //! so Tier-A and Tier-B share one definition of caller attribution.
 
-use crate::graph::types::Symbol;
+use std::collections::HashMap;
+
+use crate::graph::types::{FileFacts, Symbol};
 use crate::symbol::SymbolId;
+
+/// Deduplicate `files` by their `file` key, keeping the **last** occurrence of
+/// each key and preserving the original slice order otherwise.
+///
+/// A file path identifies a unique source, so two [`FileFacts`] with the same
+/// `file` are competing versions of one file — last-wins matches the
+/// [`IncrementalGraph`] store's upsert semantics (re-upserting a key replaces
+/// it). Applying this at the batch resolver entry points keeps batch output
+/// identical to the incremental store on duplicate keys and stops the resolver
+/// from emitting two [`Symbol`]s with the SAME [`SymbolId`] (a duplicate
+/// identity, since the id derives from the file path plus descriptors).
+///
+/// Deterministic and independent of `HashMap` iteration order: the map only
+/// records the last index per key; the kept set and its order come from the
+/// in-order slice walk.
+///
+/// [`IncrementalGraph`]: crate::resolve::IncrementalGraph
+/// [`SymbolId`]: crate::symbol::SymbolId
+pub(crate) fn dedup_files_last_wins(files: &[FileFacts]) -> Vec<&FileFacts> {
+    let mut last: HashMap<&str, usize> = HashMap::new();
+    for (i, f) in files.iter().enumerate() {
+        last.insert(f.file.as_str(), i);
+    }
+    files
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| last[f.file.as_str()] == *i)
+        .map(|(_, f)| f)
+        .collect()
+}
 
 /// Index (into `symbols`) of the innermost symbol whose span contains `byte`,
 /// considering only the symbols listed in `file_indices`. `None` if no symbol
@@ -86,4 +118,50 @@ pub(crate) fn enclosing_path_ends_with<S: AsRef<str>>(candidate: &SymbolId, segs
         .iter()
         .zip(segs.iter())
         .all(|(a, b)| *a == b.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extract::{Extractor, RustExtractor};
+
+    #[test]
+    fn dedup_keeps_last_occurrence_in_slice_order() {
+        // Same path `a` appears twice (v1, v2) with `b` between; the kept set must
+        // be `[b, a(v2)]` — `b` in place, the LAST `a` standing in for the first.
+        let a_v1 = RustExtractor
+            .extract("pub fn one() {}", "src/a.rs")
+            .unwrap();
+        let b = RustExtractor
+            .extract("pub fn two() {}", "src/b.rs")
+            .unwrap();
+        let a_v2 = RustExtractor
+            .extract("pub fn three() {}", "src/a.rs")
+            .unwrap();
+
+        let files = vec![a_v1, b, a_v2];
+        let kept = dedup_files_last_wins(&files);
+
+        // Two distinct keys survive, order-stable: `src/b.rs` then `src/a.rs`.
+        let kept_keys: Vec<&str> = kept.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(kept_keys, vec!["src/b.rs", "src/a.rs"]);
+
+        // The surviving `src/a.rs` is the LAST version (v2 → defines `three`).
+        let a_kept = kept
+            .iter()
+            .find(|f| f.file == "src/a.rs")
+            .expect("src/a.rs must survive");
+        assert!(
+            a_kept
+                .symbols
+                .iter()
+                .any(|s| s.id.to_scip_string().ends_with("three().")),
+            "last-wins must keep v2 (defines `three`), got: {:?}",
+            a_kept
+                .symbols
+                .iter()
+                .map(|s| s.id.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+    }
 }

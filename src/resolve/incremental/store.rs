@@ -184,7 +184,7 @@ mod tests {
     use super::*;
     use crate::extract::{Extractor, PythonExtractor, RustExtractor};
     use crate::graph::types::{CodeGraph, Edge};
-    use crate::resolve::{Resolver, ScopeGraphResolver};
+    use crate::resolve::{Resolver, ScopeGraphResolver, SymbolTableResolver};
 
     /// Stable per-edge key: source/target SCIP ids, role, confidence, and the
     /// occurrence byte. Captures everything that distinguishes one edge fact.
@@ -239,6 +239,62 @@ mod tests {
         let store = IncrementalGraph::from_files(&files);
         let batch = ScopeGraphResolver.resolve(&files);
         assert_multiset_eq(&store.graph(), &batch);
+    }
+
+    /// Duplicate `file` keys are a single source with competing versions. The
+    /// store keys by path (last upsert wins); the batch resolvers must agree —
+    /// deduping to the LAST version — so the two paths never diverge, and no two
+    /// symbols ever share a SymbolId.
+    #[test]
+    fn duplicate_file_key_last_wins_matches_batch() {
+        // v1 and v2 share the path `src/app.rs` but define different functions.
+        let v1 = RustExtractor
+            .extract("pub fn first() {}", "src/app.rs")
+            .unwrap();
+        let v2 = RustExtractor
+            .extract("pub fn second() {}", "src/app.rs")
+            .unwrap();
+
+        // The store keys by path, so upserting v1 then v2 keeps only v2.
+        let store = IncrementalGraph::from_files(&[v1.clone(), v2.clone()]);
+        let batch = ScopeGraphResolver.resolve(&[v1.clone(), v2.clone()]);
+        assert_multiset_eq(&store.graph(), &batch);
+
+        // The surviving graph reflects v2 (`second`), not v1 (`first`).
+        let g = store.graph();
+        assert!(
+            g.symbols
+                .iter()
+                .any(|s| s.id.to_scip_string().ends_with("second().")),
+            "last-wins must keep v2 (`second`), got: {:?}",
+            g.symbols
+                .iter()
+                .map(|s| s.id.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !g.symbols
+                .iter()
+                .any(|s| s.id.to_scip_string().ends_with("first().")),
+            "v1 (`first`) must not survive last-wins dedup"
+        );
+
+        // Tier-A over the duplicate set must not emit two symbols with the SAME
+        // SymbolId (a duplicate identity, since the id derives from file + descriptors).
+        let tier_a = SymbolTableResolver.resolve(&[v1, v2]);
+        let mut ids: Vec<String> = tier_a
+            .symbols
+            .iter()
+            .map(|s| s.id.to_scip_string())
+            .collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "duplicate file keys must not yield duplicate SymbolIds"
+        );
     }
 
     #[test]

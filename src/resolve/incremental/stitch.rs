@@ -188,6 +188,13 @@ pub(crate) fn stitch(pending: &[PendingRef], index: &GlobalIndex) -> Vec<Edge> {
             _ => index.unique_match(&p.name, &p.segs),
         };
         if let Some(matched_id) = matched {
+            // A definition never links to itself (parity with Tier-A, which skips
+            // `i == from_idx`). An unqualified same-namespace ref whose unique
+            // match is the caller's own id (e.g. a recursive free function)
+            // would otherwise produce a `from == to` self-edge.
+            if *matched_id == p.from {
+                continue;
+            }
             edges.push(Edge {
                 from: p.from.clone(),
                 to: matched_id.clone(),
@@ -311,6 +318,57 @@ mod tests {
                 "ModuleRef(config) must not resolve to the `config` function"
             );
         }
+    }
+
+    /// A pending ref whose unique match is the caller's OWN id must NOT produce a
+    /// `from == to` self-edge — parity with Tier-A, which skips `i == from_idx`.
+    /// This is reachable for unqualified same-namespace recursion: a definition
+    /// deferred to stitch whose only same-name candidate in its namespace is
+    /// itself.
+    #[test]
+    fn pending_ref_to_own_id_yields_no_self_edge() {
+        use crate::graph::types::{Confidence, Occurrence};
+
+        // A single-file recursive free function: `Run` in `package main` calls
+        // `Run`. Its own definition is the sole same-name target in the namespace.
+        let recurse = RustExtractor
+            .extract("pub fn recurse() { recurse() }", "src/main.rs")
+            .unwrap();
+        let sub = build_subgraph(&recurse);
+
+        // The caller's own SymbolId (the `recurse` definition).
+        let own_id = sub
+            .symbols
+            .iter()
+            .find(|s| s.id.leaf_name() == Some("recurse"))
+            .map(|s| s.id.clone())
+            .expect("recurse must be defined");
+
+        // Index only this file's symbols, then hand stitch a pending ref whose
+        // unique match IS the caller — exactly what an unqualified same-namespace
+        // self-recursive deferral produces.
+        let mut index = GlobalIndex::new();
+        index.insert_symbols(&sub.symbols);
+        let pending = vec![PendingRef {
+            from: own_id.clone(),
+            name: "recurse".to_string(),
+            segs: Vec::new(),
+            role: RefRole::Call,
+            occ: Occurrence {
+                file: "src/main.rs".to_string(),
+                line: 1,
+                col: 0,
+                byte: 20,
+            },
+            confidence: Confidence::Scoped,
+            qualified: false,
+        }];
+
+        let edges = stitch(&pending, &index);
+        assert!(
+            edges.iter().all(|e| e.from != e.to),
+            "stitch must not emit a from == to self-edge"
+        );
     }
 
     /// Ambiguity: two distinct modules both named `util` → a ModuleRef to `util`

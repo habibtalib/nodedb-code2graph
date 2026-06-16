@@ -165,7 +165,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 pending.push(PendingRef {
                     from,
                     name: r.name.clone(),
-                    segs: segs.iter().map(|s| s.to_string()).collect(),
+                    segs: segs.into_iter().map(str::to_string).collect(),
                     role: r.role,
                     occ: r.occ.clone(),
                     confidence: Confidence::Exact,
@@ -254,14 +254,18 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                 // Same-file definition: resolve to the bound symbol's identity,
                 // precisely.
                 if let BindingTarget::Def(target_id) = &binding.target {
-                    intra_edges.push(Edge {
-                        from,
-                        to: target_id.clone(),
-                        role: r.role,
-                        confidence: Confidence::Scoped,
-                        provenance: Provenance::ScopeGraph,
-                        occ: r.occ.clone(),
-                    });
+                    // A definition never links to itself (same-file recursion) —
+                    // parity with Tier-A, which skips `i == from_idx`.
+                    if &from != target_id {
+                        intra_edges.push(Edge {
+                            from,
+                            to: target_id.clone(),
+                            role: r.role,
+                            confidence: Confidence::Scoped,
+                            provenance: Provenance::ScopeGraph,
+                            occ: r.occ.clone(),
+                        });
+                    }
                 }
                 // (A Definition binding always carries Def(_); the `if let` is
                 // defensive.)
@@ -279,7 +283,7 @@ pub(crate) fn build_subgraph(f: &FileFacts) -> FileSubgraph {
                         pending.push(PendingRef {
                             from,
                             name: binding.name.clone(),
-                            segs: segs.iter().map(|s| s.to_string()).collect(),
+                            segs: segs.iter().copied().map(str::to_string).collect(),
                             role: r.role,
                             occ: r.occ.clone(),
                             confidence: Confidence::Exact,

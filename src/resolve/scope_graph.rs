@@ -68,8 +68,8 @@
 
 use crate::graph::types::{CodeGraph, Edge, FileFacts, Symbol};
 
-use super::Resolver;
 use super::incremental::{FileSubgraph, GlobalIndex, build_subgraph, stitch};
+use super::{Resolver, dedup_files_last_wins};
 
 /// Scope-aware resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -77,11 +77,17 @@ pub struct ScopeGraphResolver;
 
 impl Resolver for ScopeGraphResolver {
     fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+        // A file path identifies a unique source: on duplicate `file` keys, keep
+        // the LAST version (matching the IncrementalGraph store's upsert), so
+        // batch output never diverges from the store and never emits duplicate
+        // symbol identities.
+        let files = dedup_files_last_wins(files);
+
         // Build one isolated subgraph per file. This is the SAME resolution code
         // path the future incremental store wraps — both derive everything
         // (symbols, intra-file edges, cross-file pending refs) from
         // `build_subgraph`, so the two paths never drift.
-        let subs: Vec<FileSubgraph> = files.iter().map(build_subgraph).collect();
+        let subs: Vec<FileSubgraph> = files.iter().copied().map(build_subgraph).collect();
 
         // The returned graph's symbols are the per-file symbols, concatenated in
         // file order (synthesized Local edge targets are never added here).
@@ -624,6 +630,33 @@ mod tests {
         assert!(
             import_edges(&graph).is_empty(),
             "import whose path matches no definition must yield no Tier-B edge"
+        );
+    }
+
+    #[test]
+    fn same_file_recursion_emits_no_self_edge() {
+        // A recursive free function calls itself unqualified. The call binds to
+        // the function's own same-file Definition; Tier-B's intra-file Definition
+        // arm must NOT link the definition to itself — parity with Tier-A, which
+        // skips the caller's own definition (`i == from_idx`).
+        let facts = RustExtractor
+            .extract(
+                "pub fn countdown(n: u32) { countdown(n - 1) }",
+                "src/rec.rs",
+            )
+            .unwrap();
+
+        let graph = ScopeGraphResolver.resolve(&[facts]);
+
+        let self_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from == e.to)
+            .map(|e| e.from.to_scip_string())
+            .collect();
+        assert!(
+            self_edges.is_empty(),
+            "recursion must not produce a from==to self-edge, got: {self_edges:?}"
         );
     }
 

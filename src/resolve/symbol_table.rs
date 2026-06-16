@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
 
 use super::Resolver;
-use super::{enclosing_symbol_index, namespaces_end_with, normalize_from_path};
+use super::{
+    dedup_files_last_wins, enclosing_symbol_index, namespaces_end_with, normalize_from_path,
+};
 
 /// Name-table resolver. See module docs.
 #[derive(Debug, Default, Clone, Copy)]
@@ -30,6 +32,13 @@ pub struct SymbolTableResolver;
 
 impl Resolver for SymbolTableResolver {
     fn resolve(&self, files: &[FileFacts]) -> CodeGraph {
+        // A file path identifies a unique source: on duplicate `file` keys, keep
+        // the LAST version (matching the IncrementalGraph store's upsert). Bind
+        // once so symbol collection and the reference loop below iterate the same
+        // deduped set — otherwise duplicate keys would emit duplicate symbol
+        // identities and diverge from the incremental store.
+        let files = dedup_files_last_wins(files);
+
         // leaf name → indices into the flattened symbol list
         let symbols: Vec<Symbol> = files
             .iter()
@@ -47,7 +56,7 @@ impl Resolver for SymbolTableResolver {
         }
 
         let mut edges: Vec<Edge> = Vec::new();
-        for f in files {
+        for f in files.iter().copied() {
             let file_syms = by_file.get(f.file.as_str());
             for r in &f.references {
                 // The caller: innermost symbol in this file whose span holds the ref.

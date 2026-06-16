@@ -2,9 +2,12 @@
 
 //! C extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: top-level **non-static** declarations. Covers functions,
-//! variables, struct/union/enum type definitions, typedefs, and preprocessor
-//! macros (`#define`). Qualified identity is derived from the file path
+//! Definitions: all top-level declarations, each tagged with their linkage
+//! visibility. Covers functions, variables, struct/union/enum type definitions,
+//! typedefs, and preprocessor macros (`#define`). A `static` storage-class
+//! specifier means internal linkage → [`Visibility::Private`]; all other
+//! top-level definitions have external linkage → [`Visibility::Public`].
+//! Qualified identity is derived from the file path
 //! (`src/auth/token.c` → namespaces `auth`, `token`). The same
 //! stem is shared by `.c` and `.h` files so paired translation units share a
 //! namespace.
@@ -191,35 +194,42 @@ fn find_function_declarator<'tree>(node: &Node<'tree>) -> Option<Node<'tree>> {
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
 
-    let push =
-        |out: &mut Vec<Symbol>, node: &Node, name: String, kind: SymbolKind, leaf: Descriptor| {
-            let mut descriptors: Vec<Descriptor> = namespaces
-                .iter()
-                .cloned()
-                .map(Descriptor::Namespace)
-                .collect();
-            descriptors.push(leaf);
-            out.push(Symbol {
-                id: SymbolId::global(Language::C.as_str(), descriptors),
-                name,
-                kind,
-                visibility: Visibility::Public,
-                file: file.to_owned(),
-                line: (node.start_position().row + 1) as u32,
-                span: ByteSpan {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                },
-                signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-            });
-        };
+    // `kv` = (kind, visibility) tuple — keeps arg count below the clippy
+    // `too_many_arguments` threshold while grouping the two tightly-coupled fields.
+    let push = |out: &mut Vec<Symbol>,
+                node: &Node,
+                name: String,
+                kv: (SymbolKind, Visibility),
+                leaf: Descriptor| {
+        let mut descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
+        descriptors.push(leaf);
+        out.push(Symbol {
+            id: SymbolId::global(Language::C.as_str(), descriptors),
+            name,
+            kind: kv.0,
+            visibility: kv.1,
+            file: file.to_owned(),
+            line: (node.start_position().row + 1) as u32,
+            span: ByteSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+            },
+            signature: one_line_signature(node_text(node, bytes), &['{', ';']),
+        });
+    };
 
     for child in root.children(&mut root.walk()) {
         match child.kind() {
             "function_definition" => {
-                if is_static(&child, bytes) {
-                    continue;
-                }
+                let vis = if is_static(&child, bytes) {
+                    Visibility::Private
+                } else {
+                    Visibility::Public
+                };
                 let Some(decl) = child.child_by_field_name("declarator") else {
                     continue;
                 };
@@ -230,7 +240,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    SymbolKind::Function,
+                    (SymbolKind::Function, vis),
                     Descriptor::Method {
                         name,
                         disambiguator: String::new(),
@@ -239,9 +249,11 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             }
 
             "declaration" => {
-                if is_static(&child, bytes) {
-                    continue;
-                }
+                let vis = if is_static(&child, bytes) {
+                    Visibility::Private
+                } else {
+                    Visibility::Public
+                };
 
                 // Step 1: if the `type` field is a struct/union/enum WITH a body,
                 // emit a type symbol for the aggregate definition itself.
@@ -251,7 +263,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &spec,
                             agg_name.clone(),
-                            agg_kind,
+                            (agg_kind, vis),
                             Descriptor::Type(agg_name),
                         );
                     }
@@ -268,7 +280,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &child,
                             name.clone(),
-                            SymbolKind::Function,
+                            (SymbolKind::Function, vis),
                             Descriptor::Method {
                                 name,
                                 disambiguator: String::new(),
@@ -279,7 +291,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &child,
                             name.clone(),
-                            SymbolKind::Static,
+                            (SymbolKind::Static, vis),
                             Descriptor::Term(name),
                         );
                     }
@@ -295,7 +307,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &spec,
                             agg_name.clone(),
-                            agg_kind,
+                            (agg_kind, Visibility::Public),
                             Descriptor::Type(agg_name),
                         );
                     }
@@ -312,7 +324,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    SymbolKind::TypeAlias,
+                    (SymbolKind::TypeAlias, Visibility::Public),
                     Descriptor::Type(name),
                 );
             }
@@ -326,7 +338,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    SymbolKind::Const,
+                    (SymbolKind::Const, Visibility::Public),
                     Descriptor::Macro(name),
                 );
             }
@@ -340,7 +352,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    SymbolKind::Function,
+                    (SymbolKind::Function, Visibility::Public),
                     Descriptor::Macro(name),
                 );
             }
@@ -354,7 +366,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                         &mut out,
                         &child,
                         agg_name.clone(),
-                        agg_kind,
+                        (agg_kind, Visibility::Public),
                         Descriptor::Type(agg_name),
                     );
                 }
@@ -737,7 +749,7 @@ mod tests {
     use crate::graph::types::{RefRole, TypeRefContext};
 
     #[test]
-    fn extracts_defs_and_skips_static() {
+    fn extracts_defs_with_visibility() {
         let src = r#"
 #define MAX_LEN 256
 int authenticate(const char *tok) { return validate(tok); }
@@ -751,16 +763,23 @@ static int private_count;
         let facts = CExtractor.extract(src, "src/auth/token.c").unwrap();
         let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
 
-        // authenticate: exported function
+        // authenticate: exported function → Public
         let auth = by_name("authenticate").unwrap();
         assert_eq!(auth.kind, SymbolKind::Function);
+        assert_eq!(auth.visibility, Visibility::Public);
         assert_eq!(
             auth.id.to_scip_string(),
             "codegraph . . . auth/token/authenticate()."
         );
 
-        // helper: static — must be absent
-        assert!(by_name("helper").is_none());
+        // helper: static function → emitted with Private visibility
+        let helper = by_name("helper").unwrap();
+        assert_eq!(helper.kind, SymbolKind::Function);
+        assert_eq!(helper.visibility, Visibility::Private);
+        assert_eq!(
+            helper.id.to_scip_string(),
+            "codegraph . . . auth/token/helper()."
+        );
 
         // Session: struct definition inside a declaration
         let session = by_name("Session").unwrap();
@@ -786,20 +805,28 @@ static int private_count;
             "codegraph . . . auth/token/SessionRef#"
         );
 
-        // global_count: non-static variable
+        // global_count: non-static variable → Public
         let gc = by_name("global_count").unwrap();
         assert_eq!(gc.kind, SymbolKind::Static);
+        assert_eq!(gc.visibility, Visibility::Public);
         assert_eq!(
             gc.id.to_scip_string(),
             "codegraph . . . auth/token/global_count."
         );
 
-        // private_count: static — must be absent
-        assert!(by_name("private_count").is_none());
+        // private_count: static variable → emitted with Private visibility
+        let pc = by_name("private_count").unwrap();
+        assert_eq!(pc.kind, SymbolKind::Static);
+        assert_eq!(pc.visibility, Visibility::Private);
+        assert_eq!(
+            pc.id.to_scip_string(),
+            "codegraph . . . auth/token/private_count."
+        );
 
-        // MAX_LEN: object-like macro → Const
+        // MAX_LEN: object-like macro → Const, Public
         let max = by_name("MAX_LEN").unwrap();
         assert_eq!(max.kind, SymbolKind::Const);
+        assert_eq!(max.visibility, Visibility::Public);
         assert_eq!(
             max.id.to_scip_string(),
             "codegraph . . . auth/token/MAX_LEN!"
@@ -1027,18 +1054,65 @@ int main(void) {
     }
 
     #[test]
-    fn static_func_excluded_from_definition_bindings() {
-        // `static int helper(void) { return 0; }` → NO Definition binding `helper`
-        // (static symbols are skipped by collect_symbols).
+    fn static_func_emits_definition_binding_with_private_visibility() {
+        // `static int helper(void) { return 0; }` → symbol emitted with Private
+        // visibility AND a Definition binding in scope 0 (internal linkage, still
+        // a real name in the file).
         let src = "static int helper(void) { return 0; }\n";
         let facts = CExtractor.extract(src, "src/h.c").unwrap();
 
-        assert!(
-            !facts
-                .bindings
-                .iter()
-                .any(|b| b.kind == BindingKind::Definition && b.name == "helper"),
-            "static 'helper' must NOT produce a Definition binding"
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("static 'helper' must be emitted as a symbol");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "static function must have Private visibility"
+        );
+
+        let b = facts
+            .bindings
+            .iter()
+            .find(|b| b.kind == BindingKind::Definition && b.name == "helper")
+            .expect("static 'helper' must produce a Definition binding");
+        assert_eq!(b.scope, 0, "Definition binding must be in scope 0");
+    }
+
+    #[test]
+    fn non_static_func_has_public_visibility() {
+        // `int greet(void) { return 0; }` — no static specifier → external linkage
+        // → Visibility::Public.
+        let src = "int greet(void) { return 0; }\n";
+        let facts = CExtractor.extract(src, "src/vis.c").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("'greet' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "non-static function must have Public visibility"
+        );
+    }
+
+    #[test]
+    fn static_func_has_private_visibility() {
+        // `static int internal_fn(void) { return 0; }` — static storage-class
+        // → internal linkage → Visibility::Private, but symbol IS emitted.
+        let src = "static int internal_fn(void) { return 0; }\n";
+        let facts = CExtractor.extract(src, "src/vis.c").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "internal_fn")
+            .expect("static 'internal_fn' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "static function must have Private visibility"
         );
     }
 

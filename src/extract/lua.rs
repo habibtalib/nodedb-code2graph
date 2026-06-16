@@ -24,12 +24,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_import_ref, push_ref, push_scope,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -86,8 +86,9 @@ pub(crate) fn extract_lua_family(
     let root = tree.root_node();
     let bytes = source.as_bytes();
     let namespaces = lua_namespaces(file);
+    let ctx = ExtractCtx { bytes, file, lang };
 
-    let defs = collect_symbols(&root, bytes, file, &namespaces, lang);
+    let defs = collect_symbols(&root, &ctx, &namespaces);
     let def_bindings = definition_bindings(&defs);
     let mut symbols = defs;
     let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
@@ -149,20 +150,14 @@ fn lua_namespaces(file: &str) -> Vec<String> {
 
 // ── Symbol collection ────────────────────────────────────────────────────────
 
-fn collect_symbols(
-    root: &Node,
-    bytes: &[u8],
-    file: &str,
-    namespaces: &[String],
-    lang: Language,
-) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let ns_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
         .map(Descriptor::Namespace)
         .collect();
     let mut out = Vec::new();
-    collect_chunk(root, bytes, file, &ns_descriptors, lang, &mut out);
+    collect_chunk(root, ctx, &ns_descriptors, &mut out);
     out
 }
 
@@ -177,14 +172,7 @@ fn collect_symbols(
 /// Luau additionally has `type_definition` nodes (`type X = …` / `export type
 /// X = …`). These never appear in plain Lua source, so the arm is a no-op for
 /// Lua and active for Luau.
-fn collect_chunk(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    lang: Language,
-    out: &mut Vec<Symbol>,
-) {
+fn collect_chunk(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     // Iterate ALL children (field-labeled `local_declaration` children are
     // returned here too, with their node kind — e.g. a local function still has
     // kind `function_declaration`).
@@ -192,18 +180,18 @@ fn collect_chunk(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "function_declaration" => {
-                collect_function_declaration(&child, bytes, file, prefix, lang, out);
+                collect_function_declaration(&child, ctx, prefix, out);
             }
             "variable_declaration" => {
-                collect_variable_declaration(&child, bytes, file, prefix, lang, out);
+                collect_variable_declaration(&child, ctx, prefix, out);
             }
             "assignment_statement" => {
-                collect_assignment(&child, bytes, file, prefix, lang, out);
+                collect_assignment(&child, ctx, prefix, out);
             }
             // Luau: `type Point = { x: number, y: number }` or `export type Point = …`
             // The `name` field is present regardless of the `export` prefix.
             "type_definition" => {
-                collect_type_definition(&child, bytes, file, prefix, lang, out);
+                collect_type_definition(&child, ctx, prefix, out);
             }
             _ => {}
         }
@@ -218,10 +206,8 @@ fn collect_chunk(
 /// - `function M:qux() end` → Method `qux` under Type `M`.
 fn collect_function_declaration(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
-    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     let name_node = match node.child_by_field_name("name") {
@@ -232,25 +218,22 @@ fn collect_function_declaration(
     match name_node.kind() {
         "identifier" => {
             // Global function: `function foo() end`
-            let name = node_text(&name_node, bytes).to_owned();
+            let name = node_text(&name_node, ctx.bytes).to_owned();
             let mut descriptors = prefix.to_vec();
             descriptors.push(Descriptor::Method {
                 name: name.clone(),
                 disambiguator: String::new(),
             });
-            out.push(Symbol {
-                id: SymbolId::global(lang.as_str(), descriptors),
+            let sig = one_line_signature(node_text(node, ctx.bytes), &['{', '(']);
+            out.push(make_symbol(
+                ctx,
+                node,
                 name,
-                kind: SymbolKind::Function,
-                visibility: Visibility::Unknown,
-                file: file.to_owned(),
-                line: (node.start_position().row + 1) as u32,
-                span: ByteSpan {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                },
-                signature: one_line_signature(node_text(node, bytes), &['{', '(']),
-            });
+                SymbolKind::Function,
+                Visibility::Unknown,
+                descriptors,
+                sig,
+            ));
         }
         "dot_index_expression" | "method_index_expression" => {
             // `function M.baz()` or `function M:qux()`
@@ -259,11 +242,11 @@ fn collect_function_declaration(
             } else {
                 ("table", "method")
             };
-            let table = match field_text(&name_node, table_field.0, bytes) {
+            let table = match field_text(&name_node, table_field.0, ctx.bytes) {
                 Some(t) => t,
                 None => return,
             };
-            let method = match field_text(&name_node, table_field.1, bytes) {
+            let method = match field_text(&name_node, table_field.1, ctx.bytes) {
                 Some(m) => m,
                 None => return,
             };
@@ -273,19 +256,16 @@ fn collect_function_declaration(
                 name: method.clone(),
                 disambiguator: String::new(),
             });
-            out.push(Symbol {
-                id: SymbolId::global(lang.as_str(), descriptors),
-                name: method,
-                kind: SymbolKind::Method,
-                visibility: Visibility::Unknown,
-                file: file.to_owned(),
-                line: (node.start_position().row + 1) as u32,
-                span: ByteSpan {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                },
-                signature: one_line_signature(node_text(node, bytes), &['{', '(']),
-            });
+            let sig = one_line_signature(node_text(node, ctx.bytes), &['{', '(']);
+            out.push(make_symbol(
+                ctx,
+                node,
+                method,
+                SymbolKind::Method,
+                Visibility::Unknown,
+                descriptors,
+                sig,
+            ));
         }
         _ => {}
     }
@@ -295,10 +275,8 @@ fn collect_function_declaration(
 /// `local M = {}`.
 fn collect_variable_declaration(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
-    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     // `variable_declaration` wraps an `assignment_statement` that carries the
@@ -306,20 +284,13 @@ fn collect_variable_declaration(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "assignment_statement" {
-            collect_assignment(&child, bytes, file, prefix, lang, out);
+            collect_assignment(&child, ctx, prefix, out);
         }
     }
 }
 
 /// Handle bare `assignment_statement` (e.g. `local M = {}`; or top-level `x = 1`).
-fn collect_assignment(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    lang: Language,
-    out: &mut Vec<Symbol>,
-) {
+fn collect_assignment(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     let names: Vec<Node> = node
         .children(&mut node.walk())
         .find(|c| c.kind() == "variable_list")
@@ -341,20 +312,10 @@ fn collect_assignment(
         .unwrap_or_default();
 
     for (i, name_node) in names.iter().enumerate() {
-        let name = node_text(name_node, bytes).to_owned();
+        let name = node_text(name_node, ctx.bytes).to_owned();
         let value_opt = values.get(i);
-        let ctx = LuaCtx { bytes, file, lang };
         emit_local_symbol(name, value_opt, node, ctx, prefix, out);
     }
-}
-
-/// Per-pass context shared by the deep symbol emitters: the source bytes, the
-/// file path, and the language tag. Bundled to keep walker signatures small.
-#[derive(Clone, Copy)]
-struct LuaCtx<'a> {
-    bytes: &'a [u8],
-    file: &'a str,
-    lang: Language,
 }
 
 /// Emit a symbol for a named local or assignment, choosing kind from the value.
@@ -362,11 +323,10 @@ fn emit_local_symbol(
     name: String,
     value_opt: Option<&Node>,
     decl_node: &Node,
-    ctx: LuaCtx,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
-    let (bytes, file, lang) = (ctx.bytes, ctx.file, ctx.lang);
     let (kind, descriptor) = match value_opt.map(|v| v.kind()) {
         Some("function_definition") => (
             SymbolKind::Function,
@@ -381,19 +341,16 @@ fn emit_local_symbol(
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(descriptor);
-    out.push(Symbol {
-        id: SymbolId::global(lang.as_str(), descriptors.clone()),
+    let sig = one_line_signature(node_text(decl_node, ctx.bytes), &['{', '=']);
+    out.push(make_symbol(
+        ctx,
+        decl_node,
         name,
         kind,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (decl_node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: decl_node.start_byte(),
-            end: decl_node.end_byte(),
-        },
-        signature: one_line_signature(node_text(decl_node, bytes), &['{', '=']),
-    });
+        Visibility::Unknown,
+        descriptors.clone(),
+        sig,
+    ));
 
     // If it's a table constructor, descend into its fields.
     if let Some(val) = value_opt {
@@ -407,16 +364,15 @@ fn emit_local_symbol(
 fn collect_table_fields(
     node: &Node,
     type_prefix: &[Descriptor],
-    ctx: LuaCtx,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let (bytes, file, lang) = (ctx.bytes, ctx.file, ctx.lang);
     for child in node.children(&mut node.walk()) {
         if child.kind() != "field" {
             continue;
         }
         // field: name: (identifier) value: <expr>
-        let Some(fname) = field_text(&child, "name", bytes) else {
+        let Some(fname) = field_text(&child, "name", ctx.bytes) else {
             continue;
         };
         let value_kind = child.child_by_field_name("value").map_or("", |v| v.kind());
@@ -435,19 +391,16 @@ fn collect_table_fields(
 
         let mut descriptors = type_prefix.to_vec();
         descriptors.push(descriptor);
-        out.push(Symbol {
-            id: SymbolId::global(lang.as_str(), descriptors),
-            name: fname,
+        let sig = one_line_signature(node_text(&child, ctx.bytes), &['{', '=']);
+        out.push(make_symbol(
+            ctx,
+            &child,
+            fname,
             kind,
-            visibility: Visibility::Unknown,
-            file: file.to_owned(),
-            line: (child.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: child.start_byte(),
-                end: child.end_byte(),
-            },
-            signature: one_line_signature(node_text(&child, bytes), &['{', '=']),
-        });
+            Visibility::Unknown,
+            descriptors,
+            sig,
+        ));
     }
 }
 
@@ -459,31 +412,26 @@ fn collect_table_fields(
 /// function for Lua is a no-op.
 fn collect_type_definition(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
-    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
-    let name = node_text(&name_node, bytes).to_owned();
+    let name = node_text(&name_node, ctx.bytes).to_owned();
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(lang.as_str(), descriptors),
+    let sig = one_line_signature(node_text(node, ctx.bytes), &['=']);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::TypeAlias,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['=']),
-    });
+        SymbolKind::TypeAlias,
+        Visibility::Unknown,
+        descriptors,
+        sig,
+    ));
 }
 
 // ── Require imports ──────────────────────────────────────────────────────────

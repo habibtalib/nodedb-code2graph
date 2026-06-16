@@ -25,12 +25,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
-    definition_bindings, import_bindings, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    collect_call_references, definition_bindings, import_bindings, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -81,7 +81,8 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     let bytes = source.as_bytes();
     let namespaces = module_namespaces(file);
 
-    let defs = collect_symbols(&root, bytes, file, &namespaces, lang);
+    let ctx = ExtractCtx { bytes, file, lang };
+    let defs = collect_symbols(&root, &ctx, &namespaces);
     let def_bindings = definition_bindings(&defs);
     let mut symbols = defs;
     let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
@@ -143,13 +144,7 @@ const BARE_DECL_KINDS: &[&str] = &[
     "variable_declaration",
 ];
 
-fn collect_symbols(
-    root: &Node,
-    bytes: &[u8],
-    file: &str,
-    namespaces: &[String],
-    lang: Language,
-) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
     for stmt in root.children(&mut root.walk()) {
         match stmt.kind() {
@@ -159,10 +154,8 @@ fn collect_symbols(
                 for decl in stmt.children(&mut stmt.walk()) {
                     emit_declaration(
                         DeclSite { decl, span: stmt },
-                        bytes,
-                        file,
+                        ctx,
                         namespaces,
-                        lang,
                         Visibility::Public,
                         &mut out,
                     );
@@ -176,10 +169,8 @@ fn collect_symbols(
                         decl: stmt,
                         span: stmt,
                     },
-                    bytes,
-                    file,
+                    ctx,
                     namespaces,
-                    lang,
                     Visibility::Private,
                     &mut out,
                 );
@@ -204,10 +195,8 @@ struct DeclSite<'t> {
 /// declaration was exported (`Public`) or bare (`Private`).
 fn emit_declaration(
     site: DeclSite,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     namespaces: &[String],
-    lang: Language,
     visibility: Visibility,
     out: &mut Vec<Symbol>,
 ) {
@@ -220,24 +209,21 @@ fn emit_declaration(
             .map(Descriptor::Namespace)
             .collect();
         descriptors.push(leaf);
-        out.push(Symbol {
-            id: SymbolId::global(lang.as_str(), descriptors),
+        let signature = one_line_signature(node_text(decl, ctx.bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            span_node,
             name,
             kind,
             visibility,
-            file: file.to_owned(),
-            line: (span_node.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: span_node.start_byte(),
-                end: span_node.end_byte(),
-            },
-            signature: one_line_signature(node_text(decl, bytes), &['{']),
-        });
+            descriptors,
+            signature,
+        ));
     };
 
     match decl.kind() {
         "function_declaration" | "generator_function_declaration" => {
-            if let Some(n) = child_text(decl, "identifier", bytes) {
+            if let Some(n) = child_text(decl, "identifier", ctx.bytes) {
                 push(
                     out,
                     n.clone(),
@@ -250,12 +236,12 @@ fn emit_declaration(
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
-            emit_named(decl, bytes, SymbolKind::Class, out, &push)
+            emit_named(decl, ctx.bytes, SymbolKind::Class, out, &push)
         }
-        "interface_declaration" => emit_named(decl, bytes, SymbolKind::Interface, out, &push),
-        "type_alias_declaration" => emit_named(decl, bytes, SymbolKind::TypeAlias, out, &push),
+        "interface_declaration" => emit_named(decl, ctx.bytes, SymbolKind::Interface, out, &push),
+        "type_alias_declaration" => emit_named(decl, ctx.bytes, SymbolKind::TypeAlias, out, &push),
         "enum_declaration" => {
-            if let Some(n) = child_text(decl, "identifier", bytes) {
+            if let Some(n) = child_text(decl, "identifier", ctx.bytes) {
                 push(out, n.clone(), SymbolKind::Enum, Descriptor::Type(n));
             }
         }
@@ -264,7 +250,7 @@ fn emit_declaration(
                 if vd.kind() != "variable_declarator" {
                     continue;
                 }
-                if let Some(n) = child_text(&vd, "identifier", bytes) {
+                if let Some(n) = child_text(&vd, "identifier", ctx.bytes) {
                     push(out, n.clone(), SymbolKind::Const, Descriptor::Term(n));
                 }
             }
@@ -275,7 +261,7 @@ fn emit_declaration(
                 if vd.kind() != "variable_declarator" {
                     continue;
                 }
-                if let Some(n) = child_text(&vd, "identifier", bytes) {
+                if let Some(n) = child_text(&vd, "identifier", ctx.bytes) {
                     push(out, n.clone(), SymbolKind::Const, Descriptor::Term(n));
                 }
             }

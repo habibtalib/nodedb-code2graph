@@ -1,5 +1,5 @@
 {
-  "name": "code2graph",
+  "name": "code2graph-rs",
   "version": "0.0.0",
   "description": "Source code to structural graph facts — Node.js/Bun bindings",
   "license": "Apache-2.0",

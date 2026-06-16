@@ -17,7 +17,7 @@ The `napi build` command (from `@napi-rs/cli`) compiles the Rust crate and write
 napi-rs automatically converts Rust `snake_case` function names to JS `camelCase` (`build_graph` → `buildGraph`, `language_of` → `languageOf`). TypeScript types are generated as `index.d.ts`.
 
 ```js
-const { extract, buildGraph, languageOf } = require("code2graph");
+const { extract, buildGraph, languageOf } = require("code2graph-rs");
 
 const facts = extract("src/lib.rs", "pub fn hello() {}");
 const graph = buildGraph([facts], "name");

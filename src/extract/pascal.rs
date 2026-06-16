@@ -88,6 +88,8 @@ impl Extractor for PascalExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -603,6 +605,100 @@ fn type_leaf(node: &Node, bytes: &[u8], file: &str, ctx: TypeRefContext, out: &m
     }
 }
 
+// ── Read / write references ──────────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) sits in a position already
+/// captured by another collector — a call entity/callee, a declaration name
+/// (procedure, type, var, const, parameter, enum value, label, module),
+/// an import binding, an assignment LHS (handled by [`collect_write_references`]),
+/// or a member-access leaf (`rhs` of `exprDot`) — and so must NOT also be
+/// emitted as a Read reference.
+///
+/// The base (`lhs`) of `exprDot` (e.g. `Source` in `Source.Field`) is a genuine
+/// read and is intentionally NOT excluded — only the leaf (`rhs`) is skipped.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call entity/callee — already a Call ref (free or qualified).
+        "exprCall" => parent.child_by_field_name("entity").as_ref() == Some(node),
+        // Member-access leaf: `Source.Field` — skip the rhs (leaf) only; the
+        // lhs (base) is a genuine read and falls through.
+        "exprDot" => parent.child_by_field_name("rhs").as_ref() == Some(node),
+        // Assignment LHS — handled by collect_write_references.
+        "assignment" => parent.child_by_field_name("lhs").as_ref() == Some(node),
+        // Inline var-assignment declaration `var x: T := …` — `x` is the
+        // binding name inside the varAssignDef wrapper (not a read).
+        "varAssignDef" => true,
+        // Declaration names — proc/function, type, var, const, field, enum value, label.
+        "declProc" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declType" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declVar" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declConst" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declField" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declArg" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declEnumValue" => parent.child_by_field_name("name").as_ref() == Some(node),
+        "declLabel" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Module/unit/program name in `moduleName` node — already the module symbol.
+        "moduleName" => true,
+        // `uses` import bindings — already Import refs.
+        "declUses" => true,
+        // Type-name positions — already captured as TypeRef by collect_type_references.
+        // `type_leaf` walks `typeref` children for identifiers, and recurses into `type`
+        // named children where an identifier may appear directly. Mirror both paths here
+        // so no type name is double-emitted as a Read.
+        "typeref" => true,
+        "type" => true,
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions. Applies [`MIN_REF_LEN`].
+///
+/// Skips identifiers that are already captured by other collectors (call callees,
+/// declaration names, import binding names, assignment LHS, member-access leaf)
+/// via [`is_non_read_position`].
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // `identifier` nodes have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of Pascal `assignment` statements (`:=`).
+///
+/// Pascal `:=` produces an `assignment` node with a named `lhs` field (from the
+/// grammar's `op.infix` helper). Only bare `identifier` LHS targets are covered —
+/// member/subscript LHS (`rec.Field := …`, `arr[i] := …`) are out of scope for
+/// v1. `var`/`const` declarations never use `:=` in the Pascal grammar (they use
+/// `=` via `defaultValue`), so no parent-exclusion is needed. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment" {
+        if let Some(lhs) = node.child_by_field_name("lhs") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 // ── Scope tree ───────────────────────────────────────────────────────────────
 
 fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
@@ -914,6 +1010,187 @@ end.
         assert_eq!(
             run_count, 1,
             "Run should appear exactly once (the declaration, not the impl)"
+        );
+    }
+
+    // ── Read / write references ──────────────────────────────────────────────
+
+    /// `Total := Total + Bonus;` — LHS emits Write for `Total`, RHS emits
+    /// Read for `Total` and Read for `Bonus`.
+    #[test]
+    fn assignment_emits_write_and_reads() {
+        let src = r#"
+program Greeter;
+procedure Run;
+var Total: Integer;
+var Bonus: Integer;
+begin
+  Total := Total + Bonus;
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let writes: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            writes.iter().any(|n| n.eq_ignore_ascii_case("Total")),
+            "expected Write ref for 'Total': {writes:?}"
+        );
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        // RHS `Total` (read) and `Bonus` (read) must both appear.
+        assert!(
+            reads.iter().any(|n| n.eq_ignore_ascii_case("Total")),
+            "expected Read ref for 'Total' on RHS: {reads:?}"
+        );
+        assert!(
+            reads.iter().any(|n| n.eq_ignore_ascii_case("Bonus")),
+            "expected Read ref for 'Bonus': {reads:?}"
+        );
+    }
+
+    /// `var Result: Integer;` is a declaration, NOT an assignment — no Write ref
+    /// should be emitted for `Result`.
+    #[test]
+    fn var_declaration_does_not_emit_write() {
+        let src = r#"
+program Greeter;
+procedure Run;
+var Result: Integer;
+begin
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let writes: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            !writes.iter().any(|n| n.eq_ignore_ascii_case("Result")),
+            "expected NO Write ref for var declaration 'Result': {writes:?}"
+        );
+    }
+
+    /// A call argument identifier emits a Read; the callee itself does NOT.
+    #[test]
+    fn call_argument_is_read_callee_is_not() {
+        let src = r#"
+program Greeter;
+procedure Run;
+var Arg: Integer;
+begin
+  Process(Arg);
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.iter().any(|n| n.eq_ignore_ascii_case("Arg")),
+            "expected Read ref for call argument 'Arg': {reads:?}"
+        );
+
+        // The callee `Process` is already a Call ref; it must NOT also appear as Read.
+        assert!(
+            !reads.iter().any(|n| n.eq_ignore_ascii_case("Process")),
+            "callee 'Process' must NOT appear as a Read ref: {reads:?}"
+        );
+    }
+
+    /// `Value := Source.Field;` — base `Source` emits a Read; leaf `Field` does NOT.
+    #[test]
+    fn field_access_base_is_read_leaf_is_not() {
+        let src = r#"
+program Greeter;
+procedure Run;
+var Value: Integer;
+begin
+  Value := Source.Field;
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.iter().any(|n| n.eq_ignore_ascii_case("Source")),
+            "expected Read ref for field-access base 'Source': {reads:?}"
+        );
+        assert!(
+            !reads.iter().any(|n| n.eq_ignore_ascii_case("Field")),
+            "field-access leaf 'Field' must NOT appear as a Read ref: {reads:?}"
+        );
+    }
+
+    /// `var Total: TMyType;` — the type name `TMyType` must NOT be emitted as a Read
+    /// (it is already captured as a TypeRef). Value identifiers used in an assignment
+    /// (`Source` on the RHS) still must appear as Read.
+    ///
+    /// NOTE (pre-existing v1 boundary, not fixed here): comma-grouped declarations like
+    /// `var Aaa, Bbb: Integer;` produce only the first name (`Aaa`) from
+    /// `child_by_field_name("name")`; the trailing name `Bbb` leaks as a Read.
+    /// This is consistent with the existing `declVar`/`declArg` arms and is left as a
+    /// documented limitation.
+    #[test]
+    fn type_name_in_var_decl_is_not_a_read() {
+        let src = r#"
+program Greeter;
+procedure Run;
+var Total: TMyType;
+begin
+  Total := Source;
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        // The type name must NOT appear as a Read — it is a TypeRef, not a value read.
+        assert!(
+            !reads.iter().any(|n| n.eq_ignore_ascii_case("TMyType")),
+            "type name 'TMyType' must NOT appear as a Read ref: {reads:?}"
+        );
+
+        // A genuine value read on the RHS of an assignment must still be captured.
+        assert!(
+            reads.iter().any(|n| n.eq_ignore_ascii_case("Source")),
+            "expected Read ref for value identifier 'Source': {reads:?}"
         );
     }
 }

@@ -3,13 +3,13 @@
 //! PHP extractor — one tree-sitter pass yielding definitions and references.
 //!
 //! Definitions: top-level functions, classes, interfaces, traits, and enums,
-//! plus their public members (methods, properties, constants). Namespace
-//! identity comes from the `namespace` declaration when present; otherwise it
-//! falls back to path-derived segments (strips `.php`, strips leading `src/`,
-//! splits on `/`). Private and protected members are skipped. Interface members
-//! are treated as implicitly public. Enum *cases* are not captured in v0 — a
-//! deliberate limitation; they require a separate `SymbolKind` and are left for
-//! a future pass.
+//! plus ALL their members (methods, properties, constants), tagged with their
+//! real `Visibility`. Namespace identity comes from the `namespace` declaration
+//! when present; otherwise it falls back to path-derived segments (strips
+//! `.php`, strips leading `src/`, splits on `/`). Interface members are treated
+//! as implicitly public. Enum *cases* are not captured in v0 — a deliberate
+//! limitation; they require a separate `SymbolKind` and are left for a future
+//! pass.
 //!
 //! PHP supports two namespace forms:
 //! - **Statement form**: `namespace App;` followed by sibling declarations.
@@ -175,11 +175,13 @@ fn collect_defs(
                     name: name.clone(),
                     disambiguator: String::new(),
                 });
+                // Top-level functions have no visibility modifier concept; they
+                // are effectively public within their namespace.
                 push_symbol(
                     out,
                     &child,
                     name,
-                    SymbolKind::Function,
+                    (SymbolKind::Function, Visibility::Public),
                     descriptors,
                     bytes,
                     file,
@@ -201,11 +203,13 @@ fn collect_defs(
                 };
                 let mut type_descriptors = base_descriptors.clone();
                 type_descriptors.push(Descriptor::Type(type_name.clone()));
+                // Top-level type declarations have no visibility modifier; they
+                // are effectively public within their namespace.
                 push_symbol(
                     out,
                     &child,
                     type_name,
-                    type_sym_kind,
+                    (type_sym_kind, Visibility::Public),
                     type_descriptors.clone(),
                     bytes,
                     file,
@@ -231,7 +235,8 @@ fn collect_defs(
     }
 }
 
-/// Collect public method, property, and constant declarations from a type body.
+/// Collect ALL method, property, and constant declarations from a type body,
+/// tagging each with its real `Visibility`.
 fn collect_members(
     body: &Node,
     type_descriptors: &[Descriptor],
@@ -243,11 +248,13 @@ fn collect_members(
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "method_declaration" => {
-                if !implicit_public && !is_public(&member, bytes) {
-                    continue;
-                }
                 let Some(name) = field_text(&member, "name", bytes) else {
                     continue;
+                };
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&member, bytes)
                 };
                 let mut descriptors = type_descriptors.to_vec();
                 descriptors.push(Descriptor::Method {
@@ -258,16 +265,18 @@ fn collect_members(
                     out,
                     &member,
                     name,
-                    SymbolKind::Method,
+                    (SymbolKind::Method, vis),
                     descriptors,
                     bytes,
                     file,
                 );
             }
             "property_declaration" => {
-                if !implicit_public && !is_public(&member, bytes) {
-                    continue;
-                }
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&member, bytes)
+                };
                 // A property_declaration may contain one or more property_element
                 // children; each property_element's `name` field is a
                 // `variable_name` node whose text includes the leading `$`.
@@ -290,7 +299,7 @@ fn collect_members(
                         out,
                         &member,
                         name,
-                        SymbolKind::Static,
+                        (SymbolKind::Static, vis),
                         descriptors,
                         bytes,
                         file,
@@ -298,9 +307,11 @@ fn collect_members(
                 }
             }
             "const_declaration" => {
-                if !implicit_public && !is_public(&member, bytes) {
-                    continue;
-                }
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&member, bytes)
+                };
                 // A const_declaration contains one or more const_element children;
                 // each const_element has a child of kind `name`.
                 for elem in member.children(&mut member.walk()) {
@@ -317,7 +328,7 @@ fn collect_members(
                         out,
                         &member,
                         name,
-                        SymbolKind::Const,
+                        (SymbolKind::Const, vis),
                         descriptors,
                         bytes,
                         file,
@@ -329,19 +340,29 @@ fn collect_members(
     }
 }
 
-/// Returns `true` if `node` is public.
+/// Read the explicit visibility of `node`, falling back to `Public` when no
+/// `visibility_modifier` child is present (PHP's implicit default).
 ///
-/// Scans `node`'s direct children for a `visibility_modifier`. If one is found
-/// returns whether its text is `"public"`; if none is found returns `true`
-/// (PHP members without an explicit modifier default to public).
-fn is_public(node: &Node, bytes: &[u8]) -> bool {
+/// Maps modifier text to [`Visibility`]:
+/// - `"private"`   → [`Visibility::Private`]
+/// - `"protected"` → [`Visibility::Protected`]
+/// - `"public"`    → [`Visibility::Public`]
+/// - anything else → [`Visibility::Public`] (e.g. future modifiers)
+/// - absent        → [`Visibility::Public`] (PHP implicit default for class
+///   members; free functions and classes have no modifier concept and are
+///   effectively public-scoped)
+fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "visibility_modifier" {
-            return node_text(&child, bytes) == "public";
+            return match node_text(&child, bytes) {
+                "private" => Visibility::Private,
+                "protected" => Visibility::Protected,
+                _ => Visibility::Public,
+            };
         }
     }
-    // No visibility_modifier present → PHP default is public.
-    true
+    // No visibility_modifier present → PHP implicit default is public.
+    Visibility::Public
 }
 
 /// Recursively walk `node` collecting `Import` references for every
@@ -874,7 +895,7 @@ fn push_symbol(
     out: &mut Vec<Symbol>,
     node: &Node,
     name: String,
-    kind: SymbolKind,
+    (kind, visibility): (SymbolKind, Visibility),
     descriptors: Vec<Descriptor>,
     bytes: &[u8],
     file: &str,
@@ -883,7 +904,7 @@ fn push_symbol(
         id: SymbolId::global(Language::Php.as_str(), descriptors),
         name,
         kind,
-        visibility: Visibility::Public,
+        visibility,
         file: file.to_owned(),
         line: (node.start_position().row + 1) as u32,
         span: ByteSpan {
@@ -952,9 +973,12 @@ interface Reader {
             token.id.to_scip_string(),
             "codegraph . . . App/Auth/Session#token."
         );
+        assert_eq!(token.visibility, Visibility::Public);
 
-        // Private property must not appear.
-        assert!(by_name("secret").is_none());
+        // Private property IS now emitted, tagged Private.
+        let secret = by_name("secret").unwrap();
+        assert_eq!(secret.kind, SymbolKind::Static);
+        assert_eq!(secret.visibility, Visibility::Private);
 
         // Public method.
         let validate = by_name("validate").unwrap();
@@ -963,9 +987,12 @@ interface Reader {
             validate.id.to_scip_string(),
             "codegraph . . . App/Auth/Session#validate()."
         );
+        assert_eq!(validate.visibility, Visibility::Public);
 
-        // Private method must not appear.
-        assert!(by_name("internal").is_none());
+        // Private method IS now emitted, tagged Private.
+        let internal = by_name("internal").unwrap();
+        assert_eq!(internal.kind, SymbolKind::Method);
+        assert_eq!(internal.visibility, Visibility::Private);
 
         // Interface symbol.
         let reader = by_name("Reader").unwrap();
@@ -1563,6 +1590,127 @@ function run() {
         assert!(
             prim_refs.is_empty(),
             "primitive 'int' must NOT produce a TypeRef; got: {prim_refs:?}"
+        );
+    }
+
+    // ── Visibility tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn visibility_public_method_tagged_public() {
+        // `public function` → Visibility::Public.
+        let src = "<?php\nclass C { public function foo() {} }\n";
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "foo")
+            .expect("expected symbol 'foo'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "public function must be tagged Public"
+        );
+    }
+
+    #[test]
+    fn visibility_private_method_emitted_and_tagged_private() {
+        // `private function` → emitted with Visibility::Private.
+        let src = "<?php\nclass C { private function secret() {} }\n";
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "secret")
+            .expect("private method 'secret' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "private function must be tagged Private"
+        );
+    }
+
+    #[test]
+    fn visibility_protected_method_emitted_and_tagged_protected() {
+        // `protected function` → emitted with Visibility::Protected.
+        let src = "<?php\nclass C { protected function hook() {} }\n";
+        let facts = PhpExtractor.extract(src, "src/C.php").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "hook")
+            .expect("protected method 'hook' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Protected,
+            "protected function must be tagged Protected"
+        );
+    }
+
+    #[test]
+    fn visibility_no_modifier_method_defaults_to_public() {
+        // Interface method with no modifier → Visibility::Public (implicit).
+        let src = "<?php\ninterface I { function read(); }\n";
+        let facts = PhpExtractor.extract(src, "src/I.php").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "read")
+            .expect("interface method 'read' must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "method without modifier must default to Public"
+        );
+    }
+
+    #[test]
+    fn visibility_all_modifiers_in_one_class() {
+        // Class with public, protected, and private members — all three emitted
+        // with correct visibility tags.
+        let src = r#"<?php
+class Multi {
+    public function pub_fn() {}
+    protected function prot_fn() {}
+    private function priv_fn() {}
+    public $pub_prop;
+    protected $prot_prop;
+    private $priv_prop;
+}
+"#;
+        let facts = PhpExtractor.extract(src, "src/Multi.php").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        assert_eq!(by_name("pub_fn").unwrap().visibility, Visibility::Public);
+        assert_eq!(
+            by_name("prot_fn").unwrap().visibility,
+            Visibility::Protected
+        );
+        assert_eq!(by_name("priv_fn").unwrap().visibility, Visibility::Private);
+        assert_eq!(by_name("pub_prop").unwrap().visibility, Visibility::Public);
+        assert_eq!(
+            by_name("prot_prop").unwrap().visibility,
+            Visibility::Protected
+        );
+        assert_eq!(
+            by_name("priv_prop").unwrap().visibility,
+            Visibility::Private
+        );
+    }
+
+    #[test]
+    fn visibility_top_level_function_is_public() {
+        // A free top-level function has no visibility modifier; it must be Public.
+        let src = "<?php\nfunction helper() {}\n";
+        let facts = PhpExtractor.extract(src, "src/helpers.php").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .expect("expected symbol 'helper'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "top-level function must be tagged Public"
         );
     }
 }

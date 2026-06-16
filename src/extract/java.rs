@@ -2,13 +2,13 @@
 
 //! Java extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: **public** top-level type declarations (`class`, `interface`,
-//! `enum`, `record`, `@interface`) and their public members (methods,
-//! constructors, fields). Interface and annotation-type members are treated as
-//! implicitly public. Qualified identity follows the `package` declaration;
-//! files without a package declaration fall back to a path-derived namespace.
-//! References: callee identifiers of `method_invocation` and
-//! `object_creation_expression` nodes.
+//! Definitions: all top-level type declarations (`class`, `interface`,
+//! `enum`, `record`, `@interface`) and their members (methods, constructors,
+//! fields), tagged with their real [`Visibility`]. Interface and
+//! annotation-type members are treated as implicitly public. Qualified identity
+//! follows the `package` declaration; files without a package declaration fall
+//! back to a path-derived namespace. References: callee identifiers of
+//! `method_invocation` and `object_creation_expression` nodes.
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
 
@@ -147,11 +147,6 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             _ => continue,
         };
 
-        // Gate: only public types.
-        if !is_public(&child, bytes) {
-            continue;
-        }
-
         let Some(type_name) = field_text(&child, "name", bytes) else {
             continue;
         };
@@ -163,7 +158,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             _ => SymbolKind::Class,
         };
 
-        // Emit the type symbol.
+        // Emit the type symbol with its real visibility.
         let mut type_descriptors: Vec<Descriptor> = namespaces
             .iter()
             .cloned()
@@ -174,7 +169,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             id: SymbolId::global(Language::Java.as_str(), type_descriptors),
             name: type_name.clone(),
             kind: type_sym_kind,
-            visibility: Visibility::Public,
+            visibility: read_visibility(&child, bytes, false),
             file: file.to_owned(),
             line: (child.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -238,9 +233,6 @@ fn collect_members(
                 );
             }
             "method_declaration" | "constructor_declaration" => {
-                if !implicit_public && !is_public(&member, bytes) {
-                    continue;
-                }
                 let Some(name) = field_text(&member, "name", bytes) else {
                     continue;
                 };
@@ -258,7 +250,7 @@ fn collect_members(
                     id: SymbolId::global(Language::Java.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Method,
-                    visibility: Visibility::Public,
+                    visibility: read_visibility(&member, bytes, implicit_public),
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -269,10 +261,8 @@ fn collect_members(
                 });
             }
             "field_declaration" => {
-                if !implicit_public && !is_public(&member, bytes) {
-                    continue;
-                }
                 // A single field_declaration may declare multiple variables.
+                let field_vis = read_visibility(&member, bytes, implicit_public);
                 let mut cursor = member.walk();
                 for declarator in member.children_by_field_name("declarator", &mut cursor) {
                     let Some(var_name) = field_text(&declarator, "name", bytes) else {
@@ -289,7 +279,7 @@ fn collect_members(
                         id: SymbolId::global(Language::Java.as_str(), descriptors),
                         name: var_name,
                         kind: SymbolKind::Static,
-                        visibility: Visibility::Public,
+                        visibility: field_vis,
                         file: file.to_owned(),
                         line: (member.start_position().row + 1) as u32,
                         span: ByteSpan {
@@ -448,11 +438,32 @@ fn has_modifier(node: &Node, bytes: &[u8], keyword: &str) -> bool {
         })
 }
 
-/// True iff `node` has a `modifiers` child that contains the text `"public"`.
+/// Read the declared visibility of `node` from its `modifiers` child.
 ///
-/// If there is no `modifiers` child (package-private), returns `false`.
-fn is_public(node: &Node, bytes: &[u8]) -> bool {
-    has_modifier(node, bytes, "public")
+/// Modifier keywords are checked in this order:
+/// - `private` → [`Visibility::Private`]
+/// - `protected` → [`Visibility::Protected`]
+/// - `public` → [`Visibility::Public`]
+/// - none of the above (package-private in Java) → [`Visibility::Internal`],
+///   **unless** `implicit_public` is `true` (e.g. interface / annotation-type
+///   members, which are implicitly public) → [`Visibility::Public`].
+fn read_visibility(node: &Node, bytes: &[u8], implicit_public: bool) -> Visibility {
+    if has_modifier(node, bytes, "private") {
+        return Visibility::Private;
+    }
+    if has_modifier(node, bytes, "protected") {
+        return Visibility::Protected;
+    }
+    if has_modifier(node, bytes, "public") {
+        return Visibility::Public;
+    }
+    // No explicit access modifier → package-private, unless the enclosing
+    // context makes the member implicitly public (interface / @interface members).
+    if implicit_public {
+        Visibility::Public
+    } else {
+        Visibility::Internal
+    }
 }
 
 /// Emit an FFI-bridge reference for every `native` method, so the resolver links
@@ -1004,7 +1015,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_public_class_and_method() {
+    fn extracts_all_types_and_members_with_visibility() {
         let src = r#"package com.example.auth;
 public class SessionManager {
     public boolean validate(String token) { return true; }
@@ -1021,6 +1032,7 @@ class Helper {}
 
         let sm = by_name("SessionManager").unwrap();
         assert_eq!(sm.kind, SymbolKind::Class);
+        assert_eq!(sm.visibility, Visibility::Public);
         assert_eq!(
             sm.id.to_scip_string(),
             "codegraph . . . com/example/auth/SessionManager#"
@@ -1028,17 +1040,24 @@ class Helper {}
 
         let validate = by_name("validate").unwrap();
         assert_eq!(validate.kind, SymbolKind::Method);
+        assert_eq!(validate.visibility, Visibility::Public);
         assert_eq!(
             validate.id.to_scip_string(),
             "codegraph . . . com/example/auth/SessionManager#validate()."
         );
 
-        // private method — must not appear
-        assert!(by_name("secret").is_none());
-        // package-private field — must not appear
-        assert!(by_name("packagePrivate").is_none());
-        // non-public type — must not appear
-        assert!(by_name("Helper").is_none());
+        // private method — now emitted with Private visibility
+        let secret = by_name("secret").unwrap();
+        assert_eq!(secret.visibility, Visibility::Private);
+
+        // package-private field — now emitted with Internal visibility
+        let pkg_priv = by_name("packagePrivate").unwrap();
+        assert_eq!(pkg_priv.visibility, Visibility::Internal);
+
+        // package-private type — now emitted with Internal visibility
+        let helper = by_name("Helper").unwrap();
+        assert_eq!(helper.kind, SymbolKind::Class);
+        assert_eq!(helper.visibility, Visibility::Internal);
 
         assert_eq!(facts.lang, "java");
     }
@@ -1061,9 +1080,11 @@ public interface Reader {
         assert_eq!(reader.kind, SymbolKind::Interface);
         assert_eq!(reader.id.to_scip_string(), "codegraph . . . io/svc/Reader#");
 
-        // Both methods must be emitted even though they carry no `public` modifier.
+        // Both methods must be emitted even though they carry no `public` modifier,
+        // and both must have Visibility::Public (implicit public for interface members).
         let read = by_name("read").unwrap();
         assert_eq!(read.kind, SymbolKind::Method);
+        assert_eq!(read.visibility, Visibility::Public);
         assert_eq!(
             read.id.to_scip_string(),
             "codegraph . . . io/svc/Reader#read()."
@@ -1071,6 +1092,7 @@ public interface Reader {
 
         let close = by_name("close").unwrap();
         assert_eq!(close.kind, SymbolKind::Method);
+        assert_eq!(close.visibility, Visibility::Public);
         assert_eq!(
             close.id.to_scip_string(),
             "codegraph . . . io/svc/Reader#close()."
@@ -1800,6 +1822,90 @@ public class C {
             Some(TypeRefContext::GenericArg),
             "expected GenericArg ctx for 'Config', got {:?}",
             config_ref.type_ref_ctx
+        );
+    }
+
+    // ── Visibility tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn visibility_public_method() {
+        let src = "package p;\npublic class C { public void pub_m() {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "pub_m")
+            .expect("expected symbol 'pub_m'");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "public method must have Visibility::Public"
+        );
+    }
+
+    #[test]
+    fn visibility_private_method_emitted_with_private() {
+        let src = "package p;\npublic class C { private void priv_m() {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "priv_m")
+            .expect("private method must now be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Private,
+            "private method must have Visibility::Private"
+        );
+    }
+
+    #[test]
+    fn visibility_protected_method_emitted_with_protected() {
+        let src = "package p;\npublic class C { protected void prot_m() {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "prot_m")
+            .expect("protected method must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Protected,
+            "protected method must have Visibility::Protected"
+        );
+    }
+
+    #[test]
+    fn visibility_package_private_method_emitted_with_internal() {
+        // No access modifier → package-private in Java → Internal.
+        let src = "package p;\npublic class C { void pkg_m() {} }";
+        let facts = JavaExtractor.extract(src, "src/p/C.java").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "pkg_m")
+            .expect("package-private method must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "package-private method must have Visibility::Internal"
+        );
+    }
+
+    #[test]
+    fn visibility_interface_method_implicit_public() {
+        // Interface method with no modifier is implicitly public.
+        let src = "package p;\npublic interface I { void iface_m(); }";
+        let facts = JavaExtractor.extract(src, "src/p/I.java").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "iface_m")
+            .expect("interface method must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "interface method without modifier must be Visibility::Public (implicitly public)"
         );
     }
 }

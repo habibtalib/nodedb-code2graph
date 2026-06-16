@@ -32,6 +32,8 @@ pub mod javascript;
 pub mod kotlin;
 #[cfg(feature = "lua")]
 pub mod lua;
+#[cfg(feature = "luau")]
+pub mod luau;
 #[cfg(feature = "php")]
 pub mod php;
 #[cfg(feature = "python")]
@@ -75,6 +77,8 @@ pub use javascript::JavaScriptExtractor;
 pub use kotlin::KotlinExtractor;
 #[cfg(feature = "lua")]
 pub use lua::LuaExtractor;
+#[cfg(feature = "luau")]
+pub use luau::LuauExtractor;
 #[cfg(feature = "php")]
 pub use php::PhpExtractor;
 #[cfg(feature = "python")]

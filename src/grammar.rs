@@ -129,6 +129,12 @@ pub fn lua() -> Language {
     tree_sitter_lua::LANGUAGE.into()
 }
 
+#[cfg(feature = "luau")]
+/// Returns the tree-sitter grammar for Luau.
+pub fn luau() -> Language {
+    tree_sitter_luau::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -183,5 +189,7 @@ mod tests {
         check("dart", super::dart());
         #[cfg(feature = "lua")]
         check("lua", super::lua());
+        #[cfg(feature = "luau")]
+        check("luau", super::luau());
     }
 }

@@ -27,6 +27,8 @@ use super::JavaScriptExtractor;
 use super::KotlinExtractor;
 #[cfg(feature = "lua")]
 use super::LuaExtractor;
+#[cfg(feature = "luau")]
+use super::LuauExtractor;
 #[cfg(feature = "php")]
 use super::PhpExtractor;
 #[cfg(feature = "python")]
@@ -106,6 +108,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Dart => DartExtractor.extract(source, file),
         #[cfg(feature = "lua")]
         Language::Lua => LuaExtractor.extract(source, file),
+        #[cfg(feature = "luau")]
+        Language::Luau => LuauExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

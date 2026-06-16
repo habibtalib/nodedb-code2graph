@@ -12,6 +12,9 @@
 //! (emitted as an `Import` reference rather than a `Call`).
 //!
 //! Emits neutral [`FileFacts`] — no storage entries, no source bodies.
+//!
+//! The core extraction logic is shared with the Luau extractor via
+//! [`extract_lua_family`], which is parameterized by [`Language`] and grammar.
 
 use tree_sitter::{Node, Parser};
 
@@ -53,70 +56,87 @@ impl Extractor for LuaExtractor {
     }
 
     fn extract(&self, source: &str, file: &str) -> Result<FileFacts> {
-        let ts_language = crate::grammar::lua();
-        let mut parser = Parser::new();
-        parser
-            .set_language(&ts_language)
-            .map_err(|_| CodegraphError::Parse {
-                path: file.to_owned(),
-            })?;
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| CodegraphError::Parse {
-                path: file.to_owned(),
-            })?;
-
-        let root = tree.root_node();
-        let bytes = source.as_bytes();
-        let namespaces = lua_namespaces(file);
-
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
-        let def_bindings = definition_bindings(&defs);
-        let mut symbols = defs;
-        let mod_sym = super::module_symbol(Language::Lua, &namespaces, file, source.len());
-        let module_id = mod_sym.id.to_scip_string();
-        symbols.push(mod_sym);
-
-        // Collect all calls; we'll filter `require` out separately.
-        let mut references =
-            collect_call_references(&root, &ts_language, CALL_QUERY, Language::Lua, bytes, file)?;
-        // Remove `require` from plain call refs — we re-emit them as Import refs.
-        references.retain(|r| r.name != "require");
-
-        collect_require_imports(&root, bytes, file, &mut references, &module_id);
-
-        let scopes = collect_scopes(&root, source.len());
-        attach_reference_scopes(&mut references, &scopes);
-        let mut bindings = collect_bindings(&root, bytes, &scopes);
-        bindings.extend(def_bindings);
-        bindings.extend(import_bindings(&references, &scopes));
-
-        Ok(FileFacts {
-            file: file.to_owned(),
-            lang: Language::Lua.as_str().to_owned(),
-            symbols,
-            references,
-            scopes,
-            bindings,
-            ffi_exports: Vec::new(),
-        })
+        extract_lua_family(source, file, Language::Lua, crate::grammar::lua())
     }
+}
+
+/// Shared extraction pass for the Lua language family (Lua and Luau).
+///
+/// Parameterized by `lang` (determines SCIP scheme tag and `FileFacts.lang`)
+/// and `grammar` (the tree-sitter grammar to use). `LuaExtractor` and
+/// `LuauExtractor` are thin wrappers that call this function.
+pub(crate) fn extract_lua_family(
+    source: &str,
+    file: &str,
+    lang: Language,
+    grammar: tree_sitter::Language,
+) -> Result<FileFacts> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&grammar)
+        .map_err(|_| CodegraphError::Parse {
+            path: file.to_owned(),
+        })?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| CodegraphError::Parse {
+            path: file.to_owned(),
+        })?;
+
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+    let namespaces = lua_namespaces(file);
+
+    let defs = collect_symbols(&root, bytes, file, &namespaces, lang);
+    let def_bindings = definition_bindings(&defs);
+    let mut symbols = defs;
+    let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
+    let module_id = mod_sym.id.to_scip_string();
+    symbols.push(mod_sym);
+
+    // Collect all calls; we'll filter `require` out separately.
+    let mut references = collect_call_references(&root, &grammar, CALL_QUERY, lang, bytes, file)?;
+    // Remove `require` from plain call refs — we re-emit them as Import refs.
+    references.retain(|r| r.name != "require");
+
+    collect_require_imports(&root, bytes, file, &mut references, &module_id);
+
+    let scopes = collect_scopes(&root, source.len());
+    attach_reference_scopes(&mut references, &scopes);
+    let mut bindings = collect_bindings(&root, bytes, &scopes);
+    bindings.extend(def_bindings);
+    bindings.extend(import_bindings(&references, &scopes));
+
+    Ok(FileFacts {
+        file: file.to_owned(),
+        lang: lang.as_str().to_owned(),
+        symbols,
+        references,
+        scopes,
+        bindings,
+        ffi_exports: Vec::new(),
+    })
 }
 
 // ── Namespace derivation ─────────────────────────────────────────────────────
 
 /// Derive namespace descriptors purely from the file path.
 ///
-/// Lua has no namespace/package declaration — identity is file-based. We strip
-/// `.lua`, strip leading `src/` and `lua/` (common source roots), then split
-/// on `/`.
+/// Lua/Luau have no namespace/package declaration — identity is file-based. We
+/// strip `.lua`/`.luau`, strip leading `src/`, `lua/`, or `luau/` (common
+/// source roots), then split on `/`.
 ///
-/// `src/util.lua`     → `["util"]`
+/// `src/util.lua`        → `["util"]`
 /// `lua/http/client.lua` → `["http", "client"]`
+/// `src/m.luau`          → `["m"]`
 fn lua_namespaces(file: &str) -> Vec<String> {
-    let p = file.strip_suffix(".lua").unwrap_or(file);
+    let p = file
+        .strip_suffix(".luau")
+        .or_else(|| file.strip_suffix(".lua"))
+        .unwrap_or(file);
     let p = p
-        .strip_prefix("lua/")
+        .strip_prefix("luau/")
+        .or_else(|| p.strip_prefix("lua/"))
         .or_else(|| p.strip_prefix("src/"))
         .unwrap_or(p);
     p.split('/')
@@ -127,14 +147,20 @@ fn lua_namespaces(file: &str) -> Vec<String> {
 
 // ── Symbol collection ────────────────────────────────────────────────────────
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(
+    root: &Node,
+    bytes: &[u8],
+    file: &str,
+    namespaces: &[String],
+    lang: Language,
+) -> Vec<Symbol> {
     let ns_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
         .map(Descriptor::Namespace)
         .collect();
     let mut out = Vec::new();
-    collect_chunk(root, bytes, file, &ns_descriptors, &mut out);
+    collect_chunk(root, bytes, file, &ns_descriptors, lang, &mut out);
     out
 }
 
@@ -145,11 +171,16 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 /// - `local_declaration` with a `function_declaration` value (local function)
 /// - `variable_declaration` / assignment with a `function_definition` or
 ///   `table_constructor` value (local `x = function()` / `local M = {}`)
+///
+/// Luau additionally has `type_definition` nodes (`type X = …` / `export type
+/// X = …`). These never appear in plain Lua source, so the arm is a no-op for
+/// Lua and active for Luau.
 fn collect_chunk(
     node: &Node,
     bytes: &[u8],
     file: &str,
     prefix: &[Descriptor],
+    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     // Iterate ALL children (field-labeled `local_declaration` children are
@@ -159,13 +190,18 @@ fn collect_chunk(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "function_declaration" => {
-                collect_function_declaration(&child, bytes, file, prefix, out);
+                collect_function_declaration(&child, bytes, file, prefix, lang, out);
             }
             "variable_declaration" => {
-                collect_variable_declaration(&child, bytes, file, prefix, out);
+                collect_variable_declaration(&child, bytes, file, prefix, lang, out);
             }
             "assignment_statement" => {
-                collect_assignment(&child, bytes, file, prefix, out);
+                collect_assignment(&child, bytes, file, prefix, lang, out);
+            }
+            // Luau: `type Point = { x: number, y: number }` or `export type Point = …`
+            // The `name` field is present regardless of the `export` prefix.
+            "type_definition" => {
+                collect_type_definition(&child, bytes, file, prefix, lang, out);
             }
             _ => {}
         }
@@ -183,6 +219,7 @@ fn collect_function_declaration(
     bytes: &[u8],
     file: &str,
     prefix: &[Descriptor],
+    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     let name_node = match node.child_by_field_name("name") {
@@ -200,7 +237,7 @@ fn collect_function_declaration(
                 disambiguator: String::new(),
             });
             out.push(Symbol {
-                id: SymbolId::global(Language::Lua.as_str(), descriptors),
+                id: SymbolId::global(lang.as_str(), descriptors),
                 name,
                 kind: SymbolKind::Function,
                 file: file.to_owned(),
@@ -234,7 +271,7 @@ fn collect_function_declaration(
                 disambiguator: String::new(),
             });
             out.push(Symbol {
-                id: SymbolId::global(Language::Lua.as_str(), descriptors),
+                id: SymbolId::global(lang.as_str(), descriptors),
                 name: method,
                 kind: SymbolKind::Method,
                 file: file.to_owned(),
@@ -257,6 +294,7 @@ fn collect_variable_declaration(
     bytes: &[u8],
     file: &str,
     prefix: &[Descriptor],
+    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     // `variable_declaration` wraps an `assignment_statement` that carries the
@@ -264,7 +302,7 @@ fn collect_variable_declaration(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "assignment_statement" {
-            collect_assignment(&child, bytes, file, prefix, out);
+            collect_assignment(&child, bytes, file, prefix, lang, out);
         }
     }
 }
@@ -275,6 +313,7 @@ fn collect_assignment(
     bytes: &[u8],
     file: &str,
     prefix: &[Descriptor],
+    lang: Language,
     out: &mut Vec<Symbol>,
 ) {
     let names: Vec<Node> = node
@@ -300,8 +339,18 @@ fn collect_assignment(
     for (i, name_node) in names.iter().enumerate() {
         let name = node_text(name_node, bytes).to_owned();
         let value_opt = values.get(i);
-        emit_local_symbol(name, value_opt, node, bytes, file, prefix, out);
+        let ctx = LuaCtx { bytes, file, lang };
+        emit_local_symbol(name, value_opt, node, ctx, prefix, out);
     }
+}
+
+/// Per-pass context shared by the deep symbol emitters: the source bytes, the
+/// file path, and the language tag. Bundled to keep walker signatures small.
+#[derive(Clone, Copy)]
+struct LuaCtx<'a> {
+    bytes: &'a [u8],
+    file: &'a str,
+    lang: Language,
 }
 
 /// Emit a symbol for a named local or assignment, choosing kind from the value.
@@ -309,11 +358,11 @@ fn emit_local_symbol(
     name: String,
     value_opt: Option<&Node>,
     decl_node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: LuaCtx,
     prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
+    let (bytes, file, lang) = (ctx.bytes, ctx.file, ctx.lang);
     let (kind, descriptor) = match value_opt.map(|v| v.kind()) {
         Some("function_definition") => (
             SymbolKind::Function,
@@ -329,7 +378,7 @@ fn emit_local_symbol(
     let mut descriptors = prefix.to_vec();
     descriptors.push(descriptor);
     out.push(Symbol {
-        id: SymbolId::global(Language::Lua.as_str(), descriptors.clone()),
+        id: SymbolId::global(lang.as_str(), descriptors.clone()),
         name,
         kind,
         file: file.to_owned(),
@@ -344,7 +393,7 @@ fn emit_local_symbol(
     // If it's a table constructor, descend into its fields.
     if let Some(val) = value_opt {
         if val.kind() == "table_constructor" {
-            collect_table_fields(val, bytes, file, &descriptors, out);
+            collect_table_fields(val, &descriptors, ctx, out);
         }
     }
 }
@@ -352,11 +401,11 @@ fn emit_local_symbol(
 /// Walk a `table_constructor` emitting methods and static fields.
 fn collect_table_fields(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
     type_prefix: &[Descriptor],
+    ctx: LuaCtx,
     out: &mut Vec<Symbol>,
 ) {
+    let (bytes, file, lang) = (ctx.bytes, ctx.file, ctx.lang);
     for child in node.children(&mut node.walk()) {
         if child.kind() != "field" {
             continue;
@@ -365,10 +414,7 @@ fn collect_table_fields(
         let Some(fname) = field_text(&child, "name", bytes) else {
             continue;
         };
-        let value_kind = child
-            .child_by_field_name("value")
-            .map(|v| v.kind())
-            .unwrap_or("");
+        let value_kind = child.child_by_field_name("value").map_or("", |v| v.kind());
 
         let (kind, descriptor) = if value_kind == "function_definition" {
             (
@@ -385,7 +431,7 @@ fn collect_table_fields(
         let mut descriptors = type_prefix.to_vec();
         descriptors.push(descriptor);
         out.push(Symbol {
-            id: SymbolId::global(Language::Lua.as_str(), descriptors),
+            id: SymbolId::global(lang.as_str(), descriptors),
             name: fname,
             kind,
             file: file.to_owned(),
@@ -399,12 +445,51 @@ fn collect_table_fields(
     }
 }
 
+/// Emit a [`SymbolKind::TypeAlias`] for a Luau `type_definition` node.
+///
+/// Handles both `type X = …` and `export type X = …` — the `name` field is
+/// present in both forms so no special-casing is needed for the `export`
+/// keyword.  This node never appears in plain Lua source, so calling this
+/// function for Lua is a no-op.
+fn collect_type_definition(
+    node: &Node,
+    bytes: &[u8],
+    file: &str,
+    prefix: &[Descriptor],
+    lang: Language,
+    out: &mut Vec<Symbol>,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name = node_text(&name_node, bytes).to_owned();
+    let mut descriptors = prefix.to_vec();
+    descriptors.push(Descriptor::Type(name.clone()));
+    out.push(Symbol {
+        id: SymbolId::global(lang.as_str(), descriptors),
+        name,
+        kind: SymbolKind::TypeAlias,
+        file: file.to_owned(),
+        line: (node.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        },
+        signature: one_line_signature(node_text(node, bytes), &['=']),
+    });
+}
+
 // ── Require imports ──────────────────────────────────────────────────────────
 
 /// Walk the tree and emit [`RefRole::Import`] references for every `require(…)` call.
 ///
 /// `require('pkg.sub')` produces an import reference whose `name` is the leaf
 /// segment (`sub`) and whose `from_path` is the full dotted path (`pkg.sub`).
+///
+/// Luau / Roblox: `require(script.Parent.Mod)` passes a `dot_index_expression`
+/// chain instead of a string. We handle it by extracting the full dotted text
+/// of that expression; the leaf (last `.`-segment) becomes the `name`. This is
+/// additive and a no-op for plain Lua (Lua require is always a string literal).
 fn collect_require_imports(
     node: &Node,
     bytes: &[u8],
@@ -416,10 +501,15 @@ fn collect_require_imports(
         if let Some(name_node) = node.child_by_field_name("name") {
             if name_node.kind() == "identifier" && node_text(&name_node, bytes) == "require" {
                 if let Some(args) = node.child_by_field_name("arguments") {
-                    // Extract the first string argument.
-                    let path_opt = extract_string_arg(&args, bytes);
-                    if let Some(from_path) = path_opt {
-                        // Leaf name = last `.`-separated segment.
+                    // Case 1: string literal require('pkg.sub')
+                    if let Some(from_path) = extract_string_arg(&args, bytes) {
+                        let leaf = from_path.rsplit('.').next().unwrap_or(&from_path);
+                        if leaf.len() >= MIN_REF_LEN {
+                            push_import_ref(out, leaf, &name_node, file, module_id, &from_path);
+                        }
+                    }
+                    // Case 2: dot-expression require(script.Parent.Mod) — Roblox/Luau style.
+                    else if let Some(from_path) = extract_dot_expr_arg(&args, bytes) {
                         let leaf = from_path.rsplit('.').next().unwrap_or(&from_path);
                         if leaf.len() >= MIN_REF_LEN {
                             push_import_ref(out, leaf, &name_node, file, module_id, &from_path);
@@ -432,6 +522,20 @@ fn collect_require_imports(
     for child in node.children(&mut node.walk()) {
         collect_require_imports(&child, bytes, file, out, module_id);
     }
+}
+
+/// Extract the first `dot_index_expression` argument text from an `arguments`
+/// node, e.g. `script.Parent.Mod` from `require(script.Parent.Mod)`.
+///
+/// Returns the raw text of the expression node, which will contain `.`-separated
+/// identifiers.
+fn extract_dot_expr_arg(args: &Node, bytes: &[u8]) -> Option<String> {
+    for child in args.children(&mut args.walk()) {
+        if child.kind() == "dot_index_expression" {
+            return Some(node_text(&child, bytes).to_owned());
+        }
+    }
+    None
 }
 
 /// Extract the first string content from an `arguments` node.

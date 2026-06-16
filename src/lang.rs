@@ -28,6 +28,7 @@ pub enum Language {
     Scala,      // .scala, .sc
     Dart,       // .dart
     Lua,        // .lua
+    Luau,       // .luau
 }
 
 impl Language {
@@ -54,6 +55,7 @@ impl Language {
             Language::Scala => "scala",
             Language::Dart => "dart",
             Language::Lua => "lua",
+            Language::Luau => "luau",
         }
     }
 
@@ -80,6 +82,7 @@ impl Language {
             "scala" | "sc" => Some(Self::Scala),
             "dart" => Some(Self::Dart),
             "lua" => Some(Self::Lua),
+            "luau" => Some(Self::Luau),
             _ => None,
         }
     }

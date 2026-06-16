@@ -15,7 +15,8 @@
 //! # What it covers (the honest v1 boundary)
 //!
 //! Only references where the call site **textually qualifies the owning type**
-//! are considered — i.e. the extractor populated [`Reference::qualifier`] with
+//! are considered — i.e. the extractor populated
+//! [`Reference::qualifier`](crate::graph::types::Reference::qualifier) with
 //! the written type name (`Foo::bar()`, `Type.method()`). For such a reference,
 //! if `Foo` does not define `bar` directly but a supertype of `Foo` does, an
 //! edge is drawn to the inherited definition (first match wins, walking the

@@ -24,6 +24,7 @@ use super::super::{enclosing_symbol_index, normalize_from_path};
 /// Qualified calls, imports, and unqualified same-namespace cross-file calls
 /// all reduce to "match `name` whose namespace chain ends with `segs`,
 /// uniquely" — they differ only in `role` and `confidence`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone)]
 pub(crate) struct PendingRef {
     /// Caller (resolved intra-file).
@@ -48,14 +49,27 @@ pub(crate) struct PendingRef {
 }
 
 /// The resolution facts for ONE file, isolated from all other files.
+///
+/// A `FileSubgraph` is the per-file unit of incremental Tier-B resolution.
+/// Its fields are intentionally `pub(crate)` — the type is `pub` so a consumer
+/// can name it as a serialization/deserialization target (e.g. `serde_json::from_str::<FileSubgraph>(…)`),
+/// but the internal fields remain crate-private so `PendingRef` (also crate-private)
+/// does not leak into the public API and the blob stays opaque to callers.
+///
+/// To obtain a `FileSubgraph` for persistence, use [`IncrementalGraph::subgraph`];
+/// to restore one, use [`IncrementalGraph::upsert_subgraph`].
+///
+/// [`IncrementalGraph::subgraph`]: super::store::IncrementalGraph::subgraph
+/// [`IncrementalGraph::upsert_subgraph`]: super::store::IncrementalGraph::upsert_subgraph
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone)]
-pub(crate) struct FileSubgraph {
+pub struct FileSubgraph {
     /// This file's symbols (a clone of `f.symbols`).
-    pub symbols: Vec<Symbol>,
+    pub(crate) symbols: Vec<Symbol>,
     /// Fully-resolved local/param/same-file-definition edges.
-    pub intra_edges: Vec<Edge>,
+    pub(crate) intra_edges: Vec<Edge>,
     /// Cross-file refs awaiting the global index.
-    pub pending: Vec<PendingRef>,
+    pub(crate) pending: Vec<PendingRef>,
 }
 
 /// Resolve everything in `f` that can be resolved without other files, deferring

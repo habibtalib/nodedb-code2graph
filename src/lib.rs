@@ -68,7 +68,7 @@ pub use graph::{
 };
 pub use lang::Language;
 pub use resolve::{
-    FfiBridgeResolver, IncrementalGraph, LayeredResolver, Resolver, ScopeGraphResolver,
-    SymbolTableResolver,
+    FfiBridgeResolver, FileSubgraph, IncrementalGraph, LayeredResolver, Resolver,
+    ScopeGraphResolver, SymbolTableResolver,
 };
 pub use symbol::{Descriptor, Package, SymbolId};

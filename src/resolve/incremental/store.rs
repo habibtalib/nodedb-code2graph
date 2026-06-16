@@ -86,13 +86,46 @@ impl IncrementalGraph {
     /// If a subgraph already existed for this key, its definitions are removed
     /// from the global index first, so the index reflects only the current set.
     pub fn upsert(&mut self, facts: &FileFacts) {
-        let key = facts.file.clone();
-        if let Some(old) = self.files.get(&key) {
+        self.upsert_subgraph(facts.file.clone(), build_subgraph(facts));
+    }
+
+    /// Return the stored [`FileSubgraph`] for a file key, or `None` if the file
+    /// is not present in the store.
+    ///
+    /// This is the **persistence read path**: a consumer serializes the returned
+    /// subgraph (e.g. with `serde_json::to_string`) and writes it to a cache
+    /// store keyed by file path. On the next startup, the consumer deserializes
+    /// each cached blob and restores it via [`upsert_subgraph`] — bypassing
+    /// `build_subgraph` entirely for files that have not changed.
+    ///
+    /// [`upsert_subgraph`]: IncrementalGraph::upsert_subgraph
+    pub fn subgraph(&self, file: &str) -> Option<&FileSubgraph> {
+        self.files.get(file)
+    }
+
+    /// Insert or replace a PRE-BUILT (e.g. deserialized) [`FileSubgraph`] for
+    /// `file`, updating the global definition index to reflect the new contents.
+    ///
+    /// This is the **persistence write path** (the restore leg): after deserializing
+    /// a cached subgraph on startup, call this method to re-populate the store
+    /// without re-running `build_subgraph`. The global index is rebuilt from the
+    /// restored symbols, so **the index is never itself persisted** — the
+    /// subgraphs are the single source of truth, and the index is always derived
+    /// from them.
+    ///
+    /// If a subgraph already exists for `file` (e.g. a hot-reload of a changed
+    /// file), its symbols are removed from the index first, exactly as `upsert`
+    /// does, so the index never accumulates stale entries.
+    ///
+    /// All of `upsert`'s index-bookkeeping lives here; `upsert` itself delegates
+    /// to this method (after calling `build_subgraph`) so the two paths can never
+    /// drift.
+    pub fn upsert_subgraph(&mut self, file: String, sub: FileSubgraph) {
+        if let Some(old) = self.files.get(&file) {
             self.index.remove_symbols(&old.symbols);
         }
-        let sub = build_subgraph(facts);
         self.index.insert_symbols(&sub.symbols);
-        self.files.insert(key, sub);
+        self.files.insert(file, sub);
     }
 
     /// Drop the file `file` from the store, removing its definitions from the
@@ -262,6 +295,40 @@ mod tests {
             g.edges.iter().all(|e| e.occ.file != "src/app.rs"),
             "removed file's edges must be gone"
         );
+    }
+
+    /// Prove the full persistence seam end-to-end: serialize each file's
+    /// [`FileSubgraph`] to JSON, deserialize it back, restore it into a fresh
+    /// store via [`IncrementalGraph::upsert_subgraph`], and confirm that the
+    /// reloaded store produces a graph identical (as a multiset) to the original.
+    ///
+    /// This test is the contract that makes persistence safe: if it passes, a
+    /// consumer can cache subgraphs to disk and reload them without loss or drift.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn reload_from_serialized_subgraphs_matches_original() {
+        use crate::resolve::FileSubgraph;
+
+        let files = rust_set();
+        let store = IncrementalGraph::from_files(&files);
+
+        // For each file key, serialize the subgraph to JSON and deserialize it
+        // back, then restore it into a fresh store via upsert_subgraph.
+        let file_keys = ["src/conf.rs", "src/app.rs", "src/util.rs"];
+        let mut restored = IncrementalGraph::new();
+        for key in file_keys {
+            let sub = store
+                .subgraph(key)
+                .unwrap_or_else(|| panic!("subgraph missing for {key}"));
+            let json =
+                serde_json::to_string(sub).unwrap_or_else(|e| panic!("serialize {key}: {e}"));
+            let deserialized: FileSubgraph =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("deserialize {key}: {e}"));
+            restored.upsert_subgraph(key.to_string(), deserialized);
+        }
+
+        // The reloaded store must yield an identical graph (order-independent).
+        assert_multiset_eq(&restored.graph(), &store.graph());
     }
 
     #[test]

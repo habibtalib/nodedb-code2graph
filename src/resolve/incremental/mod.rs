@@ -19,4 +19,5 @@ mod subgraph;
 
 pub(crate) use stitch::{GlobalIndex, stitch};
 pub use store::IncrementalGraph;
-pub(crate) use subgraph::{FileSubgraph, build_subgraph};
+pub use subgraph::FileSubgraph;
+pub(crate) use subgraph::build_subgraph;

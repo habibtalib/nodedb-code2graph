@@ -34,12 +34,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references,
-    definition_bindings, field_text, import_bindings, innermost_scope, node_span, node_text,
-    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, child_text,
+    collect_call_references, definition_bindings, field_text, import_bindings, innermost_scope,
+    make_symbol, node_span, node_text, one_line_signature, push_binding, push_ref, push_scope,
+    push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -83,6 +84,11 @@ impl Extractor for KotlinExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Kotlin,
+        };
         let ns_strings = kotlin_namespaces(&root, bytes, file);
         let ns_descriptors: Vec<Descriptor> = ns_strings
             .iter()
@@ -91,7 +97,7 @@ impl Extractor for KotlinExtractor {
             .collect();
 
         let mut defs = Vec::new();
-        collect_decls(root, &ns_descriptors, false, bytes, file, &mut defs);
+        collect_decls(root, &ns_descriptors, false, &ctx, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Kotlin, &ns_strings, file, source.len());
@@ -208,32 +214,25 @@ fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
 // ── Symbol builder ───────────────────────────────────────────────────────────
 
 /// Build a [`Symbol`] and push it onto `out`.
-///
-/// `kind_vis` bundles `(SymbolKind, Visibility)` into one parameter to keep
-/// the total argument count within clippy's `too_many_arguments` limit (≤ 7).
 fn push_symbol(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: &Node,
     name: String,
-    kind_vis: (SymbolKind, Visibility),
+    kind: SymbolKind,
+    visibility: Visibility,
     descriptors: Vec<Descriptor>,
-    bytes: &[u8],
-    file: &str,
 ) {
-    let (kind, visibility) = kind_vis;
-    out.push(Symbol {
-        id: SymbolId::global(Language::Kotlin.as_str(), descriptors),
+    let signature = one_line_signature(node_text(node, ctx.bytes), &['{', '\n']);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
         visibility,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', '\n']),
-    });
+        descriptors,
+        signature,
+    ));
 }
 
 /// Emit a Type symbol for `type_name` and recurse into its body for members.
@@ -243,33 +242,31 @@ fn push_symbol(
 /// recurse into the body. Both `class_body` and `enum_class_body` are treated
 /// as bodies — an `enum_class_body` only ever appears under a class, so checking
 /// for it unconditionally is harmless for objects/companions.
-///
-/// `kind_vis` bundles `(SymbolKind, Visibility)` to keep argument count ≤ 7.
 fn emit_type_and_body(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: Node,
     type_name: String,
-    kind_vis: (SymbolKind, Visibility),
+    kind: SymbolKind,
+    visibility: Visibility,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
 ) {
     let mut type_descriptors = prefix.to_vec();
     type_descriptors.push(Descriptor::Type(type_name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         type_name,
-        kind_vis,
+        kind,
+        visibility,
         type_descriptors.clone(),
-        bytes,
-        file,
     );
 
     let mut body_cursor = node.walk();
     for body_child in node.children(&mut body_cursor) {
         if matches!(body_child.kind(), "class_body" | "enum_class_body") {
-            collect_decls(body_child, &type_descriptors, true, bytes, file, out);
+            collect_decls(body_child, &type_descriptors, true, ctx, out);
         }
     }
 }
@@ -286,23 +283,20 @@ fn collect_decls(
     container: Node,
     prefix: &[Descriptor],
     inside_type: bool,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
     let mut cursor = container.walk();
     for child in container.children(&mut cursor) {
         match child.kind() {
-            "class_declaration" => handle_class(child, prefix, bytes, file, out),
-            "object_declaration" => handle_object(child, prefix, bytes, file, out),
-            "companion_object" => handle_companion(child, prefix, bytes, file, out),
-            "function_declaration" => handle_function(child, prefix, inside_type, bytes, file, out),
-            "property_declaration" => handle_property(child, prefix, bytes, file, out),
-            "type_alias" => handle_typealias(child, prefix, bytes, file, out),
-            "enum_entry" => handle_enum_entry(child, prefix, bytes, file, out),
-            "secondary_constructor" => {
-                handle_secondary_constructor(child, prefix, bytes, file, out)
-            }
+            "class_declaration" => handle_class(child, prefix, ctx, out),
+            "object_declaration" => handle_object(child, prefix, ctx, out),
+            "companion_object" => handle_companion(child, prefix, ctx, out),
+            "function_declaration" => handle_function(child, prefix, inside_type, ctx, out),
+            "property_declaration" => handle_property(child, prefix, ctx, out),
+            "type_alias" => handle_typealias(child, prefix, ctx, out),
+            "enum_entry" => handle_enum_entry(child, prefix, ctx, out),
+            "secondary_constructor" => handle_secondary_constructor(child, prefix, ctx, out),
             _ => {}
         }
     }
@@ -310,18 +304,12 @@ fn collect_decls(
 
 /// Handle `class_declaration` — covers class/data class/sealed class/annotation
 /// class (→ Class), interface (→ Interface), and enum class (→ Enum).
-fn handle_class(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn handle_class(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     let name_node = match node.child_by_field_name("name") {
         Some(n) => n,
         None => return,
     };
-    let type_name = node_text(&name_node, bytes).to_owned();
+    let type_name = node_text(&name_node, ctx.bytes).to_owned();
 
     // Determine kind: enum_class_body → Enum; "interface" keyword before name → Interface; else Class.
     let sym_kind = if node
@@ -331,8 +319,9 @@ fn handle_class(
         SymbolKind::Enum
     } else {
         // Scan text from node start up to the name node start for "interface".
-        let prefix_text = std::str::from_utf8(&bytes[node.start_byte()..name_node.start_byte()])
-            .unwrap_or_default();
+        let prefix_text =
+            std::str::from_utf8(&ctx.bytes[node.start_byte()..name_node.start_byte()])
+                .unwrap_or_default();
         if prefix_text.split_whitespace().any(|w| w == "interface") {
             SymbolKind::Interface
         } else {
@@ -340,58 +329,30 @@ fn handle_class(
         }
     };
 
-    let vis = read_visibility(&node, bytes);
-    emit_type_and_body(out, node, type_name, (sym_kind, vis), prefix, bytes, file);
+    let vis = read_visibility(&node, ctx.bytes);
+    emit_type_and_body(out, ctx, node, type_name, sym_kind, vis, prefix);
 }
 
 /// Handle `object_declaration` (singleton object → SymbolKind::Class).
-fn handle_object(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let type_name = match field_text(&node, "name", bytes) {
+fn handle_object(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let type_name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
 
-    let vis = read_visibility(&node, bytes);
-    emit_type_and_body(
-        out,
-        node,
-        type_name,
-        (SymbolKind::Class, vis),
-        prefix,
-        bytes,
-        file,
-    );
+    let vis = read_visibility(&node, ctx.bytes);
+    emit_type_and_body(out, ctx, node, type_name, SymbolKind::Class, vis, prefix);
 }
 
 /// Handle `companion_object` (nested companion → SymbolKind::Class).
 ///
 /// The `name` field may be absent (anonymous `companion object`); in that case
 /// the conventional name "Companion" is used.
-fn handle_companion(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let type_name = field_text(&node, "name", bytes).unwrap_or_else(|| "Companion".to_owned());
+fn handle_companion(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let type_name = field_text(&node, "name", ctx.bytes).unwrap_or_else(|| "Companion".to_owned());
 
-    let vis = read_visibility(&node, bytes);
-    emit_type_and_body(
-        out,
-        node,
-        type_name,
-        (SymbolKind::Class, vis),
-        prefix,
-        bytes,
-        file,
-    );
+    let vis = read_visibility(&node, ctx.bytes);
+    emit_type_and_body(out, ctx, node, type_name, SymbolKind::Class, vis, prefix);
 }
 
 /// Handle `function_declaration`.
@@ -401,11 +362,10 @@ fn handle_function(
     node: Node,
     prefix: &[Descriptor],
     inside_type: bool,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let name = match field_text(&node, "name", bytes) {
+    let name = match field_text(&node, "name", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
@@ -414,13 +374,13 @@ fn handle_function(
     } else {
         SymbolKind::Function
     };
-    let vis = read_visibility(&node, bytes);
+    let vis = read_visibility(&node, ctx.bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: name.clone(),
         disambiguator: String::new(),
     });
-    push_symbol(out, &node, name, (kind, vis), descriptors, bytes, file);
+    push_symbol(out, ctx, &node, name, kind, vis, descriptors);
 }
 
 /// Handle `property_declaration`.
@@ -428,13 +388,7 @@ fn handle_function(
 /// The name lives inside a `variable_declaration` child (→ its `identifier`
 /// child). `val` → Const; `var` → Static. Multi-variable destructuring
 /// (`multi_variable_declaration`) is skipped gracefully.
-fn handle_property(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn handle_property(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     // Find name from variable_declaration → identifier.
     let var_name: Option<String> = {
         let mut found = None;
@@ -445,7 +399,7 @@ fn handle_property(
                 let mut vc = child.walk();
                 for vc_child in child.children(&mut vc) {
                     if vc_child.kind() == "identifier" {
-                        found = Some(node_text(&vc_child, bytes).to_owned());
+                        found = Some(node_text(&vc_child, ctx.bytes).to_owned());
                         break;
                     }
                 }
@@ -470,69 +424,49 @@ fn handle_property(
     } else {
         SymbolKind::Const
     };
-    let vis = read_visibility(&node, bytes);
+    let vis = read_visibility(&node, ctx.bytes);
 
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(var_name.clone()));
-    push_symbol(out, &node, var_name, (kind, vis), descriptors, bytes, file);
+    push_symbol(out, ctx, &node, var_name, kind, vis, descriptors);
 }
 
 /// Handle `type_alias`.
 ///
 /// The alias name is in the `type` field (grammar quirk).
-fn handle_typealias(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
-    let name = match field_text(&node, "type", bytes) {
+fn handle_typealias(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
+    let name = match field_text(&node, "type", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
-    let vis = read_visibility(&node, bytes);
+    let vis = read_visibility(&node, ctx.bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
     push_symbol(
         out,
+        ctx,
         &node,
         name,
-        (SymbolKind::TypeAlias, vis),
+        SymbolKind::TypeAlias,
+        vis,
         descriptors,
-        bytes,
-        file,
     );
 }
 
 /// Handle `enum_entry` (cases inside `enum_class_body`).
 ///
 /// The entry name is in an `identifier` child.
-fn handle_enum_entry(
-    node: Node,
-    prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn handle_enum_entry(node: Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     // enum_entry has an identifier child (the case name).
-    let name = match child_text(&node, "identifier", bytes) {
+    let name = match child_text(&node, "identifier", ctx.bytes) {
         Some(n) => n,
         None => return,
     };
     // Enum entries do not carry a visibility modifier; they are always public.
-    let vis = read_visibility(&node, bytes);
+    let vis = read_visibility(&node, ctx.bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(name.clone()));
-    push_symbol(
-        out,
-        &node,
-        name,
-        (SymbolKind::Const, vis),
-        descriptors,
-        bytes,
-        file,
-    );
+    push_symbol(out, ctx, &node, name, SymbolKind::Const, vis, descriptors);
 }
 
 /// Handle `secondary_constructor` inside a class body.
@@ -541,11 +475,10 @@ fn handle_enum_entry(
 fn handle_secondary_constructor(
     node: Node,
     prefix: &[Descriptor],
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
-    let vis = read_visibility(&node, bytes);
+    let vis = read_visibility(&node, ctx.bytes);
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Method {
         name: "constructor".to_owned(),
@@ -553,12 +486,12 @@ fn handle_secondary_constructor(
     });
     push_symbol(
         out,
+        ctx,
         &node,
         "constructor".to_owned(),
-        (SymbolKind::Method, vis),
+        SymbolKind::Method,
+        vis,
         descriptors,
-        bytes,
-        file,
     );
 }
 

@@ -9,7 +9,7 @@
 
 use code2graph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
 use code2graph_eval::corpus::{Case, load_corpus};
-use code2graph_eval::runner::{corpus_total, per_language, score_case};
+use code2graph_eval::runner::{corpus_total, corpus_total_tiered, per_language, score_case};
 use std::path::Path;
 
 fn corpus() -> Vec<Case> {
@@ -20,6 +20,90 @@ fn corpus() -> Vec<Case> {
 /// Cases in a given language directory.
 fn cases_in<'a>(cases: &'a [Case], lang: &str) -> Vec<&'a Case> {
     cases.iter().filter(|c| c.lang == lang).collect()
+}
+
+// ── C7: LayeredResolver density tests ────────────────────────────────────────
+
+/// Tightening the confidence cutoff can only remove edges, never add them, so
+/// recall is non-increasing as the threshold rises: Heuristic ≥ NameOnly ≥
+/// Scoped ≥ Exact.
+#[test]
+fn layered_recall_is_monotonic_non_increasing() {
+    let cases = corpus();
+    let t = corpus_total_tiered(&cases);
+    assert!(
+        t.heuristic.recall() >= t.name_only.recall(),
+        "recall@Heuristic ({:.4}) must be >= recall@NameOnly ({:.4})",
+        t.heuristic.recall(),
+        t.name_only.recall()
+    );
+    assert!(
+        t.name_only.recall() >= t.scoped.recall(),
+        "recall@NameOnly ({:.4}) must be >= recall@Scoped ({:.4})",
+        t.name_only.recall(),
+        t.scoped.recall()
+    );
+    assert!(
+        t.scoped.recall() >= t.exact.recall(),
+        "recall@Scoped ({:.4}) must be >= recall@Exact ({:.4})",
+        t.scoped.recall(),
+        t.exact.recall()
+    );
+}
+
+/// The density thesis: `LayeredResolver` at the Heuristic (all-edges) cutoff
+/// achieves recall at least as good as each individual resolver alone over the
+/// same corpus. The union can only add edges, never remove them, so the layered
+/// recall is an upper bound on any single layer's recall.
+#[test]
+fn layered_recall_at_heuristic_beats_each_single_tier() {
+    let cases = corpus();
+    let layered = corpus_total_tiered(&cases);
+    let layered_recall = layered.heuristic.recall();
+
+    let name_recall = corpus_total(&cases, &SymbolTableResolver).recall();
+    let scope_recall = corpus_total(&cases, &ScopeGraphResolver).recall();
+    let ffi_recall = corpus_total(&cases, &FfiBridgeResolver).recall();
+
+    assert!(
+        layered_recall >= name_recall,
+        "LayeredResolver recall@Heuristic ({:.4}) must be >= SymbolTableResolver recall ({:.4})",
+        layered_recall,
+        name_recall
+    );
+    assert!(
+        layered_recall >= scope_recall,
+        "LayeredResolver recall@Heuristic ({:.4}) must be >= ScopeGraphResolver recall ({:.4})",
+        layered_recall,
+        scope_recall
+    );
+    assert!(
+        layered_recall >= ffi_recall,
+        "LayeredResolver recall@Heuristic ({:.4}) must be >= FfiBridgeResolver recall ({:.4})",
+        layered_recall,
+        ffi_recall
+    );
+}
+
+/// Precision is non-decreasing as the cutoff tightens: the strict end (Exact)
+/// is at least as precise as the dense end (Heuristic). Only compared when the
+/// Exact tier has predicted edges; if there are none, `Scorecard::precision()`
+/// returns `1.0` for an empty claim (no false positives possible), which already
+/// satisfies the invariant against any Heuristic precision ≤ 1.0.
+#[test]
+fn layered_precision_improves_toward_exact() {
+    let cases = corpus();
+    let t = corpus_total_tiered(&cases);
+
+    // `Scorecard::precision()` returns `1.0` when TP+FP == 0 (empty claim set).
+    // This is the library's convention: an empty claim is perfectly precise.
+    // So the comparison is always valid — we never need to guard against NaN.
+    assert!(
+        t.exact.precision() >= t.heuristic.precision(),
+        "precision@Exact ({:.4}) must be >= precision@Heuristic ({:.4})",
+        t.exact.precision(),
+        t.heuristic.precision()
+    );
 }
 
 #[test]

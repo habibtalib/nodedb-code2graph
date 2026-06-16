@@ -89,6 +89,38 @@ impl Scorecard {
     }
 }
 
+/// Precision+recall of one resolver's graph at each confidence cutoff.
+///
+/// Each field is the scorecard of `graph.min_confidence(tier)`: tightening the
+/// cutoff keeps fewer edges, so recall is non-increasing (`Heuristic` → `Exact`)
+/// while precision rises (fewer false positives relative to true positives).
+///
+/// The `Heuristic` field represents **all** edges (no filtering), because
+/// `Confidence::Heuristic` is the lowest variant and `min_confidence` keeps
+/// every edge at or above it.
+#[derive(Default)]
+pub struct TieredScorecard {
+    /// `graph.min_confidence(Confidence::Heuristic)` — all edges.
+    pub heuristic: Scorecard,
+    /// `graph.min_confidence(Confidence::NameOnly)` — drops `Heuristic` edges.
+    pub name_only: Scorecard,
+    /// `graph.min_confidence(Confidence::Scoped)` — drops `Heuristic` + `NameOnly`.
+    pub scoped: Scorecard,
+    /// `graph.min_confidence(Confidence::Exact)` — keeps only `Exact` edges.
+    pub exact: Scorecard,
+}
+
+impl TieredScorecard {
+    /// Fold another `TieredScorecard`'s tallies into this one (for per-language
+    /// or whole-corpus aggregation).
+    pub fn merge(&mut self, other: &TieredScorecard) {
+        self.heuristic.merge(&other.heuristic);
+        self.name_only.merge(&other.name_only);
+        self.scoped.merge(&other.scoped);
+        self.exact.merge(&other.exact);
+    }
+}
+
 /// Project a resolved [`CodeGraph`] into the located-edge space and score it
 /// against the expected set.
 ///

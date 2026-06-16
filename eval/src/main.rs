@@ -8,8 +8,10 @@
 
 use code2graph::{FfiBridgeResolver, ScopeGraphResolver, SymbolTableResolver};
 use code2graph_eval::corpus::load_corpus;
-use code2graph_eval::runner::{corpus_total, per_language};
-use code2graph_eval::score::Scorecard;
+use code2graph_eval::runner::{
+    corpus_total, corpus_total_tiered, per_language, per_language_tiered,
+};
+use code2graph_eval::score::{Scorecard, TieredScorecard};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -71,7 +73,55 @@ fn main() -> ExitCode {
     let totals: Vec<&Scorecard> = tiers.iter().map(|t| &t.total).collect();
     print_row("ALL", &totals);
     println!("\nP = precision, R = recall, F1 = harmonic mean (ref→def edges).");
+
+    // ── Layered (dense) — recall@tier ────────────────────────────────────────
+    let tiered_by_lang = per_language_tiered(&cases);
+    let tiered_total = corpus_total_tiered(&cases);
+
+    println!("\nLayered (dense) — recall@tier\n");
+    print_tiered_header();
+    for lang in &langs {
+        if let Some(ts) = tiered_by_lang.get(*lang) {
+            print_tiered_row(lang, ts);
+        }
+    }
+    print_tiered_divider();
+    print_tiered_row("ALL", &tiered_total);
+    println!(
+        "\nR@Heur = recall at Heuristic (all edges), R@Name = NameOnly+, \
+         R@Scoped = Scoped+, R@Exact = Exact only, P@Exact = precision at Exact."
+    );
+
     ExitCode::SUCCESS
+}
+
+fn print_tiered_header() {
+    print!("{:<12}", "language");
+    print!(
+        " │ {:>6} {:>6} {:>6} {:>6} {:>7}",
+        "R@Heur", "R@Name", "R@Scpd", "R@Exct", "P@Exct"
+    );
+    println!();
+    print_tiered_divider();
+}
+
+fn print_tiered_divider() {
+    print!("{:-<12}", "");
+    print!("-┼{:-<41}", "");
+    println!();
+}
+
+fn print_tiered_row(label: &str, ts: &TieredScorecard) {
+    print!("{:<12}", label);
+    print!(
+        " │ {:>6.2} {:>6.2} {:>6.2} {:>6.2} {:>7.2}",
+        ts.heuristic.recall(),
+        ts.name_only.recall(),
+        ts.scoped.recall(),
+        ts.exact.recall(),
+        ts.exact.precision(),
+    );
+    println!();
 }
 
 fn print_header(tiers: &[TierReport]) {

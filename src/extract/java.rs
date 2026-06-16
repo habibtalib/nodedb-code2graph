@@ -20,12 +20,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -62,7 +62,12 @@ impl Extractor for JavaExtractor {
         let bytes = source.as_bytes();
         let namespaces = java_namespaces(&root, bytes, file);
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Java,
+        };
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Java, &namespaces, file, source.len());
@@ -133,7 +138,7 @@ fn java_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
         .collect()
 }
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
 
     // Walk root's direct children for top-level type declarations.
@@ -147,7 +152,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             _ => continue,
         };
 
-        let Some(type_name) = field_text(&child, "name", bytes) else {
+        let Some(type_name) = field_text(&child, "name", ctx.bytes) else {
             continue;
         };
 
@@ -165,19 +170,15 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             .map(Descriptor::Namespace)
             .collect();
         type_descriptors.push(Descriptor::Type(type_name.clone()));
-        out.push(Symbol {
-            id: SymbolId::global(Language::Java.as_str(), type_descriptors),
-            name: type_name.clone(),
-            kind: type_sym_kind,
-            visibility: read_visibility(&child, bytes, false),
-            file: file.to_owned(),
-            line: (child.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: child.start_byte(),
-                end: child.end_byte(),
-            },
-            signature: one_line_signature(node_text(&child, bytes), &['{', ';']),
-        });
+        out.push(make_symbol(
+            ctx,
+            &child,
+            type_name.clone(),
+            type_sym_kind,
+            read_visibility(&child, ctx.bytes, false),
+            type_descriptors,
+            one_line_signature(node_text(&child, ctx.bytes), &['{', ';']),
+        ));
 
         // Members are implicitly public for interfaces and annotation types.
         let implicit_public = matches!(
@@ -192,8 +193,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 
         collect_members(
             &body,
-            bytes,
-            file,
+            ctx,
             namespaces,
             &type_name,
             implicit_public,
@@ -211,8 +211,7 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 /// descend into that extra level automatically.
 fn collect_members(
     body: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     namespaces: &[String],
     type_name: &str,
     implicit_public: bool,
@@ -222,18 +221,10 @@ fn collect_members(
         match member.kind() {
             // enum methods/fields live one level deeper inside enum_body_declarations.
             "enum_body_declarations" => {
-                collect_members(
-                    &member,
-                    bytes,
-                    file,
-                    namespaces,
-                    type_name,
-                    implicit_public,
-                    out,
-                );
+                collect_members(&member, ctx, namespaces, type_name, implicit_public, out);
             }
             "method_declaration" | "constructor_declaration" => {
-                let Some(name) = field_text(&member, "name", bytes) else {
+                let Some(name) = field_text(&member, "name", ctx.bytes) else {
                     continue;
                 };
                 let mut descriptors: Vec<Descriptor> = namespaces
@@ -246,26 +237,22 @@ fn collect_members(
                     name: name.clone(),
                     disambiguator: String::new(),
                 });
-                out.push(Symbol {
-                    id: SymbolId::global(Language::Java.as_str(), descriptors),
+                out.push(make_symbol(
+                    ctx,
+                    &member,
                     name,
-                    kind: SymbolKind::Method,
-                    visibility: read_visibility(&member, bytes, implicit_public),
-                    file: file.to_owned(),
-                    line: (member.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: member.start_byte(),
-                        end: member.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(&member, bytes), &['{', ';']),
-                });
+                    SymbolKind::Method,
+                    read_visibility(&member, ctx.bytes, implicit_public),
+                    descriptors,
+                    one_line_signature(node_text(&member, ctx.bytes), &['{', ';']),
+                ));
             }
             "field_declaration" => {
                 // A single field_declaration may declare multiple variables.
-                let field_vis = read_visibility(&member, bytes, implicit_public);
+                let field_vis = read_visibility(&member, ctx.bytes, implicit_public);
                 let mut cursor = member.walk();
                 for declarator in member.children_by_field_name("declarator", &mut cursor) {
-                    let Some(var_name) = field_text(&declarator, "name", bytes) else {
+                    let Some(var_name) = field_text(&declarator, "name", ctx.bytes) else {
                         continue;
                     };
                     let mut descriptors: Vec<Descriptor> = namespaces
@@ -275,19 +262,15 @@ fn collect_members(
                         .collect();
                     descriptors.push(Descriptor::Type(type_name.to_owned()));
                     descriptors.push(Descriptor::Term(var_name.clone()));
-                    out.push(Symbol {
-                        id: SymbolId::global(Language::Java.as_str(), descriptors),
-                        name: var_name,
-                        kind: SymbolKind::Static,
-                        visibility: field_vis,
-                        file: file.to_owned(),
-                        line: (member.start_position().row + 1) as u32,
-                        span: ByteSpan {
-                            start: member.start_byte(),
-                            end: member.end_byte(),
-                        },
-                        signature: one_line_signature(node_text(&member, bytes), &['{', ';']),
-                    });
+                    out.push(make_symbol(
+                        ctx,
+                        &member,
+                        var_name,
+                        SymbolKind::Static,
+                        field_vis,
+                        descriptors,
+                        one_line_signature(node_text(&member, ctx.bytes), &['{', ';']),
+                    ));
                 }
             }
             _ => {}

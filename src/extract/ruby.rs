@@ -29,12 +29,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, innermost_scope, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, innermost_scope, make_symbol, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing explicit call-callee identifiers.
@@ -77,6 +77,12 @@ impl Extractor for RubyExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
 
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Ruby,
+        };
+
         let ns_strings = ruby_namespaces(file);
         let namespaces: Vec<Descriptor> = ns_strings
             .iter()
@@ -85,7 +91,7 @@ impl Extractor for RubyExtractor {
             .collect();
 
         let mut defs = Vec::new();
-        walk(&root, &namespaces, bytes, file, &mut defs);
+        walk(&root, &namespaces, &ctx, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -142,11 +148,11 @@ fn ruby_namespaces(file: &str) -> Vec<String> {
 /// Methods push a `Descriptor::Method` and do not recurse (inner defs are rare
 /// and would produce confusing qualified names). Constant assignments push a
 /// `Descriptor::Term`.
-fn walk(node: &Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut Vec<Symbol>) {
+fn walk(node: &Node, prefix: &[Descriptor], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     for child in node.children(&mut node.walk()) {
         match child.kind() {
             "class" | "module" => {
-                let Some(name) = field_text(&child, "name", bytes) else {
+                let Some(name) = field_text(&child, "name", ctx.bytes) else {
                     continue;
                 };
                 let kind = if child.kind() == "class" {
@@ -157,14 +163,14 @@ fn walk(node: &Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut 
                 let mut descriptors = prefix.to_vec();
                 descriptors.push(Descriptor::Type(name.clone()));
                 if let Some(body) = child.child_by_field_name("body") {
-                    push_symbol(out, &child, name, kind, descriptors.clone(), bytes, file);
-                    walk(&body, &descriptors, bytes, file, out);
+                    push_symbol(out, ctx, &child, name, kind, descriptors.clone());
+                    walk(&body, &descriptors, ctx, out);
                 } else {
-                    push_symbol(out, &child, name, kind, descriptors, bytes, file);
+                    push_symbol(out, ctx, &child, name, kind, descriptors);
                 }
             }
             "method" | "singleton_method" => {
-                let Some(name) = field_text(&child, "name", bytes) else {
+                let Some(name) = field_text(&child, "name", ctx.bytes) else {
                     continue;
                 };
                 let mut descriptors = prefix.to_vec();
@@ -172,15 +178,7 @@ fn walk(node: &Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut 
                     name: name.clone(),
                     disambiguator: String::new(),
                 });
-                push_symbol(
-                    out,
-                    &child,
-                    name,
-                    SymbolKind::Method,
-                    descriptors,
-                    bytes,
-                    file,
-                );
+                push_symbol(out, ctx, &child, name, SymbolKind::Method, descriptors);
                 // Do not recurse into method bodies — inner defs would produce
                 // misleading qualified names and are not top-level API surface.
             }
@@ -188,18 +186,10 @@ fn walk(node: &Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut 
                 // Constant assignment: the left-hand side is a `constant` node.
                 if let Some(left) = child.child_by_field_name("left") {
                     if left.kind() == "constant" {
-                        let name = node_text(&left, bytes).to_owned();
+                        let name = node_text(&left, ctx.bytes).to_owned();
                         let mut descriptors = prefix.to_vec();
                         descriptors.push(Descriptor::Term(name.clone()));
-                        push_symbol(
-                            out,
-                            &child,
-                            name,
-                            SymbolKind::Const,
-                            descriptors,
-                            bytes,
-                            file,
-                        );
+                        push_symbol(out, ctx, &child, name, SymbolKind::Const, descriptors);
                     }
                 }
             }
@@ -211,28 +201,24 @@ fn walk(node: &Node, prefix: &[Descriptor], bytes: &[u8], file: &str, out: &mut 
 /// Build a [`Symbol`] and push it onto `out`.
 fn push_symbol(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: &Node,
     name: String,
     kind: SymbolKind,
     descriptors: Vec<Descriptor>,
-    bytes: &[u8],
-    file: &str,
 ) {
-    out.push(Symbol {
-        id: SymbolId::global(Language::Ruby.as_str(), descriptors),
+    // Empty stop slice → first-line fallback, which is correct for Ruby's
+    // `end`-terminated blocks (no `{` to split on).
+    let signature = one_line_signature(node_text(node, ctx.bytes), &[]);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
-        visibility: Visibility::Unknown,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        // Empty stop slice → first-line fallback, which is correct for Ruby's
-        // `end`-terminated blocks (no `{` to split on).
-        signature: one_line_signature(node_text(node, bytes), &[]),
-    });
+        Visibility::Unknown,
+        descriptors,
+        signature,
+    ));
 }
 
 /// Recursively walk `node` collecting `Inherit` references for every `class`

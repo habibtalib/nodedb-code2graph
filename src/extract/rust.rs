@@ -211,8 +211,90 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             },
             signature: one_line_signature(node_text(&child, bytes), &['{']),
         });
+
+        // For inherent impl blocks, also emit symbols for their pub members.
+        // Trait-impl members are deferred: the call qualifier is `self`, not the
+        // type, and method extraction risks collisions with inherent methods.
+        if kind == SymbolKind::Impl && child.child_by_field_name("trait").is_none() {
+            let type_name = leaf.name().to_owned();
+            collect_impl_members(&child, bytes, file, namespaces, &type_name, &mut out);
+        }
     }
     out
+}
+
+/// Walk an inherent `impl_item` node and emit `pub` member symbols.
+///
+/// Covers `function_item` members (→ [`SymbolKind::Method`]) and `const_item`
+/// members (→ [`SymbolKind::Const`]) found in the `declaration_list` body.
+/// Non-`pub` members are skipped (consistent with the top-level extractor policy).
+///
+/// Descriptors: `namespaces.map(Namespace) ++ [Type(type_name), Method/Term(member_name)]`.
+/// SCIP renders e.g. `…/Foo#new().` for a method and `…/Foo#MAX.` for a const.
+fn collect_impl_members(
+    impl_node: &Node,
+    bytes: &[u8],
+    file: &str,
+    namespaces: &[String],
+    type_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    // The `body` field is the `declaration_list` — use the field accessor
+    // (idiomatic here; `scope_dfs` / `collect_bindings_dfs` do the same).
+    let Some(body) = impl_node.child_by_field_name("body") else {
+        return;
+    };
+
+    for member in body.children(&mut body.walk()) {
+        let (kind, leaf) = match member.kind() {
+            "function_item" if is_fully_pub(&member, bytes) => {
+                // Reuse the same name-extraction the top-level function_item arm uses.
+                let Some(name) = child_text(&member, "identifier", bytes) else {
+                    continue;
+                };
+                (
+                    SymbolKind::Method,
+                    Descriptor::Method {
+                        name,
+                        disambiguator: String::new(),
+                    },
+                )
+            }
+            "const_item" if is_fully_pub(&member, bytes) => {
+                // Reuse the same name-extraction the top-level const_item arm uses.
+                let Some(name) = child_text(&member, "identifier", bytes) else {
+                    continue;
+                };
+                (SymbolKind::Const, Descriptor::Term(name))
+            }
+            _ => continue,
+        };
+
+        // Build descriptors: namespaces + Type(type_name) + member leaf.
+        // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
+        let sym_name = leaf.name().to_owned();
+        let mut descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
+        descriptors.push(Descriptor::Type(type_name.to_owned()));
+        descriptors.push(leaf);
+
+        out.push(Symbol {
+            id: SymbolId::global(Language::Rust.as_str(), descriptors),
+            name: sym_name,
+            kind,
+            file: file.to_owned(),
+            line: (member.start_position().row + 1) as u32,
+            span: ByteSpan {
+                start: member.start_byte(),
+                end: member.end_byte(),
+            },
+            // Use the same stop-char as the top-level function_item / const_item arms.
+            signature: one_line_signature(node_text(&member, bytes), &['{']),
+        });
+    }
 }
 
 /// True if the node's first `visibility_modifier` child is bare `pub`.
@@ -2317,6 +2399,141 @@ impl std::fmt::Display for Point {
         assert!(
             field_reads.is_empty(),
             "field 'field' in field_expression must NOT be a Read ref; got: {field_reads:?}"
+        );
+    }
+
+    // ── assoc fn / assoc const extraction (unit C3) ───────────────────────────
+
+    #[test]
+    fn assoc_fn_symbol_emitted_for_pub_new() {
+        // `pub fn new()` in an inherent impl → SymbolKind::Method, SCIP ends `Foo#new().`
+        let src = "pub struct Foo; impl Foo { pub fn new() -> Self { Foo } }";
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "new" && s.kind == SymbolKind::Method)
+            .expect("expected a Method symbol named 'new'");
+        assert!(
+            sym.id.to_scip_string().ends_with("Foo#new()."),
+            "SCIP string should end with 'Foo#new().', got: {}",
+            sym.id.to_scip_string()
+        );
+    }
+
+    #[test]
+    fn assoc_const_symbol_emitted_for_pub_const() {
+        // `pub const MAX: u32 = 3;` in an inherent impl → SymbolKind::Const, SCIP ends `Foo#MAX.`
+        let src = "pub struct Foo; impl Foo { pub const MAX: u32 = 3; }";
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "MAX" && s.kind == SymbolKind::Const)
+            .expect("expected a Const symbol named 'MAX'");
+        assert!(
+            sym.id.to_scip_string().ends_with("Foo#MAX."),
+            "SCIP string should end with 'Foo#MAX.', got: {}",
+            sym.id.to_scip_string()
+        );
+    }
+
+    #[test]
+    fn method_with_self_is_emitted() {
+        // `pub fn run(&self)` in an inherent impl → SymbolKind::Method, SCIP ends `Foo#run().`
+        let src = "pub struct Foo; impl Foo { pub fn run(&self) {} }";
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "run" && s.kind == SymbolKind::Method)
+            .expect("expected a Method symbol named 'run'");
+        assert!(
+            sym.id.to_scip_string().ends_with("Foo#run()."),
+            "SCIP string should end with 'Foo#run().', got: {}",
+            sym.id.to_scip_string()
+        );
+    }
+
+    #[test]
+    fn non_pub_member_excluded() {
+        // `fn secret(&self) {}` (no `pub`) → NO symbol named "secret"
+        let src = "pub struct Foo; impl Foo { fn secret(&self) {} }";
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+        let secret = facts.symbols.iter().find(|s| s.name == "secret");
+        assert!(
+            secret.is_none(),
+            "private method 'secret' must NOT be emitted as a symbol, got: {:?}",
+            secret.map(|s| s.id.to_scip_string())
+        );
+    }
+
+    #[test]
+    fn trait_impl_members_excluded() {
+        // `impl std::fmt::Display for Point { fn fmt(...) }` →
+        // NO symbol named "fmt" under `Point#`; the `Impl` block symbol for
+        // `Point` is still emitted.
+        let src = r#"pub struct Point;
+impl std::fmt::Display for Point {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }
+}"#;
+        let facts = RustExtractor.extract(src, "src/foo.rs").unwrap();
+
+        // The Impl block symbol for Point is still emitted.
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|s| s.name == "Point" && s.kind == SymbolKind::Impl),
+            "Impl block symbol for 'Point' should still be emitted"
+        );
+        // No symbol named "fmt" under Point# should be emitted.
+        let fmt_under_point: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.name == "fmt" && s.id.to_scip_string().contains("Point#"))
+            .collect();
+        assert!(
+            fmt_under_point.is_empty(),
+            "trait-impl method 'fmt' must NOT be emitted under Point#, got: {:?}",
+            fmt_under_point
+                .iter()
+                .map(|s| s.id.to_scip_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cross_file_assoc_fn_call_resolves_to_impl_member() {
+        // The point of unit C3: `Point::new()` in main.rs must resolve to the
+        // `new` symbol in point.rs via a Call edge whose `to` ends with `Point#new().`.
+        use crate::resolve::{Resolver, SymbolTableResolver};
+
+        let point = RustExtractor
+            .extract(
+                "pub struct Point; impl Point { pub fn new() -> Self { Point } }",
+                "src/point.rs",
+            )
+            .unwrap();
+        let main = RustExtractor
+            .extract("pub fn run() { let _ = Point::new(); }", "src/main.rs")
+            .unwrap();
+
+        let graph = SymbolTableResolver.resolve(&[point, main]);
+
+        let call_to_new: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.role == RefRole::Call && e.to.to_scip_string().ends_with("Point#new()."))
+            .collect();
+        assert_eq!(
+            call_to_new.len(),
+            1,
+            "expected exactly one Call edge to Point#new().(), got: {:?}",
+            call_to_new
+                .iter()
+                .map(|e| format!("{} -> {}", e.from.to_scip_string(), e.to.to_scip_string()))
+                .collect::<Vec<_>>()
         );
     }
 }

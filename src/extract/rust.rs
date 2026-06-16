@@ -16,8 +16,8 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FfiAbi, FfiExport, FileFacts, RefRole, Reference, Scope,
-    ScopeId, ScopeKind, Symbol, SymbolKind, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FfiAbi, FfiExport, FileFacts, RefRole, Reference,
+    Scope, ScopeId, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -237,6 +237,12 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
             descriptors,
             signature,
         ));
+        // Populate entry-point markers for function definitions only.
+        if kind == SymbolKind::Function {
+            if let Some(sym) = out.last_mut() {
+                sym.entry_points = entry_points_for_rust(&sym_name, &child, bytes);
+            }
+        }
 
         // For inherent impl blocks, also emit symbols for their members (all
         // visibilities). Trait-impl members are deferred: the call qualifier is
@@ -427,6 +433,104 @@ fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
         Some(text) if text.starts_with("pub(") => Visibility::Internal,
         _ => Visibility::Private,
     }
+}
+
+/// Attribute path terminal identifiers that mark a Rust function as an HTTP route
+/// handler.
+///
+/// Detection rule (honest boundary): a function is an HTTP-route entry point when
+/// one of its outer `#[...]` attributes has a path whose terminal identifier is in
+/// this set. Terminal extraction: for a bare path like `#[get("/")]` the terminal
+/// is the text of the first named child of `attribute` (an `identifier`); for a
+/// qualified path like `#[actix_web::get("/")]` it is the `name:` field of the
+/// `scoped_identifier` first named child. Attributes NOT in this set (`#[derive(...)]`,
+/// `#[tokio::main]`, `#[no_mangle]`, `#[inline]`, `#[cfg(...)]`) produce no
+/// marker. Note that `#[tokio::main]` has terminal `main`, which is NOT in this
+/// set — it is correctly excluded. The `fn main` NAME check handles the
+/// entry-function regardless of such attributes.
+///
+/// Covers Actix-web and Rocket route attribute conventions. Cannot detect
+/// dynamically constructed route registrations or non-standard attribute aliases.
+const RUST_ROUTE_ATTRS: &[&str] = &[
+    "get", "post", "put", "delete", "patch", "head", "options", "route", "connect", "trace",
+];
+
+/// Compute entry-point markers for a top-level Rust function symbol.
+///
+/// `fn_name` is the bare function name (for `Main` detection).
+/// `func` is the `function_item` node whose outer attributes (preceding
+/// `attribute_item` siblings) are inspected for HTTP-route markers.
+///
+/// Node-kind path for route attribute detection (tree-sitter-rust grammar verified):
+/// ```text
+/// attribute_item                  ← preceding sibling of function_item
+///   attribute                     ← single named child (no field name)
+///     identifier                  ← first named child, bare: #[get("/")]
+///     OR
+///     scoped_identifier           ← first named child, qualified: #[actix_web::get("/")]
+///       name: identifier          ← `name` field → terminal = "get"
+/// ```
+/// The attribute node has no `path:` field in the grammar; the path node is the
+/// first named child of `attribute`. Attributes NOT in [`RUST_ROUTE_ATTRS`] (e.g.
+/// `#[derive(...)]`, `#[no_mangle]`, `#[inline]`) produce no marker.  Multiple
+/// matching attributes are all emitted (preserve order).
+///
+/// This reuses the same preceding-sibling walk that [`fn_ffi_exports`] uses —
+/// the only per-attribute difference is which terminal string we match.
+fn entry_points_for_rust(fn_name: &str, func: &Node, bytes: &[u8]) -> Vec<EntryPoint> {
+    let mut markers: Vec<EntryPoint> = Vec::new();
+
+    // (a) Name-based: a function literally named `main` → EntryPoint::Main.
+    if fn_name == "main" {
+        markers.push(EntryPoint::Main);
+    }
+
+    // (b) HTTP-route outer-attribute detection — walk preceding attribute_item siblings.
+    // Outer attributes in tree-sitter-rust are preceding siblings of the item node, not
+    // its children.  We walk backward until we encounter a non-attribute_item sibling,
+    // matching the same traversal used by fn_ffi_exports.
+    let mut sib = func.prev_sibling();
+    while let Some(node) = sib {
+        if node.kind() != "attribute_item" {
+            break;
+        }
+        // attribute_item has a single named child: the `attribute` node.
+        // The `attribute` node's path is its FIRST named child (an `identifier`
+        // or `scoped_identifier`) — tree-sitter-rust has no `path:` field on
+        // `attribute`; verified against node-types.json.
+        if let Some(attr) = node.named_children(&mut node.walk()).next() {
+            if attr.kind() == "attribute" {
+                // First named child of `attribute` is the macro path node.
+                if let Some(path_node) = attr.named_children(&mut attr.walk()).next() {
+                    // Extract the terminal identifier:
+                    //   - `identifier`        → its own text (bare #[get(...)])
+                    //   - `scoped_identifier` → its `name` field (qualified #[a::b::get(...)])
+                    let terminal = match path_node.kind() {
+                        "identifier" => node_text(&path_node, bytes),
+                        "scoped_identifier" => path_node
+                            .child_by_field_name("name")
+                            .map_or("", |n| node_text(&n, bytes)),
+                        _ => "",
+                    };
+                    if !terminal.is_empty() && RUST_ROUTE_ATTRS.contains(&terminal) {
+                        markers.push(EntryPoint::HttpRoute(terminal.to_owned()));
+                    }
+                }
+            }
+        }
+        sib = node.prev_sibling();
+    }
+
+    // The preceding-sibling walk visits attributes in bottom-up order (closest
+    // attribute first).  Reverse so markers appear in top-down source order.
+    // Main (from the name check) is always first regardless.
+    let main_count = markers
+        .iter()
+        .take_while(|m| matches!(m, EntryPoint::Main))
+        .count();
+    markers[main_count..].reverse();
+
+    markers
 }
 
 /// Collect cross-language export markers from top-level functions.
@@ -2717,6 +2821,161 @@ impl std::fmt::Display for Point {
             Visibility::Private,
             "private impl method should have Visibility::Private, got {:?}",
             sym.visibility
+        );
+    }
+
+    // ── Entry-point detection (E2) ────────────────────────────────────────────
+
+    /// Find a symbol by bare name in the extracted facts (panics if absent).
+    fn sym_by_name(facts: &crate::graph::types::FileFacts, name: &str) -> Symbol {
+        facts
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol '{name}' not found; symbols: {:?}",
+                    facts
+                        .symbols
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
+            .clone()
+    }
+
+    /// Render entry_points as a compact string for assertion messages.
+    fn ep_str(eps: &[EntryPoint]) -> String {
+        eps.iter()
+            .map(|ep| match ep {
+                EntryPoint::Main => "Main".to_owned(),
+                EntryPoint::HttpRoute(m) => format!("HttpRoute({m})"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn rust_entry_point_get_route() {
+        // `#[get("/")]` is an Actix-web/Rocket route attribute; terminal = "get".
+        let src = "#[get(\"/\")]\npub fn index() -> String { String::new() }";
+        let facts = RustExtractor.extract(src, "src/routes.rs").unwrap();
+        let sym = sym_by_name(&facts, "index");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "get"),
+            "expected HttpRoute(\"get\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn rust_entry_point_post_route() {
+        // `#[post("/users")]` → HttpRoute("post").
+        let src = "#[post(\"/users\")]\npub fn create() {}";
+        let facts = RustExtractor.extract(src, "src/routes.rs").unwrap();
+        let sym = sym_by_name(&facts, "create");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "post"),
+            "expected HttpRoute(\"post\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn rust_entry_point_non_route_attr_ignored() {
+        // `#[derive(Debug)]` and `#[inline]` are not route attrs — entry_points must be empty.
+        let src = "#[derive(Debug)]\n#[inline]\npub fn helper() {}";
+        let facts = RustExtractor.extract(src, "src/util.rs").unwrap();
+        let sym = sym_by_name(&facts, "helper");
+        assert!(
+            sym.entry_points.is_empty(),
+            "non-route attributes must not produce entry points; got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn rust_entry_point_main_fn_name() {
+        // A function literally named `main` → EntryPoint::Main.
+        let src = "pub fn main() {}";
+        let facts = RustExtractor.extract(src, "src/main.rs").unwrap();
+        let sym = sym_by_name(&facts, "main");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::Main),
+            "expected Main, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn rust_entry_point_plain_fn_empty() {
+        // A plain function with no special attribute or name → empty entry_points.
+        let src = "pub fn process() {}";
+        let facts = RustExtractor.extract(src, "src/util.rs").unwrap();
+        let sym = sym_by_name(&facts, "process");
+        assert!(
+            sym.entry_points.is_empty(),
+            "plain function must have no entry points; got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn rust_entry_point_qualified_path_terminal() {
+        // `#[actix_web::get("/")]` — qualified path; terminal identifier = "get".
+        let src = "#[actix_web::get(\"/\")]\npub fn scoped() {}";
+        let facts = RustExtractor.extract(src, "src/routes.rs").unwrap();
+        let sym = sym_by_name(&facts, "scoped");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "get"),
+            "expected HttpRoute(\"get\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn rust_entry_point_tokio_main_not_a_route() {
+        // `#[tokio::main]` has terminal `main` which is NOT in RUST_ROUTE_ATTRS,
+        // so it does NOT produce an HttpRoute. But `fn main` name → EntryPoint::Main.
+        let src = "#[tokio::main]\nasync fn main() {}";
+        let facts = RustExtractor.extract(src, "src/main.rs").unwrap();
+        let sym = sym_by_name(&facts, "main");
+        // Should have exactly Main, not an HttpRoute for "main".
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point (Main), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::Main),
+            "expected Main, got [{}]",
+            ep_str(&sym.entry_points)
         );
     }
 

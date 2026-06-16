@@ -42,12 +42,12 @@ Cross-language **FFI** is a property of language _pairs_, so it lives in its own
 
 | Language        | Extensions                              | Status | Calls | Imports | Inherit | Type-ref | Read/Write | Entry-pts | Notes                                                                 |
 | --------------- | --------------------------------------- | :----: | :---: | :-----: | :-----: | :------: | :--------: | :-------: | --------------------------------------------------------------------- |
-| Rust            | `.rs`                                   |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           | traits → inherit; FFI producer                                        |
+| Rust            | `.rs`                                   |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     | traits → inherit; FFI producer                                        |
 | TypeScript      | `.ts` `.tsx`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
 | JavaScript      | `.js` `.jsx` `.mjs` `.cjs`              |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      |           | via the TS engine; not separately oracle-scored                       |
 | Python          | `.py` `.pyi`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
-| Go              | `.go`                                   |   ⭐   |   ✓   |    ✓    |    —    |    ✓     |     ✓      |           | structural interfaces → no class inheritance                          |
-| Java            | `.java`                                 |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Go              | `.go`                                   |   ⭐   |   ✓   |    ✓    |    —    |    ✓     |     ✓      |     ✓     | structural interfaces → no class inheritance                          |
+| Java            | `.java`                                 |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
 | C               | `.c` `.h`                               |   ⭐   |   ✓   |    —    |    —    |    ✓     |     ✓      |           | no import graph                                                       |
 | C++             | `.cc` `.cpp` `.cxx` `.hh` `.hpp` `.hxx` |   ⭐   |   ✓   |    —    |    ✓    |    ✓     |     ✓      |           |                                                                       |
 | Kotlin          | `.kt` `.kts`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |

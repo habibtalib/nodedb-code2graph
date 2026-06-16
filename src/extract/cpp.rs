@@ -23,12 +23,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, innermost_scope, is_static, make_symbol, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 // NOTE: SymbolKind has no Union variant; unions map to Struct. Preprocessor
@@ -69,10 +69,15 @@ impl Extractor for CppExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Cpp,
+        };
         let namespaces = cpp_namespaces(file);
 
         let mut defs = Vec::new();
-        collect_defs(&root, &namespaces, bytes, file, &mut defs);
+        collect_defs(&root, &namespaces, &ctx, &mut defs);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         symbols.push(super::module_symbol(
@@ -180,33 +185,28 @@ fn type_leaf_name(node: &Node, bytes: &[u8]) -> Option<String> {
 
 /// Push a symbol whose leaf descriptor extends `prefix` (a namespace/type chain).
 /// The symbol's display name is derived from `leaf.name()`.
-/// `kv` is `(kind, visibility)` collapsed into a tuple to keep the param count ≤ 7.
 fn push_symbol(
     out: &mut Vec<Symbol>,
+    ctx: &ExtractCtx,
     node: &Node,
     prefix: &[Descriptor],
     leaf: Descriptor,
-    kv: (SymbolKind, Visibility),
-    bytes: &[u8],
-    file: &str,
+    kind: SymbolKind,
+    visibility: Visibility,
 ) {
-    let (kind, visibility) = kv;
     let name = leaf.name().to_owned();
     let mut descriptors = prefix.to_vec();
     descriptors.push(leaf);
-    out.push(Symbol {
-        id: SymbolId::global(Language::Cpp.as_str(), descriptors),
+    let signature = one_line_signature(node_text(node, ctx.bytes), &['{', ';']);
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
         visibility,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        descriptors,
+        signature,
+    ));
 }
 
 /// Build the descriptor prefix for a list of namespace segments.
@@ -221,44 +221,32 @@ fn namespace_prefix(namespaces: &[String]) -> Vec<Descriptor> {
 /// Process a container node (translation unit or `declaration_list`), handling
 /// namespace blocks, top-level defs, and class/struct/union/enum/alias defs.
 /// `namespaces` is the current namespace descriptor chain (as plain strings).
-fn collect_defs(
-    container: &Node,
-    namespaces: &[String],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn collect_defs(container: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     for child in container.children(&mut container.walk()) {
-        process_node(&child, namespaces, bytes, file, out);
+        process_node(&child, namespaces, ctx, out);
     }
 }
 
 /// Process a single declaration-level node.
-fn process_node(
-    node: &Node,
-    namespaces: &[String],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn process_node(node: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     match node.kind() {
         "namespace_definition" => {
             // Extend the namespace chain with the (possibly nested or absent) name.
             let mut nested = namespaces.to_vec();
             if let Some(name) = node.child_by_field_name("name") {
-                for seg in node_text(&name, bytes).split("::") {
+                for seg in node_text(&name, ctx.bytes).split("::") {
                     if !seg.is_empty() {
                         nested.push(seg.to_owned());
                     }
                 }
             }
             if let Some(body) = node.child_by_field_name("body") {
-                collect_defs(&body, &nested, bytes, file, out);
+                collect_defs(&body, &nested, ctx, out);
             }
         }
 
         "function_definition" => {
-            let vis = if is_static(node, bytes) {
+            let vis = if is_static(node, ctx.bytes) {
                 Visibility::Private
             } else {
                 Visibility::Public
@@ -266,26 +254,26 @@ fn process_node(
             let Some(decl) = node.child_by_field_name("declarator") else {
                 return;
             };
-            let Some((name, _)) = declarator_name(&decl, bytes) else {
+            let Some((name, _)) = declarator_name(&decl, ctx.bytes) else {
                 return;
             };
             let prefix = namespace_prefix(namespaces);
             push_symbol(
                 out,
+                ctx,
                 node,
                 &prefix,
                 Descriptor::Method {
                     name,
                     disambiguator: String::new(),
                 },
-                (SymbolKind::Function, vis),
-                bytes,
-                file,
+                SymbolKind::Function,
+                vis,
             );
         }
 
         "declaration" => {
-            let vis = if is_static(node, bytes) {
+            let vis = if is_static(node, ctx.bytes) {
                 Visibility::Private
             } else {
                 Visibility::Public
@@ -293,36 +281,36 @@ fn process_node(
             // A class/struct/union/enum specifier in the `type` field with a
             // body is an aggregate definition; emit it (and its members).
             if let Some(spec) = node.child_by_field_name("type") {
-                emit_aggregate(&spec, namespaces, bytes, file, out);
+                emit_aggregate(&spec, namespaces, ctx, out);
             }
             let prefix = namespace_prefix(namespaces);
             let mut cursor = node.walk();
             for decl in node.children_by_field_name("declarator", &mut cursor) {
-                let Some((name, is_function)) = declarator_name(&decl, bytes) else {
+                let Some((name, is_function)) = declarator_name(&decl, ctx.bytes) else {
                     continue;
                 };
                 if is_function {
                     push_symbol(
                         out,
+                        ctx,
                         node,
                         &prefix,
                         Descriptor::Method {
                             name,
                             disambiguator: String::new(),
                         },
-                        (SymbolKind::Function, vis),
-                        bytes,
-                        file,
+                        SymbolKind::Function,
+                        vis,
                     );
                 } else {
                     push_symbol(
                         out,
+                        ctx,
                         node,
                         &prefix,
                         Descriptor::Term(name),
-                        (SymbolKind::Static, vis),
-                        bytes,
-                        file,
+                        SymbolKind::Static,
+                        vis,
                     );
                 }
             }
@@ -330,45 +318,45 @@ fn process_node(
 
         // A bare top-level `class/struct/union/enum Name { ... };`.
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier" => {
-            emit_aggregate(node, namespaces, bytes, file, out);
+            emit_aggregate(node, namespaces, ctx, out);
         }
 
         "type_definition" => {
             if let Some(spec) = node.child_by_field_name("type") {
-                emit_aggregate(&spec, namespaces, bytes, file, out);
+                emit_aggregate(&spec, namespaces, ctx, out);
             }
             let Some(decl) = node.child_by_field_name("declarator") else {
                 return;
             };
-            let Some((name, _)) = declarator_name(&decl, bytes) else {
+            let Some((name, _)) = declarator_name(&decl, ctx.bytes) else {
                 return;
             };
             let prefix = namespace_prefix(namespaces);
             push_symbol(
                 out,
+                ctx,
                 node,
                 &prefix,
                 Descriptor::Type(name),
-                (SymbolKind::TypeAlias, Visibility::Public),
-                bytes,
-                file,
+                SymbolKind::TypeAlias,
+                Visibility::Public,
             );
         }
 
         // `using T = X;`
         "alias_declaration" => {
-            let Some(name) = field_text(node, "name", bytes) else {
+            let Some(name) = field_text(node, "name", ctx.bytes) else {
                 return;
             };
             let prefix = namespace_prefix(namespaces);
             push_symbol(
                 out,
+                ctx,
                 node,
                 &prefix,
                 Descriptor::Type(name),
-                (SymbolKind::TypeAlias, Visibility::Public),
-                bytes,
-                file,
+                SymbolKind::TypeAlias,
+                Visibility::Public,
             );
         }
 
@@ -384,37 +372,37 @@ fn process_node(
                         | "struct_specifier"
                         | "union_specifier"
                 ) {
-                    process_node(&c, namespaces, bytes, file, out);
+                    process_node(&c, namespaces, ctx, out);
                 }
             }
         }
 
         "preproc_def" => {
-            if let Some(name) = field_text(node, "name", bytes) {
+            if let Some(name) = field_text(node, "name", ctx.bytes) {
                 let prefix = namespace_prefix(namespaces);
                 push_symbol(
                     out,
+                    ctx,
                     node,
                     &prefix,
                     Descriptor::Macro(name),
-                    (SymbolKind::Const, Visibility::Public),
-                    bytes,
-                    file,
+                    SymbolKind::Const,
+                    Visibility::Public,
                 );
             }
         }
 
         "preproc_function_def" => {
-            if let Some(name) = field_text(node, "name", bytes) {
+            if let Some(name) = field_text(node, "name", ctx.bytes) {
                 let prefix = namespace_prefix(namespaces);
                 push_symbol(
                     out,
+                    ctx,
                     node,
                     &prefix,
                     Descriptor::Macro(name),
-                    (SymbolKind::Function, Visibility::Public),
-                    bytes,
-                    file,
+                    SymbolKind::Function,
+                    Visibility::Public,
                 );
             }
         }
@@ -425,13 +413,7 @@ fn process_node(
 
 /// If `spec` is a class/struct/union/enum specifier with a body (a definition,
 /// not a forward declaration), emit the type symbol and recurse into members.
-fn emit_aggregate(
-    spec: &Node,
-    namespaces: &[String],
-    bytes: &[u8],
-    file: &str,
-    out: &mut Vec<Symbol>,
-) {
+fn emit_aggregate(spec: &Node, namespaces: &[String], ctx: &ExtractCtx, out: &mut Vec<Symbol>) {
     let (kind, default_vis, is_enum) = match spec.kind() {
         "class_specifier" => (SymbolKind::Class, Visibility::Private, false),
         "struct_specifier" => (SymbolKind::Struct, Visibility::Public, false),
@@ -449,19 +431,19 @@ fn emit_aggregate(
     let Some(name_node) = spec.child_by_field_name("name") else {
         return;
     };
-    let Some(name) = type_leaf_name(&name_node, bytes) else {
+    let Some(name) = type_leaf_name(&name_node, ctx.bytes) else {
         return;
     };
 
     let prefix = namespace_prefix(namespaces);
     push_symbol(
         out,
+        ctx,
         spec,
         &prefix,
         Descriptor::Type(name.clone()),
-        (kind, Visibility::Public),
-        bytes,
-        file,
+        kind,
+        Visibility::Public,
     );
 
     // Enumerators are not emitted individually (mirrors the C extractor).
@@ -472,7 +454,7 @@ fn emit_aggregate(
     // The type's own descriptor prefix for nested members.
     let mut type_prefix = prefix;
     type_prefix.push(Descriptor::Type(name));
-    collect_members(&body, &type_prefix, default_vis, bytes, file, out);
+    collect_members(&body, &type_prefix, default_vis, ctx, out);
 }
 
 /// Collect all members of a `field_declaration_list`, tracking visibility
@@ -486,15 +468,14 @@ fn collect_members(
     body: &Node,
     type_prefix: &[Descriptor],
     default_vis: Visibility,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     out: &mut Vec<Symbol>,
 ) {
     let mut current_vis = default_vis;
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "access_specifier" => {
-                let text = node_text(&member, bytes);
+                let text = node_text(&member, ctx.bytes);
                 current_vis = if text.starts_with("public") {
                     Visibility::Public
                 } else if text.starts_with("protected") {
@@ -507,51 +488,51 @@ fn collect_members(
                 let Some(decl) = member.child_by_field_name("declarator") else {
                     continue;
                 };
-                let Some((name, _)) = declarator_name(&decl, bytes) else {
+                let Some((name, _)) = declarator_name(&decl, ctx.bytes) else {
                     continue;
                 };
                 push_symbol(
                     out,
+                    ctx,
                     &member,
                     type_prefix,
                     Descriptor::Method {
                         name,
                         disambiguator: String::new(),
                     },
-                    (SymbolKind::Method, current_vis),
-                    bytes,
-                    file,
+                    SymbolKind::Method,
+                    current_vis,
                 );
             }
             "field_declaration" => {
                 let Some(decl) = member.child_by_field_name("declarator") else {
                     continue;
                 };
-                let Some((name, is_function)) = declarator_name(&decl, bytes) else {
+                let Some((name, is_function)) = declarator_name(&decl, ctx.bytes) else {
                     continue;
                 };
                 if is_function {
                     push_symbol(
                         out,
+                        ctx,
                         &member,
                         type_prefix,
                         Descriptor::Method {
                             name,
                             disambiguator: String::new(),
                         },
-                        (SymbolKind::Method, current_vis),
-                        bytes,
-                        file,
+                        SymbolKind::Method,
+                        current_vis,
                     );
                 } else {
                     push_symbol(
                         out,
+                        ctx,
                         &member,
                         type_prefix,
                         Descriptor::Term(name),
-                        (SymbolKind::Static, current_vis),
-                        bytes,
-                        file,
+                        SymbolKind::Static,
+                        current_vis,
                     );
                 }
             }
@@ -562,7 +543,7 @@ fn collect_members(
                 // the "namespaces" for the nested aggregate.
                 let nested_ns: Vec<String> =
                     type_prefix.iter().map(|d| d.name().to_owned()).collect();
-                emit_aggregate(&member, &nested_ns, bytes, file, out);
+                emit_aggregate(&member, &nested_ns, ctx, out);
             }
             _ => {}
         }

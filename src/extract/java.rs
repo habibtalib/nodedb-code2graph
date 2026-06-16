@@ -16,8 +16,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -26,6 +26,7 @@ use super::{
     ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
     definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
     node_text, one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
+    simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -35,6 +36,103 @@ const CALL_QUERY: &str = r#"
   (object_creation_expression type: (type_identifier) @callee)
 ]
 "#;
+
+/// Annotation simple-names that mark a definition as an HTTP route or controller
+/// entry point.
+///
+/// Spring MVC / Spring WebFlux: `RequestMapping`, `GetMapping`, `PostMapping`,
+/// `PutMapping`, `DeleteMapping`, `PatchMapping` (method-level handlers) and
+/// `RestController`, `Controller` (class-level stereotypes that expose routes).
+///
+/// JAX-RS: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS` (method
+/// annotations) and `Path` (class- or method-level URI template).
+///
+/// Detection rule (honest boundary): a definition is an HTTP-route entry point
+/// when its `modifiers` node contains a `marker_annotation` or `annotation`
+/// whose `name` field's simple name (identifier after `@`, ignoring any package
+/// qualifier and any argument list) is in this set. Annotations not in this set
+/// (`@Override`, `@Autowired`, `@Deprecated`, …) produce no marker. This is a
+/// syntactic, build-free heuristic; it cannot detect programmatically registered
+/// routes or non-standard annotation aliases.
+const JAVA_ROUTE_ANNOTATIONS: &[&str] = &[
+    // Spring MVC / WebFlux — class-level stereotypes
+    "RestController",
+    "Controller",
+    // Spring MVC / WebFlux — method-level mappings
+    "RequestMapping",
+    "GetMapping",
+    "PostMapping",
+    "PutMapping",
+    "DeleteMapping",
+    "PatchMapping",
+    // JAX-RS — method HTTP-verb annotations
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    // JAX-RS — URI template (class- or method-level)
+    "Path",
+];
+
+/// Compute entry-point markers for a class, interface, or method symbol.
+///
+/// `method_name` is `Some(name)` for method/constructor definitions (used for
+/// `Main` detection); `None` for type definitions (class/interface/enum).
+/// `node` is the definition node whose `modifiers` child is inspected for
+/// annotations.
+///
+/// Node-kind path for annotation detection:
+/// ```text
+/// method_declaration (or class_declaration, …)
+///   modifiers
+///     marker_annotation          ← @Override, @RestController
+///       name: identifier         ← simple name
+///     annotation                 ← @GetMapping("/users")
+///       name: identifier         ← simple name
+///       arguments: annotation_argument_list
+/// ```
+/// For a qualified annotation name (`@org.springframework.web.bind.annotation.GetMapping`)
+/// the `name` field is a `scoped_identifier`; its own `name` field is the leaf
+/// `identifier`. `simple_type_name` extracts that leaf uniformly.
+fn entry_points_for_java(method_name: Option<&str>, node: &Node, bytes: &[u8]) -> Vec<EntryPoint> {
+    let mut markers: Vec<EntryPoint> = Vec::new();
+
+    // (a) `main` + `static` → EntryPoint::Main (method definitions only).
+    if method_name == Some("main") && has_modifier(node, bytes, "static") {
+        markers.push(EntryPoint::Main);
+    }
+
+    // (b) HTTP-route annotation detection — inspect the `modifiers` child.
+    let Some(mods) = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "modifiers")
+    else {
+        return markers;
+    };
+
+    for ann in mods.children(&mut mods.walk()) {
+        let kind = ann.kind();
+        if kind != "marker_annotation" && kind != "annotation" {
+            continue;
+        }
+        // Both node kinds expose the annotation name via the `name:` field.
+        // The field value is an `identifier` or a `scoped_identifier`; either
+        // way `simple_type_name(..., ".")` extracts the leaf segment.
+        let Some(name_node) = ann.child_by_field_name("name") else {
+            continue;
+        };
+        let raw = node_text(&name_node, bytes);
+        let simple = simple_type_name(raw, ".");
+        if JAVA_ROUTE_ANNOTATIONS.contains(&simple) {
+            markers.push(EntryPoint::HttpRoute(simple.to_owned()));
+        }
+    }
+
+    markers
+}
 
 /// Extracts Java symbols and references.
 pub struct JavaExtractor;
@@ -170,7 +268,7 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
             .map(Descriptor::Namespace)
             .collect();
         type_descriptors.push(Descriptor::Type(type_name.clone()));
-        out.push(make_symbol(
+        let mut type_sym = make_symbol(
             ctx,
             &child,
             type_name.clone(),
@@ -178,7 +276,10 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
             read_visibility(&child, ctx.bytes, false),
             type_descriptors,
             one_line_signature(node_text(&child, ctx.bytes), &['{', ';']),
-        ));
+        );
+        // Populate entry-point markers (controller stereotypes live on the class node).
+        type_sym.entry_points = entry_points_for_java(None, &child, ctx.bytes);
+        out.push(type_sym);
 
         // Members are implicitly public for interfaces and annotation types.
         let implicit_public = matches!(
@@ -237,15 +338,18 @@ fn collect_members(
                     name: name.clone(),
                     disambiguator: String::new(),
                 });
-                out.push(make_symbol(
+                let mut method_sym = make_symbol(
                     ctx,
                     &member,
-                    name,
+                    name.clone(),
                     SymbolKind::Method,
                     read_visibility(&member, ctx.bytes, implicit_public),
                     descriptors,
                     one_line_signature(node_text(&member, ctx.bytes), &['{', ';']),
-                ));
+                );
+                // Populate entry-point markers (main detection + route annotations).
+                method_sym.entry_points = entry_points_for_java(Some(&name), &member, ctx.bytes);
+                out.push(method_sym);
             }
             "field_declaration" => {
                 // A single field_declaration may declare multiple variables.
@@ -1889,6 +1993,172 @@ public class C {
             sym.visibility,
             Visibility::Public,
             "interface method without modifier must be Visibility::Public (implicitly public)"
+        );
+    }
+
+    // ── Entry-point detection ────────────────────────────────────────────────
+
+    /// Helper: find a symbol by bare name in `facts.symbols`.
+    fn sym_by_name(facts: &FileFacts, name: &str) -> Symbol {
+        facts
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!("symbol '{name}' not found; symbols: {:?}", {
+                    let names: Vec<&str> = facts.symbols.iter().map(|s| s.name.as_str()).collect();
+                    names
+                })
+            })
+            .clone()
+    }
+
+    /// Helper: render entry_points as a compact string for assertion messages.
+    fn ep_str(eps: &[EntryPoint]) -> String {
+        eps.iter()
+            .map(|ep| match ep {
+                EntryPoint::Main => "Main".to_owned(),
+                EntryPoint::HttpRoute(m) => format!("HttpRoute({m})"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn java_entry_point_rest_controller_class() {
+        // `@RestController` on a class → HttpRoute("RestController") on the class symbol.
+        let src = "@RestController\npublic class UserController {}";
+        let facts = JavaExtractor
+            .extract(src, "src/UserController.java")
+            .unwrap();
+        let sym = sym_by_name(&facts, "UserController");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "RestController"),
+            "expected HttpRoute(\"RestController\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn java_entry_point_get_mapping_method() {
+        // `@GetMapping("/users")` on a method → HttpRoute("GetMapping") on the method symbol.
+        let src = r#"public class Api {
+    @GetMapping("/users")
+    public java.util.List<Object> list() { return null; }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/Api.java").unwrap();
+        let sym = sym_by_name(&facts, "list");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point on 'list', got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "GetMapping"),
+            "expected HttpRoute(\"GetMapping\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn java_entry_point_non_route_annotation_ignored() {
+        // `@Override` is not in the route set → entry_points must be empty.
+        let src = r#"public class Foo {
+    @Override
+    public String toString() { return null; }
+}"#;
+        let facts = JavaExtractor.extract(src, "src/Foo.java").unwrap();
+        let sym = sym_by_name(&facts, "toString");
+        assert!(
+            sym.entry_points.is_empty(),
+            "non-route annotation must not produce entry points; got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn java_entry_point_static_main() {
+        // `public static void main(String[] args) {}` → EntryPoint::Main.
+        let src = r#"public class App {
+    public static void main(String[] args) {}
+}"#;
+        let facts = JavaExtractor.extract(src, "src/App.java").unwrap();
+        let sym = sym_by_name(&facts, "main");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point on 'main', got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::Main),
+            "expected Main, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn java_entry_point_plain_class_and_method_empty() {
+        // An undecorated class and a plain method → entry_points empty for both.
+        let src = r#"public class Plain {
+    public void doWork() {}
+}"#;
+        let facts = JavaExtractor.extract(src, "src/Plain.java").unwrap();
+        let cls = sym_by_name(&facts, "Plain");
+        assert!(
+            cls.entry_points.is_empty(),
+            "plain class must have no entry points; got [{}]",
+            ep_str(&cls.entry_points)
+        );
+        let method = sym_by_name(&facts, "doWork");
+        assert!(
+            method.entry_points.is_empty(),
+            "plain method must have no entry points; got [{}]",
+            ep_str(&method.entry_points)
+        );
+    }
+
+    #[test]
+    fn java_entry_point_post_mapping_method() {
+        // `@PostMapping("/x")` on a method → HttpRoute("PostMapping").
+        let src = r#"public class Api {
+    @PostMapping("/x")
+    public void create() {}
+}"#;
+        let facts = JavaExtractor.extract(src, "src/Api.java").unwrap();
+        let sym = sym_by_name(&facts, "create");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point on 'create', got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "PostMapping"),
+            "expected HttpRoute(\"PostMapping\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn java_entry_point_non_static_main_ignored() {
+        // A non-static method named `main` must NOT produce EntryPoint::Main.
+        let src = r#"public class Foo {
+    public void main() {}
+}"#;
+        let facts = JavaExtractor.extract(src, "src/Foo.java").unwrap();
+        let sym = sym_by_name(&facts, "main");
+        assert!(
+            sym.entry_points.is_empty(),
+            "non-static 'main' must not produce EntryPoint::Main; got [{}]",
+            ep_str(&sym.entry_points)
         );
     }
 }

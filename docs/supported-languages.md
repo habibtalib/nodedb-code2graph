@@ -9,14 +9,23 @@ planned. One table; only languages we'll **never** support are kept out of it (s
 
 ## Legend
 
-**Status & depth** (one marker per language):
+**Resolution tiers** (both behind the `Resolver` trait — see [README](../README.md#resolution-tiers)):
 
-- ⭐ **supported · oracle-measured** — scope-aware (Tier-B) resolution, with ref→def precision/recall
+- **Tier A** (`SymbolTableResolver`) — name-based, recall-first, **available for _every_ language**.
+  An ambiguous name links to all same-named definitions (`NameOnly`, or `Scoped` when globally
+  unique). The universal floor under every row below.
+- **Tier B** (`ScopeGraphResolver`) — scope-aware (lexical scopes, imports, qualified paths),
+  `Scoped`/`Exact`, never fakes precision. Available where the extractor emits `scopes` + `bindings`.
+
+**Status & depth** (one marker per language = the _highest_ tier it reaches, on top of Tier-A):
+
+- ⭐ **supported · Tier-B, oracle-measured** — scope-aware resolution with ref→def precision/recall
   scored against an external SCIP oracle (rust-analyzer / scip-typescript / scip-java / …). The
   proven lane.
 - 🟢 **supported · Tier-B** — scope-aware resolution (emits scopes + bindings); not yet oracle-measured.
-- 🟣 **supported · cross-artifact** — declarative format: definition symbols + cross-reference edges,
-  so it stitches to code (e.g. a Rust field → a SQL table); no lexical scope or read/write.
+- 🟣 **supported · cross-artifact** — declarative format with no scope-aware tier: Tier-A name
+  matching **plus** cross-artifact stitching (definition symbols + cross-reference edges, so a Rust
+  field stitches to a SQL table). No lexical scopes or read/write.
 - 🟠 **planned** — a tree-sitter grammar is believed available; adding it is the mechanical recipe.
   _(Always confirm `tree-sitter >=0.24, <0.27` compatibility first — see CONTRIBUTING.)_
 - 🔴 **blocked** — feasible in principle, but no usable/compatible grammar exists yet.

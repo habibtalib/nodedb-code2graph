@@ -88,6 +88,8 @@ impl Extractor for ScalaExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -596,6 +598,113 @@ fn collect_import_node(
     }
 }
 
+// ── Read / Write references ──────────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is in a position already captured
+/// by another collector and must NOT also be emitted as a Read reference.
+///
+/// Excluded positions:
+/// - Call callee: the `function:` field of `call_expression` or the inner
+///   `function:` field of `generic_function` inside a `call_expression`.
+/// - Declaration names: `name:` field of `function_definition`,
+///   `class_definition`, `trait_definition`, `object_definition`,
+///   `package_object`, `enum_definition`, `type_definition`.
+/// - Val/var binding: `pattern:` field of `val_definition` / `var_definition`
+///   (the bound name, not a re-assignment).
+/// - Parameter names: `name:` field of `parameter` / `class_parameter`.
+/// - Import binding names: direct parent is `import_declaration`,
+///   `import_selectors`, or `import_selector` (already captured as
+///   `RefRole::Import`).
+/// - Member-access leaf: the `field:` field of `field_expression` (e.g. the
+///   `.foo` in `obj.foo`) — the receiver (`value:`) IS a read; only the leaf
+///   member name is skipped.
+/// - Assignment LHS: the `left:` field of `assignment_expression` — handled by
+///   `collect_write_references`.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee — `function:` field of `call_expression`.
+        "call_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Inner callee of a generic call `foo[T]()` — generic_function's `function:`.
+        "generic_function" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Declaration names.
+        "function_definition"
+        | "class_definition"
+        | "trait_definition"
+        | "object_definition"
+        | "package_object"
+        | "enum_definition"
+        | "type_definition" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Val/var binding name (binding introduction, not re-assignment).
+        "val_definition" | "var_definition" => {
+            parent.child_by_field_name("pattern").as_ref() == Some(node)
+        }
+        // Parameter bound name.
+        "parameter" | "class_parameter" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Import binding — already an Import ref.
+        "import_declaration" | "import_selectors" | "import_selector" => true,
+        // Member-access leaf (`obj.foo` — skip `foo`, keep `obj`).
+        "field_expression" => parent.child_by_field_name("field").as_ref() == Some(node),
+        // Assignment LHS — handled by collect_write_references.
+        "assignment_expression" => parent.child_by_field_name("left").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers that are:
+/// - Call callees (already [`RefRole::Call`])
+/// - Declaration names (function / class / trait / object / val binding / param)
+/// - Import binding names (already [`RefRole::Import`])
+/// - Member-access leaves (the `field:` of `field_expression`)
+/// - Assignment LHS (handled by [`collect_write_references`])
+///
+/// Applies [`MIN_REF_LEN`] (same threshold as calls).
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` nodes (e.g. `x = expr`).
+///
+/// Note: `val x = …` / `var x = …` definitions are `val_definition` /
+/// `var_definition` nodes — distinct from `assignment_expression` — and are
+/// deliberately excluded. Only a re-assignment `x = expr` is a Write.
+///
+/// Member/index LHS (`obj.field = …`) is not covered in v1. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_expression" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            if lhs.kind() == "identifier" {
+                let name = node_text(&lhs, bytes);
+                if name.len() >= MIN_REF_LEN {
+                    push_ref(out, name, &lhs, file, RefRole::Write);
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 // ── TypeRef edges ────────────────────────────────────────────────────────────
 
 /// Recursively walk `node` emitting [`RefRole::TypeRef`] references for
@@ -958,6 +1067,153 @@ class Foo {}
             Some("scala.collection.mutable".to_owned()),
             "from_path should be 'scala.collection.mutable', got {:?}",
             arr.from_path
+        );
+    }
+
+    // ── Read / Write references ──────────────────────────────────────────────
+
+    #[test]
+    fn reassignment_emits_write_and_reads_for_rhs() {
+        let src = r#"
+object O {
+  def m(): Unit = {
+    var total = 0
+    val bonus = 10
+    total = total + bonus
+  }
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        let refs = &facts.references;
+
+        // `total =` on the LHS of assignment_expression → Write.
+        assert!(
+            refs.iter()
+                .any(|r| r.role == RefRole::Write && r.name == "total"),
+            "expected Write ref for 'total': {:?}",
+            refs.iter().map(|r| (&r.role, &r.name)).collect::<Vec<_>>()
+        );
+        // `bonus` on the RHS → Read.
+        assert!(
+            refs.iter()
+                .any(|r| r.role == RefRole::Read && r.name == "bonus"),
+            "expected Read ref for 'bonus': {:?}",
+            refs.iter().map(|r| (&r.role, &r.name)).collect::<Vec<_>>()
+        );
+        // `total` on the RHS of `total + bonus` → Read.
+        let read_totals: Vec<_> = refs
+            .iter()
+            .filter(|r| r.role == RefRole::Read && r.name == "total")
+            .collect();
+        assert!(
+            !read_totals.is_empty(),
+            "expected at least one Read ref for 'total' (RHS usage)"
+        );
+    }
+
+    #[test]
+    fn val_definition_does_not_emit_write_for_binding_name() {
+        let src = r#"
+object O {
+  def m(): Unit = {
+    val result = compute()
+  }
+  def compute(): Int = 42
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        assert!(
+            !facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Write && r.name == "result"),
+            "val binding 'result' must NOT emit a Write ref: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.role, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn free_call_arg_is_read_but_callee_is_not() {
+        let src = r#"
+object O {
+  def m(): Unit = {
+    val config = Config()
+    logger(config)
+  }
+  def logger(x: Any): Unit = {}
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        // `config` passed as argument → Read.
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Read && r.name == "config"),
+            "expected Read ref for argument 'config': {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.role, &r.name))
+                .collect::<Vec<_>>()
+        );
+        // `logger` is the callee → Call, NOT Read.
+        assert!(
+            !facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Read && r.name == "logger"),
+            "callee 'logger' must NOT emit a Read ref: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.role, &r.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn field_expression_receiver_is_read_but_leaf_is_not() {
+        let src = r#"
+object O {
+  def m(): Unit = {
+    var value = 0
+    val source = Src()
+    value = source.field
+  }
+  class Src { val field: Int = 1 }
+}
+"#;
+        let facts = extract(src, "src/O.scala");
+        // `source` is the receiver (value: field of field_expression) → Read.
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Read && r.name == "source"),
+            "expected Read ref for receiver 'source': {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.role, &r.name))
+                .collect::<Vec<_>>()
+        );
+        // `field` is the member-access leaf → must NOT be a Read.
+        assert!(
+            !facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Read && r.name == "field"),
+            "member-access leaf 'field' must NOT emit a Read ref: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.role, &r.name))
+                .collect::<Vec<_>>()
         );
     }
 }

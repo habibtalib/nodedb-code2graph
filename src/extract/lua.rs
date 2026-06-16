@@ -20,8 +20,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, Reference, Scope, ScopeId, ScopeKind, Symbol,
-    SymbolKind,
+    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
+    Symbol, SymbolKind,
 };
 use crate::lang::Language;
 use crate::symbol::{Descriptor, SymbolId};
@@ -29,7 +29,7 @@ use crate::symbol::{Descriptor, SymbolId};
 use super::{
     Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
     field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_import_ref, push_scope,
+    push_binding, push_import_ref, push_ref, push_scope,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -100,6 +100,8 @@ pub(crate) fn extract_lua_family(
     references.retain(|r| r.name != "require");
 
     collect_require_imports(&root, bytes, file, &mut references, &module_id);
+    collect_read_references(&root, bytes, file, &mut references);
+    collect_write_references(&root, bytes, file, &mut references);
 
     let scopes = collect_scopes(&root, source.len());
     attach_reference_scopes(&mut references, &scopes);
@@ -563,6 +565,95 @@ fn extract_string_arg(args: &Node, bytes: &[u8]) -> Option<String> {
     None
 }
 
+// ── Read / write references ──────────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) sits in a position already
+/// captured by another collector — a call callee, a definition/parameter name,
+/// an assignment/local-declaration target, a member-access leaf, or a
+/// table-constructor field key — and so must NOT also be emitted as a Read.
+///
+/// The base table of a member access (`a` in `a.b` / `a:b()`) is a genuine read
+/// of `a` and is intentionally *not* skipped — only the leaf field/method name is.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true,
+    };
+    match parent.kind() {
+        // Free-call callee: `foo()` — the `name` field of a `function_call`.
+        "function_call" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Member access `a.b` / `a:b` — skip the leaf field/method name only.
+        "dot_index_expression" => parent.child_by_field_name("field").as_ref() == Some(node),
+        "method_index_expression" => parent.child_by_field_name("method").as_ref() == Some(node),
+        // Assignment / local-declaration targets live in the `variable_list`
+        // (writes are emitted separately; locals are bindings).
+        "variable_list" => true,
+        // Function / closure parameter binding sites.
+        "parameters" => true,
+        // Definition name: `function foo()` (dotted/colon names nest under an
+        // index expression and are handled by the arms above).
+        "function_declaration" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Table-constructor field key `{ key = value }` — a field definition; the
+        // value identifier is still reached and kept as a read.
+        "field" => parent.child_by_field_name("name").as_ref() == Some(node),
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value positions. Applies [`MIN_REF_LEN`].
+///
+/// Skips positions handled by other collectors (call callees, definition and
+/// parameter names, assignment / local-declaration targets, member-access leaf
+/// names, table-field keys) via [`is_non_read_position`].
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier targets of an `assignment_statement` (e.g. `x = 5`,
+/// `count = count + 1`).
+///
+/// A `local x = …` declaration is *not* a write — its `assignment_statement`
+/// nests under a `variable_declaration`/`local_declaration` wrapper and is
+/// excluded. Member / index targets (`obj.field = …`, `t[i] = …`) are not
+/// covered in v1 — only bare `identifier` targets. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_statement"
+        && !matches!(
+            node.parent().map(|p| p.kind()),
+            Some("variable_declaration") | Some("local_declaration")
+        )
+    {
+        if let Some(vl) = node
+            .children(&mut node.walk())
+            .find(|c| c.kind() == "variable_list")
+        {
+            for target in vl.children(&mut vl.walk()) {
+                if target.kind() == "identifier" {
+                    let name = node_text(&target, bytes);
+                    if name.len() >= MIN_REF_LEN {
+                        push_ref(out, name, &target, file, RefRole::Write);
+                    }
+                }
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 // ── Scope tree ───────────────────────────────────────────────────────────────
 
 fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
@@ -815,6 +906,85 @@ mod tests {
         assert!(
             require_calls.is_empty(),
             "require should not appear as a Call ref"
+        );
+    }
+
+    // ── Read / write references ──────────────────────────────────────────────
+
+    fn has_ref(facts: &FileFacts, role: RefRole, name: &str) -> bool {
+        facts
+            .references
+            .iter()
+            .any(|r| r.role == role && r.name == name)
+    }
+
+    #[test]
+    fn reassignment_emits_write_and_reads() {
+        // `count = count + bonus` is a re-assignment (not a `local`): the LHS is a
+        // Write; both RHS identifiers are Reads.
+        let src = "function run() local count = 0 count = count + bonus end";
+        let facts = extract(src, "src/util.lua");
+
+        assert!(
+            has_ref(&facts, RefRole::Write, "count"),
+            "expected a Write ref for the assignment target 'count'"
+        );
+        assert!(
+            has_ref(&facts, RefRole::Read, "bonus"),
+            "expected a Read ref for 'bonus' on the RHS"
+        );
+        assert!(
+            has_ref(&facts, RefRole::Read, "count"),
+            "expected a Read ref for the RHS use of 'count'"
+        );
+    }
+
+    #[test]
+    fn local_declaration_is_not_a_write() {
+        // `local total = compute()` introduces a binding — not a Write.
+        let src = "function run() local total = compute() end";
+        let facts = extract(src, "src/util.lua");
+
+        assert!(
+            !has_ref(&facts, RefRole::Write, "total"),
+            "a `local` declaration must not emit a Write ref"
+        );
+        // The declared name is a binding, not a Read either.
+        assert!(
+            !has_ref(&facts, RefRole::Read, "total"),
+            "the declared name must not be emitted as a Read"
+        );
+    }
+
+    #[test]
+    fn read_of_global_in_call_arg() {
+        // `config` is read as an argument; `print` is the call callee, not a Read.
+        let src = "function run() print(config) end";
+        let facts = extract(src, "src/util.lua");
+
+        assert!(
+            has_ref(&facts, RefRole::Read, "config"),
+            "expected a Read ref for the argument 'config'"
+        );
+        assert!(
+            !has_ref(&facts, RefRole::Read, "print"),
+            "a call callee must not also be a Read ref"
+        );
+    }
+
+    #[test]
+    fn member_access_base_is_read_leaf_is_not() {
+        // `value = source.field` — `source` (base) is a Read; `field` (leaf) is not.
+        let src = "function run() value = source.field end";
+        let facts = extract(src, "src/util.lua");
+
+        assert!(
+            has_ref(&facts, RefRole::Read, "source"),
+            "the base of a member access should be a Read ref"
+        );
+        assert!(
+            !has_ref(&facts, RefRole::Read, "field"),
+            "the leaf of a member access must not be a Read ref"
         );
     }
 }

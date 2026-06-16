@@ -20,8 +20,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -167,6 +167,46 @@ fn go_package_name(root: &Node, bytes: &[u8]) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Compute entry-point markers for a Go function or method symbol.
+///
+/// # v1 rules (definition-time detection only)
+///
+/// - `EntryPoint::Main` — a top-level **function** (not a method) whose bare
+///   name is exactly `main`.  This is Go's program entry-point convention
+///   (`func main()` in `package main`).
+/// - `EntryPoint::HttpRoute("ServeHTTP")` — a **method** whose bare name is
+///   exactly `ServeHTTP`.  Any type implementing the `http.Handler` interface
+///   must have a `ServeHTTP(ResponseWriter, *Request)` method; detecting the
+///   name at the definition site is sufficient to mark it as an HTTP entry
+///   point without resolving the interface assignment.
+///
+/// # Deferred: call-site route registrations
+///
+/// Patterns such as `http.HandleFunc("/path", handler)`,
+/// `router.GET("/path", handler)` (gorilla/mux, gin, echo, chi), and similar
+/// framework router registrations are **not** detected here.  Those are
+/// call-site registrations where the handler is passed as an argument; linking
+/// that argument back to its definition requires reference resolution
+/// (cross-file, cross-call-graph), which is out of scope for a
+/// definition-time extractor.  A future pass over `CodeGraph` edges could
+/// detect `HandleFunc`-style calls and back-annotate the handler symbol.
+fn entry_points_for_go(name: &str, is_method: bool) -> Vec<EntryPoint> {
+    let mut markers: Vec<EntryPoint> = Vec::new();
+
+    // (a) `func main()` — the Go program entry point (function, not method).
+    if !is_method && name == "main" {
+        markers.push(EntryPoint::Main);
+    }
+
+    // (b) `ServeHTTP` method — the `http.Handler` interface dispatch method.
+    // Any method named ServeHTTP is the idiomatic Go HTTP handler entry point.
+    if is_method && name == "ServeHTTP" {
+        markers.push(EntryPoint::HttpRoute("ServeHTTP".to_owned()));
+    }
+
+    markers
+}
+
 fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
 
@@ -200,34 +240,52 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                     continue;
                 };
                 let vis = name_visibility(&name);
-                push(
-                    &mut out,
+                let mut descriptors: Vec<Descriptor> = namespaces
+                    .iter()
+                    .cloned()
+                    .map(Descriptor::Namespace)
+                    .collect();
+                descriptors.push(Descriptor::Method {
+                    name: name.clone(),
+                    disambiguator: String::new(),
+                });
+                let mut sym = make_symbol(
+                    ctx,
                     &child,
                     name.clone(),
                     SymbolKind::Function,
                     vis,
-                    Descriptor::Method {
-                        name,
-                        disambiguator: String::new(),
-                    },
+                    descriptors,
+                    one_line_signature(node_text(&child, ctx.bytes), &['{']),
                 );
+                sym.entry_points = entry_points_for_go(&name, false);
+                out.push(sym);
             }
             "method_declaration" => {
                 let Some(name) = field_text(&child, "name", ctx.bytes) else {
                     continue;
                 };
                 let vis = name_visibility(&name);
-                push(
-                    &mut out,
+                let mut descriptors: Vec<Descriptor> = namespaces
+                    .iter()
+                    .cloned()
+                    .map(Descriptor::Namespace)
+                    .collect();
+                descriptors.push(Descriptor::Method {
+                    name: name.clone(),
+                    disambiguator: String::new(),
+                });
+                let mut sym = make_symbol(
+                    ctx,
                     &child,
                     name.clone(),
                     SymbolKind::Method,
                     vis,
-                    Descriptor::Method {
-                        name,
-                        disambiguator: String::new(),
-                    },
+                    descriptors,
+                    one_line_signature(node_text(&child, ctx.bytes), &['{']),
                 );
+                sym.entry_points = entry_points_for_go(&name, true);
+                out.push(sym);
             }
             "type_declaration" => {
                 for spec in child.children(&mut child.walk()) {
@@ -1560,6 +1618,100 @@ func main() {
         assert!(
             !conn_reads.is_empty(),
             "expected a Read ref for the receiver 'conn'"
+        );
+    }
+
+    // ── Entry-point detection ────────────────────────────────────────────────
+
+    #[test]
+    fn entry_point_main_function() {
+        // `func main() {}` in package main → EntryPoint::Main.
+        let src = "package main\n\nfunc main() {}\n";
+        let facts = GoExtractor.extract(src, "main.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "main")
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol 'main' not found; symbols: {:?}",
+                    facts.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point for 'main', got {:?}",
+            sym.entry_points
+        );
+        assert!(
+            matches!(sym.entry_points[0], EntryPoint::Main),
+            "expected EntryPoint::Main, got {:?}",
+            sym.entry_points
+        );
+    }
+
+    #[test]
+    fn entry_point_serve_http_method() {
+        // A method named ServeHTTP → EntryPoint::HttpRoute("ServeHTTP").
+        // (implements http.Handler — the idiomatic Go HTTP dispatch method)
+        let src = "package main\n\ntype Handler struct{}\n\nfunc (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {}\n";
+        let facts = GoExtractor.extract(src, "main.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "ServeHTTP")
+            .unwrap_or_else(|| {
+                panic!(
+                    "symbol 'ServeHTTP' not found; symbols: {:?}",
+                    facts.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(sym.kind, SymbolKind::Method, "ServeHTTP must be a Method");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point for 'ServeHTTP', got {:?}",
+            sym.entry_points
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "ServeHTTP"),
+            "expected EntryPoint::HttpRoute(\"ServeHTTP\"), got {:?}",
+            sym.entry_points
+        );
+    }
+
+    #[test]
+    fn entry_point_plain_function_empty() {
+        // A plain function (not named `main`) → entry_points is empty.
+        let src = "package main\n\nfunc process() {}\n";
+        let facts = GoExtractor.extract(src, "main.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "process")
+            .expect("symbol 'process' not found");
+        assert!(
+            sym.entry_points.is_empty(),
+            "plain non-main function must have no entry points; got {:?}",
+            sym.entry_points
+        );
+    }
+
+    #[test]
+    fn entry_point_other_method_empty() {
+        // A method not named ServeHTTP → entry_points is empty.
+        let src = "package main\n\ntype Handler struct{}\n\nfunc (h *Handler) Other() {}\n";
+        let facts = GoExtractor.extract(src, "main.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Other")
+            .expect("symbol 'Other' not found");
+        assert!(
+            sym.entry_points.is_empty(),
+            "non-ServeHTTP method must have no entry points; got {:?}",
+            sym.entry_points
         );
     }
 }

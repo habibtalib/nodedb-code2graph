@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "code2graph-rs"
 version = "0.0.0"
 description = "Source code to structural graph facts — Python bindings"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 readme = "README.md"
 classifiers = [

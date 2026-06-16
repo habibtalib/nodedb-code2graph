@@ -5,10 +5,10 @@
 # proves resolution quality without leaking any non-neutral concern into the core.
 [package]
 name = "code2graph-eval"
-version = "0.0.0"
-edition = "2024"
-rust-version = "1.85"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 # The scorecard binary (src/main.rs) is the default; `gen-oracle` is opt-in and
 # only buildable with --features oracle-regen.

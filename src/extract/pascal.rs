@@ -24,12 +24,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
+    push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -69,8 +70,13 @@ impl Extractor for PascalExtractor {
         let root = tree.root_node();
         let bytes = source.as_bytes();
         let namespaces = pascal_namespaces(&root, bytes, file);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Pascal,
+        };
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Pascal, &namespaces, file, source.len());
@@ -152,7 +158,7 @@ fn pascal_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
 
 // ── Symbol collection ────────────────────────────────────────────────────────
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let ns_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
@@ -162,8 +168,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 
     for top in root.children(&mut root.walk()) {
         match top.kind() {
-            "unit" => collect_unit(&top, bytes, file, &ns_descriptors, &mut out),
-            "program" => collect_program(&top, bytes, file, &ns_descriptors, &mut out),
+            "unit" => collect_unit(&top, ctx, &ns_descriptors, &mut out),
+            "program" => collect_program(&top, ctx, &ns_descriptors, &mut out),
             _ => {}
         }
     }
@@ -172,46 +178,28 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
 
 /// Collect definitions from a `unit` node.
 /// Types live in the `interface` section; standalone procs in `implementation`.
-fn collect_unit(
-    unit: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_unit(unit: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     for child in unit.children(&mut unit.walk()) {
         match child.kind() {
-            "interface" => collect_decl_types(&child, bytes, file, prefix, out),
-            "implementation" => collect_impl_procs(&child, bytes, file, prefix, out),
+            "interface" => collect_decl_types(&child, ctx, prefix, out),
+            "implementation" => collect_impl_procs(&child, ctx, prefix, out),
             _ => {}
         }
     }
 }
 
 /// Collect definitions from a `program` node: standalone top-level `defProc`s.
-fn collect_program(
-    prog: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
-    collect_impl_procs(prog, bytes, file, prefix, out);
+fn collect_program(prog: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
+    collect_impl_procs(prog, ctx, prefix, out);
 }
 
 /// Walk `node` and emit symbols for every `declType` found (class, record, interface, enum).
-fn collect_decl_types(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_decl_types(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "declTypes" {
             for decl in child.children(&mut child.walk()) {
                 if decl.kind() == "declType" {
-                    collect_decl_type(&decl, bytes, file, prefix, out);
+                    collect_decl_type(&decl, ctx, prefix, out);
                 }
             }
         }
@@ -219,15 +207,9 @@ fn collect_decl_types(
 }
 
 /// Emit a symbol for a single `declType` and its members.
-fn collect_decl_type(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_decl_type(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     // The type name is in the `name` field (an identifier).
-    let Some(name) = field_text(node, "name", bytes) else {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
 
@@ -244,25 +226,21 @@ fn collect_decl_type(
     let mut type_descriptors = prefix.to_vec();
     type_descriptors.push(Descriptor::Type(name.clone()));
 
-    out.push(Symbol {
-        id: SymbolId::global(Language::Pascal.as_str(), type_descriptors.clone()),
-        name: name.clone(),
+    out.push(make_symbol(
+        ctx,
+        node,
+        name.clone(),
         kind,
         // Unit-level type declarations are in the interface section — always public.
-        visibility: Visibility::Public,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        Visibility::Public,
+        type_descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     if kind == SymbolKind::Enum {
-        collect_enum_values(&inner, bytes, file, &type_descriptors, out);
+        collect_enum_values(&inner, ctx, &type_descriptors, out);
     } else {
-        collect_members(&inner, bytes, file, &type_descriptors, members, out);
+        collect_members(&inner, ctx, &type_descriptors, members, out);
     }
 }
 
@@ -303,30 +281,25 @@ fn classify_decl_type(node: &Node) -> (SymbolKind, bool) {
 /// Emit `SymbolKind::Const` for each `declEnumValue` inside an enum body.
 fn collect_enum_values(
     enum_node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
     for child in enum_node.children(&mut enum_node.walk()) {
         if child.kind() == "declEnumValue" {
-            if let Some(val_name) = field_text(&child, "name", bytes) {
+            if let Some(val_name) = field_text(&child, "name", ctx.bytes) {
                 let mut descriptors = type_prefix.to_vec();
                 descriptors.push(Descriptor::Term(val_name.clone()));
-                out.push(Symbol {
-                    id: SymbolId::global(Language::Pascal.as_str(), descriptors),
-                    name: val_name,
-                    kind: SymbolKind::Const,
+                out.push(make_symbol(
+                    ctx,
+                    &child,
+                    val_name,
+                    SymbolKind::Const,
                     // Enum values are part of a unit-level type — always public.
-                    visibility: Visibility::Public,
-                    file: file.to_owned(),
-                    line: (child.start_position().row + 1) as u32,
-                    span: ByteSpan {
-                        start: child.start_byte(),
-                        end: child.end_byte(),
-                    },
-                    signature: one_line_signature(node_text(&child, bytes), &['{', ';', ',']),
-                });
+                    Visibility::Public,
+                    descriptors,
+                    one_line_signature(node_text(&child, ctx.bytes), &['{', ';', ',']),
+                ));
             }
         }
     }
@@ -367,8 +340,7 @@ fn section_visibility(node: &Node) -> Visibility {
 /// Walk a class/record/interface body (`declClass` or `declIntf`) and emit member symbols.
 fn collect_members(
     body: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     emit: bool,
     out: &mut Vec<Symbol>,
@@ -377,13 +349,12 @@ fn collect_members(
         return;
     }
     // Pascal class default (before any section keyword) is `published`, which maps to Public.
-    collect_members_in(body, bytes, file, type_prefix, Visibility::Public, out);
+    collect_members_in(body, ctx, type_prefix, Visibility::Public, out);
 }
 
 fn collect_members_in(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     current_vis: Visibility,
     out: &mut Vec<Symbol>,
@@ -393,13 +364,13 @@ fn collect_members_in(
             "declSection" => {
                 // Visibility section (kPublic, kPrivate, …); determine its visibility and recurse.
                 let vis = section_visibility(&child);
-                collect_members_in(&child, bytes, file, type_prefix, vis, out);
+                collect_members_in(&child, ctx, type_prefix, vis, out);
             }
             "declProc" => {
-                emit_method(&child, bytes, file, type_prefix, current_vis, out);
+                emit_method(&child, ctx, type_prefix, current_vis, out);
             }
             "declField" => {
-                emit_field(&child, bytes, file, type_prefix, current_vis, out);
+                emit_field(&child, ctx, type_prefix, current_vis, out);
             }
             _ => {}
         }
@@ -409,13 +380,12 @@ fn collect_members_in(
 /// Emit a `SymbolKind::Method` for a `declProc` that is a member declaration.
 fn emit_method(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     vis: Visibility,
     out: &mut Vec<Symbol>,
 ) {
-    let Some(name) = field_text(node, "name", bytes) else {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     // Skip if the name node is a qualified name (genericDot) — that's a body, not a decl.
@@ -430,60 +400,45 @@ fn emit_method(
         name: name.clone(),
         disambiguator: String::new(),
     });
-    out.push(Symbol {
-        id: SymbolId::global(Language::Pascal.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::Method,
-        visibility: vis,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        SymbolKind::Method,
+        vis,
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 }
 
 /// Emit a `SymbolKind::Static` for a `declField`.
 fn emit_field(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     vis: Visibility,
     out: &mut Vec<Symbol>,
 ) {
-    let Some(name) = field_text(node, "name", bytes) else {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     let mut descriptors = type_prefix.to_vec();
     descriptors.push(Descriptor::Term(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Pascal.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::Static,
-        visibility: vis,
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        SymbolKind::Static,
+        vis,
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 }
 
 /// Walk `node` and emit `SymbolKind::Function` for standalone `defProc`s whose header's
 /// `declProc` name is a plain `identifier` (not a qualified `genericDot`).
 /// Skips method implementations like `procedure TFoo.Run; begin end;`.
-fn collect_impl_procs(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_impl_procs(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     for child in node.children(&mut node.walk()) {
         if child.kind() == "defProc" {
             if let Some(header) = child.child_by_field_name("header") {
@@ -497,26 +452,22 @@ fn collect_impl_procs(
                         .unwrap_or(false);
 
                     if name_is_plain_ident {
-                        if let Some(name) = field_text(&header, "name", bytes) {
+                        if let Some(name) = field_text(&header, "name", ctx.bytes) {
                             let mut descriptors = prefix.to_vec();
                             descriptors.push(Descriptor::Method {
                                 name: name.clone(),
                                 disambiguator: String::new(),
                             });
-                            out.push(Symbol {
-                                id: SymbolId::global(Language::Pascal.as_str(), descriptors),
+                            out.push(make_symbol(
+                                ctx,
+                                &child,
                                 name,
-                                kind: SymbolKind::Function,
+                                SymbolKind::Function,
                                 // Standalone top-level procedures/functions are public.
-                                visibility: Visibility::Public,
-                                file: file.to_owned(),
-                                line: (child.start_position().row + 1) as u32,
-                                span: ByteSpan {
-                                    start: child.start_byte(),
-                                    end: child.end_byte(),
-                                },
-                                signature: one_line_signature(node_text(&header, bytes), &[';']),
-                            });
+                                Visibility::Public,
+                                descriptors,
+                                one_line_signature(node_text(&header, ctx.bytes), &[';']),
+                            ));
                         }
                     }
                 }

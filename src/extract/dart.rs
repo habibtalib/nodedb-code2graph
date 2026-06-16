@@ -79,6 +79,8 @@ impl Extractor for DartExtractor {
         collect_inheritance(&root, bytes, file, &mut references);
         collect_imports(&root, bytes, file, &mut references, &module_id);
         collect_type_references(&root, bytes, file, &mut references);
+        collect_read_references(&root, bytes, file, &mut references);
+        collect_write_references(&root, bytes, file, &mut references);
 
         let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
@@ -837,6 +839,205 @@ fn type_leaf(node: &Node, bytes: &[u8], file: &str, ctx: TypeRefContext, out: &m
     }
 }
 
+// ── Read / Write references ──────────────────────────────────────────────────
+
+/// Returns `true` when `node` (an `identifier`) is the sole bare-identifier
+/// target of an `assignment_expression`'s `left` field via an
+/// `assignable_expression` wrapper.
+///
+/// Concretely, the AST shape for `total = …` is:
+/// ```text
+/// (assignment_expression
+///   left: (assignable_expression (identifier))   ← bare target
+///   right: …)
+/// ```
+/// A member/index target such as `obj.prop = …` produces an
+/// `assignable_expression` with MORE than one identifier child (or extra
+/// selector children), so it does NOT match and is excluded from both Write
+/// emission and Read exclusion — leaving `obj` as a genuine Read.
+///
+/// The test applied: `node.parent()` is `assignable_expression`, that parent
+/// has exactly ONE direct `identifier` child (and it is `node`), and the
+/// grandparent is `assignment_expression` with the `assignable_expression` as
+/// its `left` field.
+fn is_bare_assignable_target(node: &Node) -> bool {
+    let Some(assignable) = node.parent() else {
+        return false;
+    };
+    if assignable.kind() != "assignable_expression" {
+        return false;
+    }
+    // The grandparent must be assignment_expression with assignable as `left`.
+    let Some(assignment) = assignable.parent() else {
+        return false;
+    };
+    if assignment.kind() != "assignment_expression" {
+        return false;
+    }
+    if assignment.child_by_field_name("left").as_ref() != Some(&assignable) {
+        return false;
+    }
+    // Count direct `identifier` children of the assignable_expression.
+    // A bare target has exactly one; a member/index target has more.
+    let id_count = assignable
+        .children(&mut assignable.walk())
+        .filter(|c| c.kind() == "identifier")
+        .count();
+    id_count == 1
+}
+
+/// Returns `true` when `node` (an `identifier`) is in a position already
+/// captured by another collector and must NOT also be emitted as a Read ref.
+///
+/// Excluded positions:
+/// - Call callee: `function` field of `call_expression`.
+/// - Function/getter/setter declaration names: `name` field of
+///   `function_signature`, `getter_signature`, `setter_signature`,
+///   `constructor_signature`.
+/// - Class / mixin / enum / extension declaration names: `name` field of the
+///   respective declaration node.
+/// - Typed identifier binding names (e.g. `int x`): `name` field of
+///   `typed_identifier`.
+/// - Variable binding names: `name` field of `initialized_identifier`
+///   (local and field variable declarations with `var`/`final`/untyped).
+/// - Import binding names: `import_specification` (alias identifier) or
+///   `combinator` (show combinator — already Import refs).
+/// - Assignment LHS bare target: sole `identifier` inside the
+///   `assignable_expression` that is the `left` field of
+///   `assignment_expression` — handled by `collect_write_references`.
+///   Member/index targets (e.g. `obj` in `obj.prop = x`) are NOT excluded
+///   and remain Reads.
+/// - Member-access property (the leaf after `.`): `property` field of
+///   `member_expression`, `null_aware_member_expression`, and cascade
+///   variants — skip the property identifier; the object base is a genuine read.
+/// - Type-annotation positions: Dart uses `type_identifier` (not `identifier`)
+///   for type names, so those are implicitly excluded by only walking `identifier`.
+fn is_non_read_position(node: &Node) -> bool {
+    let parent = match node.parent() {
+        Some(p) => p,
+        None => return true, // root — not a read
+    };
+    match parent.kind() {
+        // Call callee: `function:` field of call_expression.
+        "call_expression" => parent.child_by_field_name("function").as_ref() == Some(node),
+        // Function/getter/setter signature name — the identifier is the `name`
+        // field directly on the *_signature node (not on function_declaration,
+        // which wraps via a `signature` field instead).
+        "function_signature" | "getter_signature" | "setter_signature" => {
+            parent.child_by_field_name("name").as_ref() == Some(node)
+        }
+        // Constructor name field on constructor_signature.
+        "constructor_signature" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Class / mixin / enum / extension declaration names.
+        "class_declaration"
+        | "mixin_declaration"
+        | "enum_declaration"
+        | "extension_declaration"
+        | "extension_type_declaration" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Typed identifier (e.g. `int x` in a declaration or parameter) — the
+        // `name` field is the bound identifier.
+        "typed_identifier" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Variable binding names in initialized_identifier (local + field vars).
+        "initialized_identifier" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Import alias identifier — direct child of import_specification.
+        // Show-combinator identifier — direct child of combinator.
+        "import_specification" | "combinator" => true,
+        // Bare assignment LHS target (sole identifier inside assignable_expression
+        // that is the left field of assignment_expression) — handled by
+        // collect_write_references. Member/index assignable targets are NOT
+        // excluded here: `obj` in `obj.prop = x` is a genuine Read.
+        "assignable_expression" => is_bare_assignable_target(node),
+        // Member-access property leaf (`obj.prop` — skip `prop`, keep `obj`).
+        "member_expression"
+        | "null_aware_member_expression"
+        | "cascade_member_expression"
+        | "cascade_null_aware_member_expression" => {
+            parent.child_by_field_name("property").as_ref() == Some(node)
+        }
+        _ => false,
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Read`] references for bare
+/// `identifier` nodes used in value/expression positions.
+///
+/// Skips identifiers already captured by other collectors:
+/// call callees, declaration names, variable binding names, parameter names,
+/// import binding names, assignment LHS, member-access property leaves.
+/// Applies [`MIN_REF_LEN`].
+fn collect_read_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "identifier" {
+        let name = node_text(node, bytes);
+        if name.len() >= MIN_REF_LEN && !is_non_read_position(node) {
+            push_ref(out, name, node, file, RefRole::Read);
+        }
+        // identifiers have no meaningful sub-identifier children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_references(&child, bytes, file, out);
+    }
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] references for the
+/// bare-identifier LHS of `assignment_expression` nodes
+/// (e.g. `x = 5`, `x += 1`, `x ??= value`).
+///
+/// All compound/simple assignments share the `assignment_expression` node kind
+/// in tree-sitter-dart (the operator variant is tracked in the `operator` field,
+/// not a separate node kind).
+///
+/// The actual AST structure wraps the target in an `assignable_expression`:
+/// ```text
+/// (assignment_expression
+///   left: (assignable_expression (identifier))
+///   right: …)
+/// ```
+/// A Write is emitted only for a bare target — i.e. when the
+/// `assignable_expression` holds exactly one `identifier` child (no
+/// member/index selectors). Member/index
+/// LHS (`obj.prop = …`, `arr[i] = …`) are not covered in v1. As a defensive
+/// fallback the direct `left == identifier` case (grammar may vary) is also
+/// handled. Applies [`MIN_REF_LEN`].
+fn collect_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "assignment_expression" {
+        if let Some(lhs) = node.child_by_field_name("left") {
+            match lhs.kind() {
+                // Actual Dart AST: left field is assignable_expression wrapping
+                // a bare identifier.
+                "assignable_expression" => {
+                    // Collect all direct identifier children in one walk.
+                    // Exactly one → bare target (Write); more than one → member/index
+                    // target (not a v1 Write). Context already guarantees lhs is the
+                    // `left` field of `assignment_expression`, so the grandparent
+                    // checks inside `is_bare_assignable_target` are redundant here.
+                    let id_children: Vec<_> = lhs
+                        .children(&mut lhs.walk())
+                        .filter(|c| c.kind() == "identifier")
+                        .collect();
+                    if let [id_node] = id_children.as_slice() {
+                        let name = node_text(id_node, bytes);
+                        if name.len() >= MIN_REF_LEN {
+                            push_ref(out, name, id_node, file, RefRole::Write);
+                        }
+                    }
+                }
+                // Defensive fallback: direct identifier as left field.
+                "identifier" => {
+                    let name = node_text(&lhs, bytes);
+                    if name.len() >= MIN_REF_LEN {
+                        push_ref(out, name, &lhs, file, RefRole::Write);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_write_references(&child, bytes, file, out);
+    }
+}
+
 // ── Scope tree ───────────────────────────────────────────────────────────────
 
 fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
@@ -1169,6 +1370,123 @@ class Dog extends Animal implements Pet {
         assert!(
             inherit_names.contains(&"Pet"),
             "expected 'Pet' in IsImplementation refs: {inherit_names:?}"
+        );
+    }
+
+    // ── Read / Write references ──────────────────────────────────────────────
+
+    #[test]
+    fn reassignment_emits_write_for_lhs_and_reads_for_rhs() {
+        // `total = total + bonus;` — Write for `total` (LHS), Read for `total`
+        // and `bonus` on the RHS.
+        let src = r#"
+void run() {
+  var total = 0;
+  var bonus = 5;
+  total = total + bonus;
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+
+        let writes: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            writes.contains(&"total"),
+            "expected Write ref for 'total': {writes:?}"
+        );
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.contains(&"bonus"),
+            "expected Read ref for 'bonus': {reads:?}"
+        );
+        assert!(
+            reads.contains(&"total"),
+            "expected Read ref for RHS 'total': {reads:?}"
+        );
+    }
+
+    #[test]
+    fn declaration_does_not_emit_write_for_bound_name() {
+        // `var result = compute();` — the binding name `result` is NOT a Write.
+        let src = r#"
+void run() {
+  var result = compute();
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+
+        let write_names: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Write)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            !write_names.contains(&"result"),
+            "declaration name 'result' must NOT produce a Write ref: {write_names:?}"
+        );
+    }
+
+    #[test]
+    fn call_argument_is_read_but_callee_is_not() {
+        // `logger(config);` — Read for `config`, no Read for the callee `logger`.
+        let src = r#"
+void run() {
+  logger(config);
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.contains(&"config"),
+            "expected Read ref for 'config': {reads:?}"
+        );
+        assert!(
+            !reads.contains(&"logger"),
+            "callee 'logger' must NOT be emitted as a Read ref: {reads:?}"
+        );
+    }
+
+    #[test]
+    fn member_access_object_is_read_but_property_is_not() {
+        // `value = source.field;` — Read for `source`, NOT for `field`.
+        let src = r#"
+void run() {
+  var value = 0;
+  value = source.field;
+}
+"#;
+        let facts = extract(src, "lib/run.dart");
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(
+            reads.contains(&"source"),
+            "expected Read ref for 'source': {reads:?}"
+        );
+        assert!(
+            !reads.contains(&"field"),
+            "member property 'field' must NOT be emitted as a Read ref: {reads:?}"
         );
     }
 }

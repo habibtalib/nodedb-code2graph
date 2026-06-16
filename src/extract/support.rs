@@ -420,6 +420,61 @@ pub(crate) fn import_bindings(refs: &[Reference], scopes: &[Scope]) -> Vec<Bindi
         .collect()
 }
 
+// ── Embedded-language offset remap ──────────────────────────────────────────
+
+/// Convert a byte offset to a 1-based (line, 0-based col) pair by scanning the
+/// bytes of the containing file.  Used when remapping inner-block offsets back
+/// into the enclosing document.
+pub(crate) fn byte_to_line_col(bytes: &[u8], byte: usize) -> (u32, u32) {
+    let safe = byte.min(bytes.len());
+    let prefix = &bytes[..safe];
+    let line = 1 + prefix.iter().filter(|&&b| b == b'\n').count() as u32;
+    let col = prefix.iter().rev().take_while(|&&b| b != b'\n').count() as u32;
+    (line, col)
+}
+
+/// Shift all byte offsets in `facts` by `delta` so that positions are expressed
+/// relative to the enclosing file (`embedding_bytes`) rather than the inner
+/// script/template block.  Also overwrites `facts.file` and `facts.lang`.
+///
+/// Scope indices (`Binding.scope`, `Reference.scope`) are Vec indices — they
+/// are NOT shifted here; the caller handles cross-block scope-index fixup when
+/// merging multiple blocks.
+pub(crate) fn shift_offsets(
+    facts: &mut crate::graph::types::FileFacts,
+    delta: usize,
+    file: &str,
+    lang: &str,
+    embedding_bytes: &[u8],
+) {
+    facts.file = file.to_owned();
+    facts.lang = lang.to_owned();
+
+    for sym in &mut facts.symbols {
+        sym.file = file.to_owned();
+        sym.span.start += delta;
+        sym.span.end += delta;
+        sym.line = byte_to_line_col(embedding_bytes, sym.span.start).0;
+    }
+
+    for scope in &mut facts.scopes {
+        scope.span.start += delta;
+        scope.span.end += delta;
+    }
+
+    for r in &mut facts.references {
+        r.occ.file = file.to_owned();
+        r.occ.byte += delta;
+        let (line, col) = byte_to_line_col(embedding_bytes, r.occ.byte);
+        r.occ.line = line;
+        r.occ.col = col;
+    }
+
+    for b in &mut facts.bindings {
+        b.intro += delta;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

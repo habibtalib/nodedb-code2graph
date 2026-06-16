@@ -47,6 +47,8 @@ use super::ShellExtractor;
 use super::SolidityExtractor;
 #[cfg(feature = "sql")]
 use super::SqlExtractor;
+#[cfg(feature = "svelte")]
+use super::SvelteExtractor;
 #[cfg(feature = "swift")]
 use super::SwiftExtractor;
 #[cfg(feature = "typescript")]
@@ -114,6 +116,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Luau => LuauExtractor.extract(source, file),
         #[cfg(feature = "pascal")]
         Language::Pascal => PascalExtractor.extract(source, file),
+        #[cfg(feature = "svelte")]
+        Language::Svelte => SvelteExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

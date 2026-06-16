@@ -52,6 +52,8 @@ pub mod shell;
 pub mod solidity;
 #[cfg(feature = "sql")]
 pub mod sql;
+#[cfg(feature = "svelte")]
+pub mod svelte;
 #[cfg(feature = "swift")]
 pub mod swift;
 #[cfg(feature = "typescript")]
@@ -99,6 +101,8 @@ pub use shell::ShellExtractor;
 pub use solidity::SolidityExtractor;
 #[cfg(feature = "sql")]
 pub use sql::SqlExtractor;
+#[cfg(feature = "svelte")]
+pub use svelte::SvelteExtractor;
 #[cfg(feature = "swift")]
 pub use swift::SwiftExtractor;
 #[cfg(feature = "typescript")]
@@ -106,8 +110,8 @@ pub use typescript::TypeScriptExtractor;
 
 #[allow(unused_imports)]
 pub(crate) use support::{
-    MIN_REF_LEN, attach_reference_scopes, child_text, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, is_static, module_name, module_symbol,
-    node_occurrence, node_span, node_text, one_line_signature, push_binding, push_import_ref,
-    push_ref, push_scope, push_type_ref, simple_type_name, unquote,
+    MIN_REF_LEN, attach_reference_scopes, byte_to_line_col, child_text, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, is_static, module_name,
+    module_symbol, node_occurrence, node_span, node_text, one_line_signature, push_binding,
+    push_import_ref, push_ref, push_scope, push_type_ref, shift_offsets, simple_type_name, unquote,
 };

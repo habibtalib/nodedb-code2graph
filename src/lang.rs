@@ -30,6 +30,7 @@ pub enum Language {
     Lua,        // .lua
     Luau,       // .luau
     Pascal,     // .pas, .dpr, .dpk, .lpr
+    Svelte,     // .svelte
 }
 
 impl Language {
@@ -58,6 +59,7 @@ impl Language {
             Language::Lua => "lua",
             Language::Luau => "luau",
             Language::Pascal => "pascal",
+            Language::Svelte => "svelte",
         }
     }
 
@@ -86,6 +88,7 @@ impl Language {
             "lua" => Some(Self::Lua),
             "luau" => Some(Self::Luau),
             "pas" | "dpr" | "dpk" | "lpr" => Some(Self::Pascal),
+            "svelte" => Some(Self::Svelte),
             _ => None,
         }
     }

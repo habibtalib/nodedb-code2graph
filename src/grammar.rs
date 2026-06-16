@@ -141,6 +141,12 @@ pub fn pascal() -> Language {
     tree_sitter_pascal::LANGUAGE.into()
 }
 
+#[cfg(feature = "svelte")]
+/// Returns the tree-sitter grammar for Svelte single-file components.
+pub fn svelte() -> Language {
+    tree_sitter_svelte_ng::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};

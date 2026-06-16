@@ -14,7 +14,7 @@ planned. One table; only languages we'll **never** support are kept out of it (s
 - **Tier A** (`SymbolTableResolver`) — name-based, recall-first; the floor under **every
   _supported_ language** (the ⭐/🟢/🟣 rows). An ambiguous name links to all same-named definitions
   (`NameOnly`, or `Scoped` when globally unique). It only needs symbols + references, which every
-  extractor emits — so 🟠 planned / 🔴 blocked languages get *nothing* (no extractor → no facts → no
+  extractor emits — so 🟠 planned / 🔴 blocked languages get _nothing_ (no extractor → no facts → no
   resolution at all, Tier-A included) until an extractor is written.
 - **Tier B** (`ScopeGraphResolver`) — scope-aware (lexical scopes, imports, qualified paths),
   `Scoped`/`Exact`, never fakes precision. Available where the extractor emits `scopes` + `bindings`.
@@ -32,60 +32,62 @@ planned. One table; only languages we'll **never** support are kept out of it (s
   _(Always confirm `tree-sitter >=0.24, <0.27` compatibility first — see CONTRIBUTING.)_
 - 🔴 **blocked** — feasible in principle, but no usable/compatible grammar exists yet.
 
-**Capabilities:** ✓ emitted · ⤴ via a shared extractor · — not emitted / n/a · _blank_ = not implemented yet.
+**Capabilities:** ✓ emitted · ⤴ via a shared extractor · — not emitted / n/a · _blank_ = not implemented yet (a gap to contribute).
 
+**Entry-pts** = attack-surface markers (`main`, HTTP routes); see [Entry-points](#entry-points).
 Cross-language **FFI** is a property of language _pairs_, so it lives in its own matrix —
 [ffi-support-matrix.md](ffi-support-matrix.md).
 
 ## Languages
 
-| Language        | Extensions                              | Status | Calls | Imports | Inherit | Type-ref | Read/Write | Notes                                                                 |
-| --------------- | --------------------------------------- | :----: | :---: | :-----: | :-----: | :------: | :--------: | --------------------------------------------------------------------- |
-| Rust            | `.rs`                                   |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      | traits → inherit; FFI producer                                        |
-| TypeScript      | `.ts` `.tsx`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| JavaScript      | `.js` `.jsx` `.mjs` `.cjs`              |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      | via the TS engine; not separately oracle-scored                       |
-| Python          | `.py` `.pyi`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Go              | `.go`                                   |   ⭐   |   ✓   |    ✓    |    —    |    ✓     |     ✓      | structural interfaces → no class inheritance                          |
-| Java            | `.java`                                 |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| C               | `.c` `.h`                               |   ⭐   |   ✓   |    —    |    —    |    ✓     |     ✓      | no import graph                                                       |
-| C++             | `.cc` `.cpp` `.cxx` `.hh` `.hpp` `.hxx` |   ⭐   |   ✓   |    —    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Kotlin          | `.kt` `.kts`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Ruby            | `.rb`                                   |   ⭐   |   ✓   |    —    |    ✓    |    —     |     ✓      | no type-refs / import graph                                           |
-| PHP             | `.php`                                  |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Swift           | `.swift`                                |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| C#              | `.cs`                                   |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Scala           | `.scala` `.sc`                          |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Dart            | `.dart`                                 |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Solidity        | `.sol`                                  |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Lua             | `.lua`                                  |   🟢   |   ✓   |    ✓    |    —    |    —     |     ✓      |                                                                       |
-| Luau            | `.luau`                                 |   🟢   |   ⤴   |    ⤴    |    —    |    —     |     ⤴      | via the Lua-family core                                               |
-| Pascal / Delphi | `.pas` `.dpr` `.dpk` `.lpr`             |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |                                                                       |
-| Shell           | `.sh` `.bash` `.zsh`                    |   🟢   |   ✓   |    —    |    —    |    —     |     ✓      |                                                                       |
-| Svelte          | `.svelte`                               |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      | `<script>` blocks via the TS engine                                   |
-| SQL             | `.sql`                                  |   🟣   |   —   |    —    |    —    |    ✓     |     —      | `Table`/`View`/`Column` symbols; `FROM`/`JOIN` refs                   |
-| HCL / Terraform | `.tf` `.hcl` `.tfvars`                  |   🟣   |   —   |    —    |    —    |    ✓     |     —      | `Resource`/module symbols; resource refs                              |
-| Elixir          | `.ex` `.exs`                            |   🟠   |       |         |         |          |            | tree-sitter-elixir; `def`/`defp` = clean visibility; macros = ceiling |
-| Erlang          | `.erl` `.hrl`                           |   🟠   |       |         |         |          |            | tree-sitter-erlang (WhatsApp); `-export` = visibility                 |
-| Gleam           | `.gleam`                                |   🟠   |       |         |         |          |            | BEAM family; tree-sitter-gleam                                        |
-| Zig             | `.zig`                                  |   🟠   |       |         |         |          |            | tree-sitter-zig                                                       |
-| Julia           | `.jl`                                   |   🟠   |       |         |         |          |            | tree-sitter-julia                                                     |
-| R               | `.r` `.R`                               |   🟠   |       |         |         |          |            | tree-sitter-r                                                         |
-| Haskell         | `.hs`                                   |   🟠   |       |         |         |          |            | tree-sitter-haskell                                                   |
-| OCaml           | `.ml` `.mli`                            |   🟠   |       |         |         |          |            | tree-sitter-ocaml                                                     |
-| Objective-C     | `.m` `.mm`                              |   🟠   |       |         |         |          |            | exposes C ABI; pairs with Swift                                       |
-| Fortran         | `.f90` `.f`                             |   🟠   |       |         |         |          |            | tree-sitter-fortran                                                   |
-| Groovy          | `.groovy` `.gradle`                     |   🟠   |       |         |         |          |            | tree-sitter-groovy                                                    |
-| PowerShell      | `.ps1` `.psm1`                          |   🟠   |       |         |         |          |            | grammar exists — verify compat                                        |
-| SystemVerilog   | `.sv` `.svh`                            |   🟠   |       |         |         |          |            | hardware; tree-sitter-verilog                                         |
-| Astro           | `.astro`                                |   🟠   |       |         |         |          |            | SFC — embedded-script pattern (like Svelte)                           |
-| Vue             | `.vue`                                  |   🔴   |       |         |         |          |            | SFC; no maintained grammar compatible with our pinned tree-sitter     |
-| Liquid          | `.liquid`                               |   🔴   |       |         |         |          |            | no compatible grammar                                                 |
-| F#              | `.fs` `.fsi`                            |   🔴   |       |         |         |          |            | grammar availability/compat to verify                                 |
-| Salesforce Apex | `.cls` `.trigger`                       |   🔴   |       |         |         |          |            | grammar availability/compat to verify                                 |
-| COBOL           | `.cob` `.cbl`                           |   🔴   |       |         |         |          |            | grammar maturity to verify                                            |
+| Language        | Extensions                              | Status | Calls | Imports | Inherit | Type-ref | Read/Write | Entry-pts | Notes                                                                 |
+| --------------- | --------------------------------------- | :----: | :---: | :-----: | :-----: | :------: | :--------: | :-------: | --------------------------------------------------------------------- |
+| Rust            | `.rs`                                   |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           | traits → inherit; FFI producer                                        |
+| TypeScript      | `.ts` `.tsx`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| JavaScript      | `.js` `.jsx` `.mjs` `.cjs`              |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      |           | via the TS engine; not separately oracle-scored                       |
+| Python          | `.py` `.pyi`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
+| Go              | `.go`                                   |   ⭐   |   ✓   |    ✓    |    —    |    ✓     |     ✓      |           | structural interfaces → no class inheritance                          |
+| Java            | `.java`                                 |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| C               | `.c` `.h`                               |   ⭐   |   ✓   |    —    |    —    |    ✓     |     ✓      |           | no import graph                                                       |
+| C++             | `.cc` `.cpp` `.cxx` `.hh` `.hpp` `.hxx` |   ⭐   |   ✓   |    —    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Kotlin          | `.kt` `.kts`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Ruby            | `.rb`                                   |   ⭐   |   ✓   |    —    |    ✓    |    —     |     ✓      |           | no type-refs / import graph                                           |
+| PHP             | `.php`                                  |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Swift           | `.swift`                                |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| C#              | `.cs`                                   |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Scala           | `.scala` `.sc`                          |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Dart            | `.dart`                                 |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Solidity        | `.sol`                                  |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Lua             | `.lua`                                  |   🟢   |   ✓   |    ✓    |    —    |    —     |     ✓      |           |                                                                       |
+| Luau            | `.luau`                                 |   🟢   |   ⤴   |    ⤴    |    —    |    —     |     ⤴      |           | via the Lua-family core                                               |
+| Pascal / Delphi | `.pas` `.dpr` `.dpk` `.lpr`             |   🟢   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| Shell           | `.sh` `.bash` `.zsh`                    |   🟢   |   ✓   |    —    |    —    |    —     |     ✓      |           |                                                                       |
+| Svelte          | `.svelte`                               |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      |           | `<script>` blocks via the TS engine                                   |
+| SQL             | `.sql`                                  |   🟣   |   —   |    —    |    —    |    ✓     |     —      |     —     | `Table`/`View`/`Column` symbols; `FROM`/`JOIN` refs                   |
+| HCL / Terraform | `.tf` `.hcl` `.tfvars`                  |   🟣   |   —   |    —    |    —    |    ✓     |     —      |     —     | `Resource`/module symbols; resource refs                              |
+| Elixir          | `.ex` `.exs`                            |   🟠   |       |         |         |          |            |           | tree-sitter-elixir; `def`/`defp` = clean visibility; macros = ceiling |
+| Erlang          | `.erl` `.hrl`                           |   🟠   |       |         |         |          |            |           | tree-sitter-erlang (WhatsApp); `-export` = visibility                 |
+| Gleam           | `.gleam`                                |   🟠   |       |         |         |          |            |           | BEAM family; tree-sitter-gleam                                        |
+| Zig             | `.zig`                                  |   🟠   |       |         |         |          |            |           | tree-sitter-zig                                                       |
+| Julia           | `.jl`                                   |   🟠   |       |         |         |          |            |           | tree-sitter-julia                                                     |
+| R               | `.r` `.R`                               |   🟠   |       |         |         |          |            |           | tree-sitter-r                                                         |
+| Haskell         | `.hs`                                   |   🟠   |       |         |         |          |            |           | tree-sitter-haskell                                                   |
+| OCaml           | `.ml` `.mli`                            |   🟠   |       |         |         |          |            |           | tree-sitter-ocaml                                                     |
+| Objective-C     | `.m` `.mm`                              |   🟠   |       |         |         |          |            |           | exposes C ABI; pairs with Swift                                       |
+| Fortran         | `.f90` `.f`                             |   🟠   |       |         |         |          |            |           | tree-sitter-fortran                                                   |
+| Groovy          | `.groovy` `.gradle`                     |   🟠   |       |         |         |          |            |           | tree-sitter-groovy                                                    |
+| PowerShell      | `.ps1` `.psm1`                          |   🟠   |       |         |         |          |            |           | grammar exists — verify compat                                        |
+| SystemVerilog   | `.sv` `.svh`                            |   🟠   |       |         |         |          |            |           | hardware; tree-sitter-verilog                                         |
+| Astro           | `.astro`                                |   🟠   |       |         |         |          |            |           | SFC — embedded-script pattern (like Svelte)                           |
+| Vue             | `.vue`                                  |   🔴   |       |         |         |          |            |           | SFC; no maintained grammar compatible with our pinned tree-sitter     |
+| Liquid          | `.liquid`                               |   🔴   |       |         |         |          |            |           | no compatible grammar                                                 |
+| F#              | `.fs` `.fsi`                            |   🔴   |       |         |         |          |            |           | grammar availability/compat to verify                                 |
+| Salesforce Apex | `.cls` `.trigger`                       |   🔴   |       |         |         |          |            |           | grammar availability/compat to verify                                 |
+| COBOL           | `.cob` `.cbl`                           |   🔴   |       |         |         |          |            |           | grammar maturity to verify                                            |
 
-**23 supported** (⭐/🟢/🟣) · the rest are 🟠 planned / 🔴 blocked. The 🟠/🔴 set is illustrative, not a
-queue — anything with a compatible grammar follows the same recipe.
+Supported = the ⭐/🟢/🟣 rows; 🟠 planned / 🔴 blocked are not a queue — anything with a compatible
+grammar follows the same recipe. **Blank cells on supported rows are real gaps** — exactly where a
+contribution lands.
 
 ## What every supported language gets
 
@@ -98,11 +100,19 @@ queue — anything with a compatible grammar follows the same recipe.
   with a `Confidence` (`Heuristic` < `NameOnly` < `Scoped` < `Exact`) and a `Provenance` (which
   analysis derived the edge).
 
+## Entry-points
+
+The **Entry-pts** column tracks a neutral `EntryPoint` fact — `Main`, or `HttpRoute("<marker>")`
+carrying the raw framework marker as written (e.g. `app.get`, `GetMapping`) — detected from
+unambiguous syntax only; the consumer decides what counts as attack surface. Per-language status is
+the column above (✓ where a detector ships · blank = open contribution); the detector follows the
+same marker-walk pattern as FFI-export detection.
+
 ## Honest limitations
 
-- **Oracle coverage is 9 languages** (the ⭐ rows). Tier-B is _implemented_ more broadly (the 🟢
-  rows), but only the ⭐ set has its precision/recall measured against an external compiler-grade
-  index. The rest are "expected-good, not proven."
+- **Oracle coverage = the ⭐ rows.** Tier-B is _implemented_ more broadly (the 🟢 rows), but only the
+  ⭐ set has its precision/recall measured against an external compiler-grade index. The rest are
+  "expected-good, not proven."
 - **The type-inference ceiling is real and we don't fake past it.** Pure syntax + scope can't fully
   resolve generics, dynamic dispatch, overloads, or macro/metaprogramming-generated code. Those
   references stay at lower `Confidence` or unresolved — by design.

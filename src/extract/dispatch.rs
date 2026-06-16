@@ -69,6 +69,7 @@ pub trait Extractor {
 /// Each language arm is compiled only when the corresponding Cargo feature is
 /// enabled (e.g. `rust`, `python`, `typescript`, …). Disabled languages return
 /// [`CodegraphError::UnsupportedLanguage`] at runtime.
+#[cfg_attr(not(feature = "_extractors"), allow(unused_variables))]
 pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFacts> {
     #[allow(unreachable_patterns)]
     match lang {

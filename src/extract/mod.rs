@@ -10,6 +10,7 @@
 //! [`FileFacts`]: crate::graph::FileFacts
 
 mod dispatch;
+#[cfg(feature = "_extractors")]
 mod support;
 
 #[cfg(feature = "c")]
@@ -108,6 +109,7 @@ pub use swift::SwiftExtractor;
 #[cfg(feature = "typescript")]
 pub use typescript::TypeScriptExtractor;
 
+#[cfg(feature = "_extractors")]
 #[allow(unused_imports)]
 pub(crate) use support::{
     MIN_REF_LEN, attach_reference_scopes, byte_to_line_col, child_text, collect_call_references,

@@ -6,6 +6,10 @@
 //! a generic call-reference query runner). Per-language modules pull them in
 //! via `super::` re-exports; nothing here is part of the public API.
 
+// This is the shared extractor toolkit; which helpers are live depends on the
+// set of enabled language features, so unused-in-this-build helpers are expected.
+#![allow(dead_code)]
+
 use tree_sitter::{Language as TsLanguage, Node, Query, QueryCursor, StreamingIterator};
 
 use crate::error::{CodegraphError, Result};

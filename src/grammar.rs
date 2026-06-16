@@ -7,6 +7,7 @@
 //! All grammar crate imports live here; no extractor module may import a grammar crate
 //! directly.
 
+#[cfg(feature = "_extractors")]
 use tree_sitter::Language;
 
 #[cfg(feature = "rust")]

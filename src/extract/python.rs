@@ -18,12 +18,12 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, node_span, node_text, one_line_signature, push_binding, push_ref,
-    push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, make_symbol, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -62,7 +62,12 @@ impl Extractor for PythonExtractor {
         let bytes = source.as_bytes();
         let namespaces = python_namespaces(file);
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Python,
+        };
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Python, &namespaces, file, source.len());
@@ -120,13 +125,13 @@ fn python_namespaces(file: &str) -> Vec<String> {
     parts
 }
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
     for child in root.children(&mut root.walk()) {
         // (span node, signature node, name, kind, leaf descriptor)
         let parsed = match child.kind() {
-            "function_definition" => def_of(&child, &child, bytes, true),
-            "class_definition" => def_of(&child, &child, bytes, false),
+            "function_definition" => def_of(&child, &child, ctx.bytes, true),
+            "class_definition" => def_of(&child, &child, ctx.bytes, false),
             "decorated_definition" => {
                 let Some(inner) = child
                     .children(&mut child.walk())
@@ -136,9 +141,9 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 };
                 let is_fn = inner.kind() == "function_definition";
                 // span includes decorators (outer node); signature is the def line.
-                def_of(&child, &inner, bytes, is_fn)
+                def_of(&child, &inner, ctx.bytes, is_fn)
             }
-            "expression_statement" | "assignment" => const_of(&child, bytes),
+            "expression_statement" | "assignment" => const_of(&child, ctx.bytes),
             _ => None,
         };
         let Some((span_node, sig_node, name, kind, leaf)) = parsed else {
@@ -152,19 +157,16 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             .collect();
         descriptors.push(leaf);
 
-        out.push(Symbol {
-            id: SymbolId::global(Language::Python.as_str(), descriptors),
+        let signature = one_line_signature(node_text(&sig_node, ctx.bytes), &[':']);
+        out.push(make_symbol(
+            ctx,
+            &span_node,
             name,
             kind,
-            visibility: Visibility::Public,
-            file: file.to_owned(),
-            line: (span_node.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: span_node.start_byte(),
-                end: span_node.end_byte(),
-            },
-            signature: one_line_signature(node_text(&sig_node, bytes), &[':']),
-        });
+            Visibility::Public,
+            descriptors,
+            signature,
+        ));
     }
     out
 }

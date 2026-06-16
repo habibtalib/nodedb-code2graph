@@ -2,10 +2,10 @@
 
 //! C# extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: non-`private` type declarations (`class`, `struct`, `interface`,
-//! `enum`, `record`) and their non-`private` members (methods, constructors,
-//! properties, fields, enum members). Interface members are treated as implicitly
-//! public. Qualified identity follows the `namespace_declaration` or
+//! Definitions: all type declarations (`class`, `struct`, `interface`, `enum`,
+//! `record`) and their members (methods, constructors, properties, fields, enum
+//! members), each tagged with a real [`Visibility`]. Interface members are treated
+//! as implicitly public. Qualified identity follows the `namespace_declaration` or
 //! `file_scoped_namespace_declaration` if present; otherwise falls back to a
 //! path-derived namespace.
 //!
@@ -150,19 +150,46 @@ fn csharp_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
 
 // ── Visibility ───────────────────────────────────────────────────────────────
 
-/// Returns `true` if the declaration should be emitted (not `private`).
+/// Read the declared visibility from a declaration node's modifier children.
 ///
-/// C# declarations have zero or more `modifier` sibling children. We scan them:
-/// if `"private"` is found the symbol is suppressed. Everything else (public,
-/// protected, internal, or no modifier → default accessibility) is emitted.
-/// Interface members carry no modifiers but are implicitly public.
-fn is_visible(node: &Node, bytes: &[u8]) -> bool {
+/// Precedence (checked in order):
+/// 1. `private` keyword present → `Visibility::Private`
+///    (covers `private protected`: `private` is checked first).
+/// 2. `protected` keyword present → `Visibility::Protected`
+///    (covers `protected internal`: `protected` is checked second).
+/// 3. `public` keyword present → `Visibility::Public`.
+/// 4. `internal` keyword present, OR no access modifier at all →
+///    `Visibility::Internal` (C# namespace-level default).
+///
+/// Interface members carry no modifiers but are implicitly public; callers
+/// that know they are inside an interface should use `Visibility::Public`
+/// directly rather than calling this function.
+fn read_visibility(node: &Node, bytes: &[u8]) -> Visibility {
+    let mut has_private = false;
+    let mut has_protected = false;
+    let mut has_public = false;
+
     for child in node.children(&mut node.walk()) {
-        if child.kind() == "modifier" && node_text(&child, bytes) == "private" {
-            return false;
+        if child.kind() == "modifier" {
+            match node_text(&child, bytes) {
+                "private" => has_private = true,
+                "protected" => has_protected = true,
+                "public" => has_public = true,
+                _ => {}
+            }
         }
     }
-    true
+
+    if has_private {
+        Visibility::Private
+    } else if has_protected {
+        Visibility::Protected
+    } else if has_public {
+        Visibility::Public
+    } else {
+        // `internal` explicit, or no access modifier → internal (C# namespace default).
+        Visibility::Internal
+    }
 }
 
 // ── Symbol collection ────────────────────────────────────────────────────────
@@ -211,9 +238,6 @@ fn collect_types_in(
             | "interface_declaration"
             | "enum_declaration"
             | "record_declaration") => {
-                if !implicit_public && !is_visible(&child, bytes) {
-                    continue;
-                }
                 let Some(type_name) = field_text(&child, "name", bytes) else {
                     continue;
                 };
@@ -224,6 +248,11 @@ fn collect_types_in(
                     "enum_declaration" => SymbolKind::Enum,
                     _ => SymbolKind::Class,
                 };
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&child, bytes)
+                };
 
                 let mut type_descriptors = prefix.to_vec();
                 type_descriptors.push(Descriptor::Type(type_name.clone()));
@@ -231,7 +260,7 @@ fn collect_types_in(
                     id: SymbolId::global(Language::CSharp.as_str(), type_descriptors.clone()),
                     name: type_name.clone(),
                     kind: type_kind,
-                    visibility: Visibility::Public,
+                    visibility: vis,
                     file: file.to_owned(),
                     line: (child.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -266,11 +295,13 @@ fn collect_members(
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "method_declaration" | "constructor_declaration" | "property_declaration" => {
-                if !implicit_public && !is_visible(&member, bytes) {
-                    continue;
-                }
                 let Some(name) = field_text(&member, "name", bytes) else {
                     continue;
+                };
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&member, bytes)
                 };
                 let mut descriptors = type_prefix.to_vec();
                 descriptors.push(Descriptor::Method {
@@ -281,7 +312,7 @@ fn collect_members(
                     id: SymbolId::global(Language::CSharp.as_str(), descriptors),
                     name,
                     kind: SymbolKind::Method,
-                    visibility: Visibility::Public,
+                    visibility: vis,
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -292,12 +323,14 @@ fn collect_members(
                 });
             }
             "field_declaration" => {
-                if !implicit_public && !is_visible(&member, bytes) {
-                    continue;
-                }
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&member, bytes)
+                };
                 // field_declaration has no `name` field — descend into
                 // variable_declaration → variable_declarator.
-                collect_field_declarators(&member, bytes, file, type_prefix, out);
+                collect_field_declarators(&member, bytes, file, type_prefix, vis, out);
             }
             "enum_member_declaration" => {
                 // Enum members are always public.
@@ -326,9 +359,6 @@ fn collect_members(
             | "interface_declaration"
             | "enum_declaration"
             | "record_declaration") => {
-                if !implicit_public && !is_visible(&member, bytes) {
-                    continue;
-                }
                 let Some(nested_name) = field_text(&member, "name", bytes) else {
                     continue;
                 };
@@ -339,13 +369,18 @@ fn collect_members(
                     "enum_declaration" => SymbolKind::Enum,
                     _ => SymbolKind::Class,
                 };
+                let vis = if implicit_public {
+                    Visibility::Public
+                } else {
+                    read_visibility(&member, bytes)
+                };
                 let mut nested_descriptors = type_prefix.to_vec();
                 nested_descriptors.push(Descriptor::Type(nested_name.clone()));
                 out.push(Symbol {
                     id: SymbolId::global(Language::CSharp.as_str(), nested_descriptors.clone()),
                     name: nested_name.clone(),
                     kind: nested_kind,
-                    visibility: Visibility::Public,
+                    visibility: vis,
                     file: file.to_owned(),
                     line: (member.start_position().row + 1) as u32,
                     span: ByteSpan {
@@ -379,6 +414,7 @@ fn collect_field_declarators(
     bytes: &[u8],
     file: &str,
     type_prefix: &[Descriptor],
+    visibility: Visibility,
     out: &mut Vec<Symbol>,
 ) {
     for child in field.children(&mut field.walk()) {
@@ -399,7 +435,7 @@ fn collect_field_declarators(
                         id: SymbolId::global(Language::CSharp.as_str(), descriptors),
                         name: name.to_owned(),
                         kind: SymbolKind::Static,
-                        visibility: Visibility::Public,
+                        visibility,
                         file: file.to_owned(),
                         line: (field.start_position().row + 1) as u32,
                         span: ByteSpan {
@@ -845,6 +881,7 @@ namespace MyApp.Auth {
 
         let sm = by_name("SessionManager").unwrap();
         assert_eq!(sm.kind, SymbolKind::Class);
+        assert_eq!(sm.visibility, Visibility::Public);
         assert_eq!(
             sm.id.to_scip_string(),
             "codegraph . . . MyApp/Auth/SessionManager#"
@@ -852,13 +889,19 @@ namespace MyApp.Auth {
 
         let validate = by_name("Validate").unwrap();
         assert_eq!(validate.kind, SymbolKind::Method);
+        assert_eq!(validate.visibility, Visibility::Public);
         assert_eq!(
             validate.id.to_scip_string(),
             "codegraph . . . MyApp/Auth/SessionManager#Validate()."
         );
 
-        // private method must not appear
-        assert!(by_name("Secret").is_none());
+        // private method must appear with Visibility::Private
+        let secret = by_name("Secret").expect("private method 'Secret' must now be emitted");
+        assert_eq!(secret.visibility, Visibility::Private);
+        assert_eq!(
+            secret.id.to_scip_string(),
+            "codegraph . . . MyApp/Auth/SessionManager#Secret()."
+        );
 
         assert_eq!(facts.lang, "csharp");
     }
@@ -1197,5 +1240,173 @@ class C {
             reads.contains(&"source"),
             "initializer value 'source' must appear as a Read ref; reads: {reads:?}",
         );
+    }
+
+    // ── Visibility tagging ────────────────────────────────────────────────────
+
+    #[test]
+    fn public_visibility_tagged_correctly() {
+        let src = r#"
+namespace N {
+    public class Svc {
+        public void Open() {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Svc.cs").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        assert_eq!(by_name("Svc").unwrap().visibility, Visibility::Public);
+        assert_eq!(by_name("Open").unwrap().visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn private_def_emitted_with_private_visibility() {
+        let src = r#"
+namespace N {
+    public class Worker {
+        private void Helper() {}
+        private int count;
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Worker.cs").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        let helper = by_name("Helper").expect("private method must be emitted");
+        assert_eq!(helper.visibility, Visibility::Private);
+
+        let count = by_name("count").expect("private field must be emitted");
+        assert_eq!(count.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn protected_def_emitted_with_protected_visibility() {
+        let src = r#"
+namespace N {
+    public class Base {
+        protected void OnInit() {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Base.cs").unwrap();
+        let on_init = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "OnInit")
+            .expect("protected method must be emitted");
+        assert_eq!(on_init.visibility, Visibility::Protected);
+    }
+
+    #[test]
+    fn internal_def_emitted_with_internal_visibility() {
+        let src = r#"
+namespace N {
+    internal class Cache {
+        internal void Flush() {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Cache.cs").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        let cache = by_name("Cache").expect("internal class must be emitted");
+        assert_eq!(cache.visibility, Visibility::Internal);
+
+        let flush = by_name("Flush").expect("internal method must be emitted");
+        assert_eq!(flush.visibility, Visibility::Internal);
+    }
+
+    #[test]
+    fn no_modifier_maps_to_internal() {
+        // A class with no access modifier at namespace level defaults to internal in C#.
+        let src = r#"
+namespace N {
+    class Hidden {
+        void DoWork() {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Hidden.cs").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        let hidden = by_name("Hidden").expect("no-modifier class must be emitted");
+        assert_eq!(hidden.visibility, Visibility::Internal);
+
+        let do_work = by_name("DoWork").expect("no-modifier method must be emitted");
+        assert_eq!(do_work.visibility, Visibility::Internal);
+    }
+
+    #[test]
+    fn private_protected_maps_to_private() {
+        let src = r#"
+namespace N {
+    public class Base {
+        private protected void Hook() {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Base.cs").unwrap();
+        let hook = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Hook")
+            .expect("private protected method must be emitted");
+        // private is checked first → Private
+        assert_eq!(hook.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn protected_internal_maps_to_protected() {
+        let src = r#"
+namespace N {
+    public class Base {
+        protected internal void Extend() {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Base.cs").unwrap();
+        let extend = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Extend")
+            .expect("protected internal method must be emitted");
+        // private absent, protected present → Protected
+        assert_eq!(extend.visibility, Visibility::Protected);
+    }
+
+    #[test]
+    fn interface_members_tagged_public_implicitly() {
+        let src = r#"
+namespace N {
+    public interface IFoo {
+        void Bar();
+        int Baz { get; }
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/IFoo.cs").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        assert_eq!(by_name("Bar").unwrap().visibility, Visibility::Public);
+        assert_eq!(by_name("Baz").unwrap().visibility, Visibility::Public);
+    }
+
+    #[test]
+    fn nested_private_type_emitted_with_private_visibility() {
+        let src = r#"
+namespace N {
+    public class Outer {
+        private class Inner {}
+    }
+}
+"#;
+        let facts = CSharpExtractor.extract(src, "src/N/Outer.cs").unwrap();
+        let inner = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Inner")
+            .expect("nested private class must be emitted");
+        assert_eq!(inner.visibility, Visibility::Private);
     }
 }

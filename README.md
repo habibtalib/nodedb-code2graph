@@ -20,6 +20,12 @@ A purpose-neutral, language-agnostic code-graph extraction library. It turns sou
   <a href="CONTRIBUTING.md"><strong>Contributing</strong></a>
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/s54gDMVc7B">
+    <img src="assets/discord-cta.svg" alt="Join the code2graph Discord" width="340">
+  </a>
+</p>
+
 <p>
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0">
   <img src="https://img.shields.io/badge/rustc-1.85%2B-orange" alt="MSRV 1.85">

@@ -632,13 +632,17 @@ fn is_non_read_position(node: &Node) -> bool {
         // Inline var-assignment declaration `var x: T := …` — `x` is the
         // binding name inside the varAssignDef wrapper (not a read).
         "varAssignDef" => true,
-        // Declaration names — proc/function, type, var, const, field, enum value, label.
+        // Declaration names — proc/function name is single (leave as-is).
         "declProc" => parent.child_by_field_name("name").as_ref() == Some(node),
         "declType" => parent.child_by_field_name("name").as_ref() == Some(node),
-        "declVar" => parent.child_by_field_name("name").as_ref() == Some(node),
-        "declConst" => parent.child_by_field_name("name").as_ref() == Some(node),
-        "declField" => parent.child_by_field_name("name").as_ref() == Some(node),
-        "declArg" => parent.child_by_field_name("name").as_ref() == Some(node),
+        // Multi-name decl nodes: `var A, B: T;` / `const A, B = …;` /
+        // `field A, B: T;` / `procedure Foo(A, B: T)` all allow multiple
+        // identifiers in the `name` field. Use `is_field_child` so every
+        // name child (not just the first) is recognised as a declaration site.
+        "declVar" => is_field_child(&parent, "name", node),
+        "declConst" => is_field_child(&parent, "name", node),
+        "declField" => is_field_child(&parent, "name", node),
+        "declArg" => is_field_child(&parent, "name", node),
         "declEnumValue" => parent.child_by_field_name("name").as_ref() == Some(node),
         "declLabel" => parent.child_by_field_name("name").as_ref() == Some(node),
         // Module/unit/program name in `moduleName` node — already the module symbol.
@@ -653,6 +657,16 @@ fn is_non_read_position(node: &Node) -> bool {
         "type" => true,
         _ => false,
     }
+}
+
+/// True when `node` is one of the children occupying `parent`'s `field` field.
+/// Unlike `child_by_field_name`, this matches EVERY child of a `multiple: true`
+/// field (e.g. `var A, B: T;` where both `A` and `B` are `name` children of
+/// `declVar`).
+fn is_field_child(parent: &Node, field: &str, node: &Node) -> bool {
+    parent
+        .children_by_field_name(field, &mut parent.walk())
+        .any(|c| c == *node)
 }
 
 /// Recursively walk `node` and emit [`RefRole::Read`] references for bare
@@ -1154,12 +1168,6 @@ end.
     /// `var Total: TMyType;` — the type name `TMyType` must NOT be emitted as a Read
     /// (it is already captured as a TypeRef). Value identifiers used in an assignment
     /// (`Source` on the RHS) still must appear as Read.
-    ///
-    /// NOTE (pre-existing v1 boundary, not fixed here): comma-grouped declarations like
-    /// `var Aaa, Bbb: Integer;` produce only the first name (`Aaa`) from
-    /// `child_by_field_name("name")`; the trailing name `Bbb` leaks as a Read.
-    /// This is consistent with the existing `declVar`/`declArg` arms and is left as a
-    /// documented limitation.
     #[test]
     fn type_name_in_var_decl_is_not_a_read() {
         let src = r#"
@@ -1191,6 +1199,40 @@ end.
         assert!(
             reads.iter().any(|n| n.eq_ignore_ascii_case("Source")),
             "expected Read ref for value identifier 'Source': {reads:?}"
+        );
+    }
+
+    /// `var Total, Bonus: Integer;` — comma-grouped declaration names must NOT
+    /// be emitted as Read references. Both `Total` and `Bonus` occupy the `name`
+    /// field of the same `declVar` node; the fix uses `is_field_child` so every
+    /// `name`-field child is recognised as a declaration site, not just the first.
+    #[test]
+    fn comma_grouped_var_decl_names_are_not_reads() {
+        let src = r#"
+program Greeter;
+procedure Run;
+var Total, Bonus: Integer;
+begin
+end;
+begin
+end.
+"#;
+        let facts = extract(src, "src/Greeter.dpr");
+
+        let reads: Vec<&str> = facts
+            .references
+            .iter()
+            .filter(|r| r.role == RefRole::Read)
+            .map(|r| r.name.as_str())
+            .collect();
+
+        assert!(
+            !reads.iter().any(|n| n.eq_ignore_ascii_case("Total")),
+            "declaration name 'Total' must NOT appear as a Read ref: {reads:?}"
+        );
+        assert!(
+            !reads.iter().any(|n| n.eq_ignore_ascii_case("Bonus")),
+            "declaration name 'Bonus' must NOT appear as a Read ref: {reads:?}"
         );
     }
 }

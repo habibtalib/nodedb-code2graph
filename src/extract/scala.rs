@@ -20,12 +20,13 @@ use crate::graph::types::{
     Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, import_bindings, innermost_scope, node_span, node_text, one_line_signature,
-    push_binding, push_import_ref, push_ref, push_scope, push_type_ref, simple_type_name,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, import_bindings, innermost_scope, make_symbol, node_span,
+    node_text, one_line_signature, push_binding, push_import_ref, push_ref, push_scope,
+    push_type_ref, simple_type_name,
 };
 
 /// Tree-sitter query capturing call-callee identifiers.
@@ -68,9 +69,14 @@ impl Extractor for ScalaExtractor {
 
         let root = tree.root_node();
         let bytes = source.as_bytes();
+        let ctx = ExtractCtx {
+            bytes,
+            file,
+            lang: Language::Scala,
+        };
         let namespaces = scala_namespaces(&root, bytes, file);
 
-        let defs = collect_symbols(&root, bytes, file, &namespaces);
+        let defs = collect_symbols(&root, &ctx, &namespaces);
         let def_bindings = definition_bindings(&defs);
         let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::Scala, &namespaces, file, source.len());
@@ -151,65 +157,59 @@ fn scala_namespaces(root: &Node, bytes: &[u8], file: &str) -> Vec<String> {
 
 // ── Symbol collection ────────────────────────────────────────────────────────
 
-fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
+fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let ns_descriptors: Vec<Descriptor> = namespaces
         .iter()
         .cloned()
         .map(Descriptor::Namespace)
         .collect();
     let mut out = Vec::new();
-    collect_defs_in(root, bytes, file, &ns_descriptors, &mut out);
+    collect_defs_in(root, ctx, &ns_descriptors, &mut out);
     out
 }
 
 /// Collect Scala definition nodes recursively, extending `prefix` as we descend
 /// into type bodies.
-fn collect_defs_in(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn collect_defs_in(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     for child in node.children(&mut node.walk()) {
         match child.kind() {
             // Skip into the package body or compilation unit.
             "package_clause" => {
                 if let Some(body) = child.child_by_field_name("body") {
-                    collect_defs_in(&body, bytes, file, prefix, out);
+                    collect_defs_in(&body, ctx, prefix, out);
                 } else {
                     // Package without braces — siblings at the top level continue.
                 }
             }
 
             "class_definition" => {
-                emit_type_def(&child, bytes, file, prefix, SymbolKind::Class, out);
+                emit_type_def(&child, ctx, prefix, SymbolKind::Class, out);
             }
             "trait_definition" => {
-                emit_type_def(&child, bytes, file, prefix, SymbolKind::Trait, out);
+                emit_type_def(&child, ctx, prefix, SymbolKind::Trait, out);
             }
             "object_definition" | "package_object" => {
-                emit_type_def(&child, bytes, file, prefix, SymbolKind::Module, out);
+                emit_type_def(&child, ctx, prefix, SymbolKind::Module, out);
             }
             "enum_definition" => {
-                emit_enum_def(&child, bytes, file, prefix, out);
+                emit_enum_def(&child, ctx, prefix, out);
             }
             "function_definition" => {
-                emit_function(&child, bytes, file, prefix, out);
+                emit_function(&child, ctx, prefix, out);
             }
             "val_definition" => {
-                emit_val_or_var(&child, bytes, file, prefix, SymbolKind::Const, out);
+                emit_val_or_var(&child, ctx, prefix, SymbolKind::Const, out);
             }
             "var_definition" => {
-                emit_val_or_var(&child, bytes, file, prefix, SymbolKind::Static, out);
+                emit_val_or_var(&child, ctx, prefix, SymbolKind::Static, out);
             }
             "type_definition" => {
-                emit_type_alias(&child, bytes, file, prefix, out);
+                emit_type_alias(&child, ctx, prefix, out);
             }
 
             _ => {
                 // Recurse into any other container (e.g. template_body at top level).
-                collect_defs_in(&child, bytes, file, prefix, out);
+                collect_defs_in(&child, ctx, prefix, out);
             }
         }
     }
@@ -218,63 +218,48 @@ fn collect_defs_in(
 /// Emit a single type symbol (class/trait/object) and recurse into its body.
 fn emit_type_def(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     kind: SymbolKind,
     out: &mut Vec<Symbol>,
 ) {
-    let Some(name) = name_text(node, bytes) else {
+    let Some(name) = name_text(node, ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Scala.as_str(), descriptors.clone()),
-        name: name.clone(),
+    out.push(make_symbol(
+        ctx,
+        node,
+        name,
         kind,
-        visibility: read_visibility(node, bytes),
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+        read_visibility(node, ctx.bytes),
+        descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     // Recurse into the template body for member definitions.
     if let Some(body) = node.child_by_field_name("body") {
-        collect_members_in(&body, bytes, file, &descriptors, out);
+        collect_members_in(&body, ctx, &descriptors, out);
     }
 }
 
 /// Emit an enum type and its cases.
-fn emit_enum_def(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
-    let Some(name) = name_text(node, bytes) else {
+fn emit_enum_def(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
+    let Some(name) = name_text(node, ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Scala.as_str(), descriptors.clone()),
-        name: name.clone(),
-        kind: SymbolKind::Enum,
-        visibility: read_visibility(node, bytes),
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-    });
+    out.push(make_symbol(
+        ctx,
+        node,
+        name,
+        SymbolKind::Enum,
+        read_visibility(node, ctx.bytes),
+        descriptors.clone(),
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';']),
+    ));
 
     // Emit enum cases. They live under `enum_case_definitions` nodes nested in
     // the `enum_body`, and a single `case A, B` puts several `name` fields on one
@@ -293,63 +278,58 @@ fn emit_enum_def(
                     .children_by_field_name("name", &mut cursor)
                     .filter(|n| matches!(n.kind(), "identifier" | "operator_identifier"))
                 {
-                    let case_name = node_text(&name_node, bytes).to_owned();
+                    let case_name = node_text(&name_node, ctx.bytes).to_owned();
                     let mut case_desc = descriptors.clone();
                     case_desc.push(Descriptor::Term(case_name.clone()));
-                    out.push(Symbol {
-                        id: SymbolId::global(Language::Scala.as_str(), case_desc),
-                        name: case_name,
-                        kind: SymbolKind::Const,
-                        visibility: read_visibility(&case, bytes),
-                        file: file.to_owned(),
-                        line: (case.start_position().row + 1) as u32,
-                        span: ByteSpan {
-                            start: case.start_byte(),
-                            end: case.end_byte(),
-                        },
-                        signature: one_line_signature(node_text(&case, bytes), &['{', ';', ',']),
-                    });
+                    out.push(make_symbol(
+                        ctx,
+                        &case,
+                        case_name,
+                        SymbolKind::Const,
+                        read_visibility(&case, ctx.bytes),
+                        case_desc,
+                        one_line_signature(node_text(&case, ctx.bytes), &['{', ';', ',']),
+                    ));
                 }
             }
         }
         // Also descend into body for nested type/method members.
-        collect_members_in(&body, bytes, file, &descriptors, out);
+        collect_members_in(&body, ctx, &descriptors, out);
     }
 }
 
 /// Collect members inside a `template_body` or `enum_body`.
 fn collect_members_in(
     body: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     type_prefix: &[Descriptor],
     out: &mut Vec<Symbol>,
 ) {
     for member in body.children(&mut body.walk()) {
         match member.kind() {
             "function_definition" => {
-                emit_function(&member, bytes, file, type_prefix, out);
+                emit_function(&member, ctx, type_prefix, out);
             }
             "val_definition" => {
-                emit_val_or_var(&member, bytes, file, type_prefix, SymbolKind::Const, out);
+                emit_val_or_var(&member, ctx, type_prefix, SymbolKind::Const, out);
             }
             "var_definition" => {
-                emit_val_or_var(&member, bytes, file, type_prefix, SymbolKind::Static, out);
+                emit_val_or_var(&member, ctx, type_prefix, SymbolKind::Static, out);
             }
             "type_definition" => {
-                emit_type_alias(&member, bytes, file, type_prefix, out);
+                emit_type_alias(&member, ctx, type_prefix, out);
             }
             "class_definition" => {
-                emit_type_def(&member, bytes, file, type_prefix, SymbolKind::Class, out);
+                emit_type_def(&member, ctx, type_prefix, SymbolKind::Class, out);
             }
             "trait_definition" => {
-                emit_type_def(&member, bytes, file, type_prefix, SymbolKind::Trait, out);
+                emit_type_def(&member, ctx, type_prefix, SymbolKind::Trait, out);
             }
             "object_definition" => {
-                emit_type_def(&member, bytes, file, type_prefix, SymbolKind::Module, out);
+                emit_type_def(&member, ctx, type_prefix, SymbolKind::Module, out);
             }
             "enum_definition" => {
-                emit_enum_def(&member, bytes, file, type_prefix, out);
+                emit_enum_def(&member, ctx, type_prefix, out);
             }
             // skip simple_enum_case / full_enum_case — handled by emit_enum_def
             _ => {}
@@ -358,14 +338,8 @@ fn collect_members_in(
 }
 
 /// Emit a `function_definition` → `SymbolKind::Method`.
-fn emit_function(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
-    let Some(name) = name_text(node, bytes) else {
+fn emit_function(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
+    let Some(name) = name_text(node, ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
@@ -373,19 +347,15 @@ fn emit_function(
         name: name.clone(),
         disambiguator: String::new(),
     });
-    out.push(Symbol {
-        id: SymbolId::global(Language::Scala.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::Method,
-        visibility: read_visibility(node, bytes),
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
-    });
+        SymbolKind::Method,
+        read_visibility(node, ctx.bytes),
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
+    ));
 }
 
 /// Emit a `val_definition` or `var_definition` → `SymbolKind::Const`/`Static`.
@@ -394,8 +364,7 @@ fn emit_function(
 /// Destructuring patterns are skipped.
 fn emit_val_or_var(
     node: &Node,
-    bytes: &[u8],
-    file: &str,
+    ctx: &ExtractCtx,
     prefix: &[Descriptor],
     kind: SymbolKind,
     out: &mut Vec<Symbol>,
@@ -404,61 +373,47 @@ fn emit_val_or_var(
     // or fall back to checking if the pattern node is an identifier.
     let name: Option<String> = if let Some(pat) = node.child_by_field_name("pattern") {
         if pat.kind() == "identifier" {
-            Some(node_text(&pat, bytes).to_owned())
+            Some(node_text(&pat, ctx.bytes).to_owned())
         } else {
             // Could be a tuple pattern, etc. — skip.
             None
         }
     } else {
         // Try `name` field as fallback.
-        field_text(node, "name", bytes)
+        field_text(node, "name", ctx.bytes)
     };
 
     let Some(name) = name else { return };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Term(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Scala.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
         kind,
-        visibility: read_visibility(node, bytes),
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
-    });
+        read_visibility(node, ctx.bytes),
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
+    ));
 }
 
 /// Emit a `type_definition` → `SymbolKind::TypeAlias`.
-fn emit_type_alias(
-    node: &Node,
-    bytes: &[u8],
-    file: &str,
-    prefix: &[Descriptor],
-    out: &mut Vec<Symbol>,
-) {
+fn emit_type_alias(node: &Node, ctx: &ExtractCtx, prefix: &[Descriptor], out: &mut Vec<Symbol>) {
     // `type_definition` has a `name` field = `type_identifier`.
-    let Some(name) = field_text(node, "name", bytes) else {
+    let Some(name) = field_text(node, "name", ctx.bytes) else {
         return;
     };
     let mut descriptors = prefix.to_vec();
     descriptors.push(Descriptor::Type(name.clone()));
-    out.push(Symbol {
-        id: SymbolId::global(Language::Scala.as_str(), descriptors),
+    out.push(make_symbol(
+        ctx,
+        node,
         name,
-        kind: SymbolKind::TypeAlias,
-        visibility: read_visibility(node, bytes),
-        file: file.to_owned(),
-        line: (node.start_position().row + 1) as u32,
-        span: ByteSpan {
-            start: node.start_byte(),
-            end: node.end_byte(),
-        },
-        signature: one_line_signature(node_text(node, bytes), &['{', ';', '=']),
-    });
+        SymbolKind::TypeAlias,
+        read_visibility(node, ctx.bytes),
+        descriptors,
+        one_line_signature(node_text(node, ctx.bytes), &['{', ';', '=']),
+    ));
 }
 
 /// Get the name text for a definition node.

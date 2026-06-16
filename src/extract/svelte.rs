@@ -9,20 +9,28 @@
 //! present: the normal instance block and `<script context="module">`;
 //! symbols and references from both are merged into a single [`FileFacts`].
 //!
-//! The merger must fix up [`ScopeId`] indices because scope Vecs from each
-//! block are local Vec indices — appending a second block's scopes shifts its
-//! base, so bindings and references that reference scope indices are adjusted
-//! by the scope-base offset before extending the merged Vec.
+//! The merger pushes one document-spanning root [`ScopeKind::Module`] scope at
+//! index 0, then re-parents each `<script>` block's own root scope under it so
+//! the merged file has exactly one root (`parent == None`) — mirroring every
+//! other language's one-module-per-file shape.  `ScopeId` indices from each
+//! block are shifted by `scope_base` before the block's scopes are appended.
+//!
+//! Per-block [`SymbolKind::Module`] symbols are filtered out during the merge;
+//! a single Module symbol spanning the whole document is synthesized once,
+//! after the loop, giving the component a stable SCIP identity regardless of
+//! how many `<script>` blocks it contains.
 
 use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
-use crate::graph::types::{FileFacts, ScopeId};
+use crate::graph::types::{ByteSpan, FileFacts, ScopeId, ScopeKind, SymbolKind};
 use crate::lang::Language;
 
 use super::Extractor;
+use super::module_symbol;
+use super::push_scope;
 use super::shift_offsets;
-use super::typescript::extract_ecmascript;
+use super::typescript::{extract_ecmascript, module_namespaces};
 
 /// Extracts facts from a Svelte single-file component.
 pub struct SvelteExtractor;
@@ -65,6 +73,20 @@ impl Extractor for SvelteExtractor {
             ffi_exports: Vec::new(),
         };
 
+        // A single document-spanning root scope. Each `<script>` block's former
+        // root scope is re-parented under this so the merged file has exactly one
+        // root (`parent == None`) — mirroring every other language's one-module-
+        // per-file shape.
+        let doc_root: ScopeId = push_scope(
+            &mut merged.scopes,
+            None,
+            ByteSpan {
+                start: 0,
+                end: source.len(),
+            },
+            ScopeKind::Module,
+        );
+
         for script_el in script_nodes {
             // Find the raw_text child — skip empty script blocks.
             let raw_text = match find_raw_text(&script_el) {
@@ -82,33 +104,56 @@ impl Extractor for SvelteExtractor {
             let mut block_facts = extract_ecmascript(inner_source, file, inner_lang)?;
             shift_offsets(&mut block_facts, delta, file, "svelte", bytes);
 
-            // Merge: fix up ScopeId indices before extending.
+            // Merge: fix up ScopeId indices before extending. `scope_base` is >= 1
+            // for every block (the doc root occupies index 0), so the shifts apply
+            // uniformly.
             let scope_base: ScopeId = merged.scopes.len();
-            if scope_base > 0 {
-                // Shift scope field on bindings from this block.
-                for b in &mut block_facts.bindings {
-                    b.scope += scope_base;
-                }
-                // Shift scope field on references from this block.
-                for r in &mut block_facts.references {
-                    if let Some(s) = r.scope.as_mut() {
-                        *s += scope_base;
-                    }
-                }
-                // Shift parent ScopeId on scopes from this block.
-                for sc in &mut block_facts.scopes {
-                    if let Some(p) = sc.parent.as_mut() {
-                        *p += scope_base;
-                    }
+            // Shift scope field on bindings from this block.
+            for b in &mut block_facts.bindings {
+                b.scope += scope_base;
+            }
+            // Shift scope field on references from this block.
+            for r in &mut block_facts.references {
+                if let Some(s) = r.scope.as_mut() {
+                    *s += scope_base;
                 }
             }
+            // Shift parent ScopeId on scopes from this block.
+            for sc in &mut block_facts.scopes {
+                if let Some(p) = sc.parent.as_mut() {
+                    *p += scope_base;
+                }
+            }
+            // Re-parent the block's former root scope (local index 0, parent None,
+            // untouched by the Some(p) shift above) under the document root.
+            if let Some(first) = block_facts.scopes.first_mut() {
+                first.parent = Some(doc_root);
+            }
 
-            merged.symbols.extend(block_facts.symbols);
+            // Drop the per-block module symbols — they share one SCIP id and would
+            // be duplicate identities. The single document module symbol is
+            // synthesized once, after the loop.
+            merged.symbols.extend(
+                block_facts
+                    .symbols
+                    .into_iter()
+                    .filter(|s| s.kind != SymbolKind::Module),
+            );
             merged.references.extend(block_facts.references);
             merged.scopes.extend(block_facts.scopes);
             merged.bindings.extend(block_facts.bindings);
             // ffi_exports: Svelte scripts don't emit FFI exports.
         }
+
+        // Exactly one module symbol spanning the whole document — its SCIP id is
+        // identical to a single-script `.svelte` (the rendered id ignores `lang`).
+        let namespaces = module_namespaces(file);
+        merged.symbols.push(module_symbol(
+            Language::Svelte,
+            &namespaces,
+            file,
+            source.len(),
+        ));
 
         Ok(merged)
     }
@@ -146,16 +191,17 @@ fn detect_script_lang(script_el: &Node<'_>, bytes: &[u8]) -> Language {
                     continue;
                 }
                 // Check attribute_name == "lang"
-                let mut attr_cursor = attr.walk();
-                let attr_children: Vec<_> = attr.children(&mut attr_cursor).collect();
-                let name_matches = attr_children
-                    .iter()
-                    .any(|n| n.kind() == "attribute_name" && &bytes[n.byte_range()] == b"lang");
+                let name_matches = {
+                    let mut c = attr.walk();
+                    attr.children(&mut c)
+                        .any(|n| n.kind() == "attribute_name" && &bytes[n.byte_range()] == b"lang")
+                };
                 if !name_matches {
                     continue;
                 }
                 // Look for quoted_attribute_value → attribute_value
-                for child2 in &attr_children {
+                let mut attr_cursor = attr.walk();
+                for child2 in attr.children(&mut attr_cursor) {
                     if child2.kind() == "quoted_attribute_value" {
                         let mut qav_cursor = child2.walk();
                         for av in child2.children(&mut qav_cursor) {
@@ -283,6 +329,60 @@ export function setup() {}
         assert!(has_preload, "expected `preload` from module script block");
         assert!(has_setup, "expected `setup` from instance script block");
 
+        // Exactly ONE module symbol, spanning the whole document — both script
+        // blocks no longer emit duplicate module symbols.
+        let module_syms: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert_eq!(
+            module_syms.len(),
+            1,
+            "expected exactly one Module symbol, got {module_syms:?}"
+        );
+        assert_eq!(module_syms[0].span.start, 0, "module span must start at 0");
+        assert_eq!(
+            module_syms[0].span.end,
+            source.len(),
+            "module span must cover the whole document"
+        );
+
+        // Exactly one root scope (`parent == None`), spanning the whole document.
+        let root_scopes: Vec<_> = facts.scopes.iter().filter(|s| s.parent.is_none()).collect();
+        assert_eq!(
+            root_scopes.len(),
+            1,
+            "expected exactly one root scope, got {root_scopes:?}"
+        );
+        assert_eq!(root_scopes[0].span.start, 0, "root scope must start at 0");
+        assert_eq!(
+            root_scopes[0].span.end,
+            source.len(),
+            "root scope must cover the whole document"
+        );
+
+        // Each block's former root scope is now re-parented under the doc root
+        // (index 0). The doc root is the only scope with parent None; every other
+        // module-kind scope must point at it.
+        let block_roots: Vec<_> = facts
+            .scopes
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| *i != 0 && s.kind == ScopeKind::Module)
+            .collect();
+        assert!(
+            !block_roots.is_empty(),
+            "expected at least one re-parented block root scope"
+        );
+        for (i, sc) in &block_roots {
+            assert_eq!(
+                sc.parent,
+                Some(0),
+                "block root scope at index {i} must be re-parented under the doc root"
+            );
+        }
+
         // All binding scope indices must be valid (in-bounds for the merged scopes vec).
         for b in &facts.bindings {
             assert!(
@@ -306,7 +406,7 @@ export function setup() {}
     }
 
     #[test]
-    fn no_script_block_returns_empty_facts_no_panic() {
+    fn no_script_block_emits_single_module_symbol_and_root_scope() {
         let source = r#"<main><p>Hello world</p></main>"#;
         let facts = SvelteExtractor
             .extract(source, "src/NoScript.svelte")
@@ -314,7 +414,49 @@ export function setup() {}
 
         assert_eq!(facts.lang, "svelte");
         assert_eq!(facts.file, "src/NoScript.svelte");
-        assert!(facts.symbols.is_empty(), "expected no symbols");
+
+        // A script-less component still emits exactly one Module symbol spanning
+        // the whole document (consistent with every other language) and no refs.
+        assert_eq!(facts.symbols.len(), 1, "expected exactly one symbol");
+        assert_eq!(facts.symbols[0].kind, SymbolKind::Module);
+        assert_eq!(facts.symbols[0].span.start, 0);
+        assert_eq!(facts.symbols[0].span.end, source.len());
         assert!(facts.references.is_empty(), "expected no references");
+
+        // Exactly one root scope spanning the whole document.
+        assert_eq!(facts.scopes.len(), 1, "expected exactly one (root) scope");
+        assert_eq!(facts.scopes[0].parent, None);
+        assert_eq!(facts.scopes[0].span.start, 0);
+        assert_eq!(facts.scopes[0].span.end, source.len());
+    }
+
+    #[test]
+    fn single_script_emits_one_module_symbol_spanning_document() {
+        let source = svelte_source_with_ts_script();
+        let facts = SvelteExtractor
+            .extract(source, "src/App.svelte")
+            .expect("extraction should succeed");
+
+        let module_syms: Vec<_> = facts
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module)
+            .collect();
+        assert_eq!(
+            module_syms.len(),
+            1,
+            "single-script .svelte must yield exactly one Module symbol, got {module_syms:?}"
+        );
+        assert_eq!(module_syms[0].span.start, 0, "module span must start at 0");
+        assert_eq!(
+            module_syms[0].span.end,
+            source.len(),
+            "module span must cover the whole document"
+        );
+        // The SCIP id ignores `lang`, so it matches the file's module path.
+        assert_eq!(
+            module_syms[0].id.to_scip_string(),
+            "codegraph . . . src/App/"
+        );
     }
 }

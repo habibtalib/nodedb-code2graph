@@ -3,9 +3,10 @@
 Which cross-language (cross-runtime) call boundaries code2graph bridges today — honestly, with what
 is **not yet** covered.
 
-> The canonical source is `FfiAbi` + `FfiAbi::consumers()` in [`src/graph/types.rs`](../src/graph/types.rs)
-> and the export markers in the per-language extractors. This page is hand-maintained; if it
-> disagrees with the code, the code wins.
+> The canonical source is the per-ABI registry in [`src/ffi/`](../src/ffi/) — one `AbiSpec` per ABI
+> (the `SPECS` table), carrying its consumer languages and export markers — plus the `FfiAbi` enum in
+> [`src/graph/types.rs`](../src/graph/types.rs). A sync test (`ffi_markers_are_documented`) fails if a
+> marker on this page drifts from `SPECS`; if the page still disagrees with the code, the code wins.
 
 ## What an FFI bridge is
 
@@ -16,7 +17,8 @@ one language to a definition in another, **deterministically**:
 - The **export** side is grounded in a real syntactic marker (e.g. Rust `#[no_mangle]`), recorded as
   a neutral `FfiExport { symbol, abi, export_name }`.
 - The **consumer** side is matched by the exported ABI name, and only in a language that actually
-  consumes that ABI (`FfiAbi::consumers()`), so a C call never binds to a Python-only export.
+  consumes that ABI (its `consumers` in the [`src/ffi/`](../src/ffi/) registry), so a C call never
+  binds to a Python-only export.
 - Same-language use is _not_ a bridge (that's an ordinary call).
 - Every bridge edge carries `Provenance::FfiBridge` and an honest `Confidence`: `Scoped` when the
   export is unique, `NameOnly` when several share the name. Never dressed up as precise.
@@ -97,8 +99,10 @@ the edges of the map; ranked roughly by how common the boundary is.
   (`lib.foo()`, `C.foo()`), a different call shape than the bare-name match used today.
 - **WebAssembly component model / WIT imports** (beyond `wasm-bindgen` exports).
 
-The architecture extends cleanly: each new boundary is one `FfiAbi` variant + a marker recognised in
-the relevant extractor + an entry in `consumers()`. The resolver itself is generic.
+The architecture extends cleanly: a new boundary is one `FfiAbi` variant + one `src/ffi/<abi>.rs` spec
+file (its consumer languages + export markers) + one line in the `SPECS` registry. The producer
+extractor keeps its syntactic walk and calls into `ffi::` to classify the marker; the resolver is
+generic — no growing match and no inline per-ABI block to extend.
 
 ## See also
 

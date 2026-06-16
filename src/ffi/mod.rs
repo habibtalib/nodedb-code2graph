@@ -10,4 +10,7 @@ mod python;
 mod spec;
 mod wasm;
 
+#[cfg(test)]
+mod sync_tests;
+
 pub(crate) use spec::{c_name_export_abi, consumers, rust_exports};

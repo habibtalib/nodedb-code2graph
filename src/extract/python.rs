@@ -14,8 +14,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -125,6 +125,107 @@ fn python_namespaces(file: &str) -> Vec<String> {
     parts
 }
 
+/// Terminal identifier names that indicate an HTTP-route decorator call.
+///
+/// Detection rule (honest boundary): a decorator is an HTTP-route marker when it
+/// is a CALL node whose `function:` field's terminal identifier is in this set
+/// (case-sensitive). Bare non-call decorators (`@staticmethod`, `@dataclass`) and
+/// call decorators whose terminal name is NOT here (`@cache.memoize()`) produce no
+/// marker.  This is a syntactic, build-free heuristic — it covers Flask-style
+/// `@app.route`, FastAPI `@router.get`, Starlette/Tornado route variants and
+/// WebSocket handlers, but cannot detect dynamically constructed route registrations
+/// or reflection-based frameworks.
+const PY_ROUTE_VERBS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "head",
+    "options",
+    "trace",
+    "route",
+    "websocket",
+    "ws",
+];
+
+/// Compute entry-point markers for a function symbol.
+///
+/// `fn_name` is the bare function name (for `Main` detection).
+/// `outer_node` is the span node — if it is a `decorated_definition`, its
+/// `decorator` children are inspected for HTTP-route call decorators.
+///
+/// Node-kind path for a route decorator:
+/// ```text
+/// decorated_definition
+///   decorator           ("@" + callee text)
+///     call
+///       function: attribute  ("app.get") or identifier ("get")
+///       arguments: argument_list
+/// ```
+/// The `function:` field of the `call` is the callee; for an `attribute` node the
+/// `attribute:` field gives the terminal identifier, for an `identifier` node the
+/// text itself is the terminal.  The `attribute` node's full text (e.g. `app.get`)
+/// is used as the `HttpRoute` marker string so the consumer can identify both the
+/// framework object and the HTTP method without reparsing.
+fn entry_points_for(fn_name: &str, outer_node: &Node, bytes: &[u8]) -> Vec<EntryPoint> {
+    let mut markers: Vec<EntryPoint> = Vec::new();
+
+    // (a) Name-based entry point: a function literally named `main`.
+    if fn_name == "main" {
+        markers.push(EntryPoint::Main);
+    }
+
+    // (b) HTTP-route decorator detection — only applies to `decorated_definition`.
+    if outer_node.kind() != "decorated_definition" {
+        return markers;
+    }
+
+    for child in outer_node.children(&mut outer_node.walk()) {
+        if child.kind() != "decorator" {
+            continue;
+        }
+        // A decorator node's children: "@" (anonymous) then the callee expression.
+        // Route detection only fires when the callee is a CALL (not a bare name).
+        let Some(call_node) = child
+            .children(&mut child.walk())
+            .find(|c| c.kind() == "call")
+        else {
+            continue;
+        };
+
+        // The `function:` field of the call is the callee expression.
+        let Some(func_node) = call_node.child_by_field_name("function") else {
+            continue;
+        };
+
+        // Determine the terminal identifier and the full callee text.
+        let (terminal, callee_text) = match func_node.kind() {
+            "attribute" => {
+                // `app.get` / `router.post` — terminal is the `attribute:` field.
+                let terminal = func_node
+                    .child_by_field_name("attribute")
+                    .map(|n| node_text(&n, bytes))
+                    .unwrap_or("");
+                let callee = node_text(&func_node, bytes);
+                (terminal, callee)
+            }
+            "identifier" => {
+                // bare `get(...)` / `route(...)` — terminal is the whole identifier.
+                let text = node_text(&func_node, bytes);
+                (text, text)
+            }
+            _ => continue,
+        };
+
+        if PY_ROUTE_VERBS.contains(&terminal) {
+            markers.push(EntryPoint::HttpRoute(callee_text.to_owned()));
+        }
+    }
+
+    markers
+}
+
 fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
     for child in root.children(&mut root.walk()) {
@@ -158,7 +259,7 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
         descriptors.push(leaf);
 
         let signature = one_line_signature(node_text(&sig_node, ctx.bytes), &[':']);
-        out.push(make_symbol(
+        let mut sym = make_symbol(
             ctx,
             &span_node,
             name,
@@ -166,7 +267,13 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
             Visibility::Public,
             descriptors,
             signature,
-        ));
+        );
+        // Populate entry-point markers for function definitions only.
+        // Classes and constants never carry route/main markers.
+        if sym.kind == SymbolKind::Function {
+            sym.entry_points = entry_points_for(&sym.name, &span_node, ctx.bytes);
+        }
+        out.push(sym);
     }
     out
 }
@@ -1306,6 +1413,159 @@ MAX_RETRIES = 3
             Some("foo.bar".to_owned()),
             "from_path for 'import foo.bar' should be 'foo.bar', got {:?}",
             bar_ref.from_path
+        );
+    }
+
+    // ── Entry-point detection ────────────────────────────────────────────────
+
+    /// Helper: find a symbol by bare name and return a clone.
+    fn sym_by_name(facts: &FileFacts, name: &str) -> Symbol {
+        facts
+            .symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| {
+                panic!("symbol '{name}' not found; symbols: {:?}", {
+                    let names: Vec<&str> = facts.symbols.iter().map(|s| s.name.as_str()).collect();
+                    names
+                })
+            })
+            .clone()
+    }
+
+    /// Helper: render entry_points as a compact string for assertion messages.
+    fn ep_str(eps: &[EntryPoint]) -> String {
+        eps.iter()
+            .map(|ep| match ep {
+                EntryPoint::Main => "Main".to_owned(),
+                EntryPoint::HttpRoute(m) => format!("HttpRoute({m})"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    #[test]
+    fn entry_point_app_get_route() {
+        // @app.get("/users") → HttpRoute("app.get")
+        let src = "@app.get(\"/users\")\ndef list_users():\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/routes.py").unwrap();
+        let sym = sym_by_name(&facts, "list_users");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "app.get"),
+            "expected HttpRoute(\"app.get\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_app_route_with_methods_arg() {
+        // @app.route("/x", methods=["POST"]) → HttpRoute("app.route")
+        let src = "@app.route(\"/x\", methods=[\"POST\"])\ndef handler():\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/routes.py").unwrap();
+        let sym = sym_by_name(&facts, "handler");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "app.route"),
+            "expected HttpRoute(\"app.route\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_non_route_decorator_ignored() {
+        // A top-level call-form decorator whose terminal name is NOT a route verb
+        // (`lru_cache` ∉ PY_ROUTE_VERBS) must produce no entry point. (Bare
+        // non-call decorators like `@staticmethod` only appear on class methods,
+        // which `collect_symbols` doesn't descend into.)
+        let src =
+            "import functools\n@functools.lru_cache(maxsize=128)\ndef compute(x):\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/util.py").unwrap();
+        let sym2 = sym_by_name(&facts, "compute");
+        assert!(
+            sym2.entry_points.is_empty(),
+            "non-route call decorator must not produce entry points; got [{}]",
+            ep_str(&sym2.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_main_function() {
+        // def main(): pass → EntryPoint::Main
+        let src = "def main():\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/main.py").unwrap();
+        let sym = sym_by_name(&facts, "main");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::Main),
+            "expected Main, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_plain_function_empty() {
+        // An undecorated, non-main function → empty entry_points.
+        let src = "def process(data):\n    return data\n";
+        let facts = PythonExtractor.extract(src, "src/util.py").unwrap();
+        let sym = sym_by_name(&facts, "process");
+        assert!(
+            sym.entry_points.is_empty(),
+            "plain function must have no entry points; got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_fastapi_router_post() {
+        // @router.post("/items") → HttpRoute("router.post")
+        let src = "@router.post(\"/items\")\ndef create_item():\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/items.py").unwrap();
+        let sym = sym_by_name(&facts, "create_item");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "router.post"),
+            "expected HttpRoute(\"router.post\"), got [{}]",
+            ep_str(&sym.entry_points)
+        );
+    }
+
+    #[test]
+    fn entry_point_websocket_route() {
+        // @bp.websocket("/ws") → HttpRoute("bp.websocket")
+        let src = "@bp.websocket(\"/ws\")\ndef ws_handler():\n    pass\n";
+        let facts = PythonExtractor.extract(src, "src/ws.py").unwrap();
+        let sym = sym_by_name(&facts, "ws_handler");
+        assert_eq!(
+            sym.entry_points.len(),
+            1,
+            "expected exactly 1 entry point, got [{}]",
+            ep_str(&sym.entry_points)
+        );
+        assert!(
+            matches!(&sym.entry_points[0], EntryPoint::HttpRoute(m) if m == "bp.websocket"),
+            "expected HttpRoute(\"bp.websocket\"), got [{}]",
+            ep_str(&sym.entry_points)
         );
     }
 }

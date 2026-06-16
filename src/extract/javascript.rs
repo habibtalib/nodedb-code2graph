@@ -36,7 +36,7 @@ impl Extractor for JavaScriptExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::types::SymbolKind;
+    use crate::graph::types::{SymbolKind, Visibility};
 
     #[test]
     fn extracts_exported_decls() {
@@ -57,12 +57,21 @@ function internal() {}
             "codegraph . . . src/auth/jwt/validateToken()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
+        assert_eq!(vt.visibility, Visibility::Public);
         assert_eq!(facts.lang, "javascript");
 
-        assert_eq!(by_name("Config").unwrap().kind, SymbolKind::Class);
-        assert_eq!(by_name("MAX").unwrap().kind, SymbolKind::Const);
-        // non-exported declarations are not symbols
-        assert!(by_name("internal").is_none());
+        let cfg = by_name("Config").unwrap();
+        assert_eq!(cfg.kind, SymbolKind::Class);
+        assert_eq!(cfg.visibility, Visibility::Public);
+
+        let max = by_name("MAX").unwrap();
+        assert_eq!(max.kind, SymbolKind::Const);
+        assert_eq!(max.visibility, Visibility::Public);
+
+        // Non-exported declarations are now emitted with Visibility::Private.
+        let internal = by_name("internal").expect("internal must now be emitted as Private");
+        assert_eq!(internal.kind, SymbolKind::Function);
+        assert_eq!(internal.visibility, Visibility::Private);
     }
 
     #[test]

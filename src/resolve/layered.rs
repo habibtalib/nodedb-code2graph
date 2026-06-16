@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::graph::types::{CodeGraph, Confidence, Edge, FileFacts, Provenance, RefRole, Symbol};
 
-use super::{FfiBridgeResolver, Resolver, ScopeGraphResolver, SymbolTableResolver};
+use super::{
+    ConformanceResolver, FfiBridgeResolver, Resolver, ScopeGraphResolver, SymbolTableResolver,
+};
 
 /// A resolver that runs a stack of inner resolvers in order and merges their
 /// outputs into a single [`CodeGraph`].
@@ -42,11 +44,14 @@ impl LayeredResolver {
     /// 1. [`SymbolTableResolver`] — fast, broad, recall-first.
     /// 2. [`ScopeGraphResolver`] — scope-precise, emits `Exact`/`Scoped`.
     /// 3. [`FfiBridgeResolver`] — cross-language FFI edges.
+    /// 4. [`ConformanceResolver`] — inherited/implemented-member recall over the
+    ///    type hierarchy (additive `Scoped` edges, `Provenance::Conformance`).
     pub fn default_dense() -> Self {
         Self::new(vec![
             Box::new(SymbolTableResolver),
             Box::new(ScopeGraphResolver),
             Box::new(FfiBridgeResolver),
+            Box::new(ConformanceResolver),
         ])
     }
 }

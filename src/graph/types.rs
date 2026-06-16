@@ -292,6 +292,10 @@ pub enum Provenance {
     /// / `extern` C ABI, PyO3, wasm-bindgen, NAPI, JNI). Links a symbol in one
     /// language to its counterpart across a runtime boundary.
     FfiBridge,
+    /// Derived by an inheritance-chain walk — an inherited/implemented member
+    /// found by traversing `IsImplementation` relationships up the type
+    /// hierarchy (structural, not type-inferred).
+    Conformance,
 }
 
 // ── FFI / cross-language boundary facts ──────────────────────────────────────

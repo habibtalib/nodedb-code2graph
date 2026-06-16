@@ -219,8 +219,59 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             let type_name = leaf.name().to_owned();
             collect_impl_members(&child, bytes, file, namespaces, &type_name, &mut out);
         }
+
+        // For trait definitions, emit symbols for their member methods and
+        // associated consts so the conformance resolver can link inherited-method
+        // calls to the trait's own definition.  Visibility is NOT checked per
+        // member: trait items have no `pub` modifier — they inherit the trait's
+        // visibility, and the `is_fully_pub` guard above already ensures we only
+        // reach here for public traits.
+        if kind == SymbolKind::Trait {
+            let trait_name = leaf.name().to_owned();
+            collect_trait_members(&child, bytes, file, namespaces, &trait_name, &mut out);
+        }
     }
     out
+}
+
+/// Build and push a [`Symbol`] for one member of an `impl` or `trait` body.
+///
+/// Shared by [`collect_impl_members`] and [`collect_trait_members`] to avoid
+/// duplicating the descriptor-construction + `Symbol` push.
+///
+/// `member` is the tree-sitter node for the member item; the `(kind, leaf)` pair
+/// comes from the caller's match arm; `type_name` is the enclosing type/trait name.
+fn push_member_symbol(
+    member: &Node,
+    bytes: &[u8],
+    file: &str,
+    namespaces: &[String],
+    type_name: &str,
+    (kind, leaf): (SymbolKind, Descriptor),
+    out: &mut Vec<Symbol>,
+) {
+    // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
+    let sym_name = leaf.name().to_owned();
+    let mut descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    descriptors.push(Descriptor::Type(type_name.to_owned()));
+    descriptors.push(leaf);
+
+    out.push(Symbol {
+        id: SymbolId::global(Language::Rust.as_str(), descriptors),
+        name: sym_name,
+        kind,
+        file: file.to_owned(),
+        line: (member.start_position().row + 1) as u32,
+        span: ByteSpan {
+            start: member.start_byte(),
+            end: member.end_byte(),
+        },
+        signature: one_line_signature(node_text(member, bytes), &['{']),
+    });
 }
 
 /// Walk an inherent `impl_item` node and emit `pub` member symbols.
@@ -270,30 +321,82 @@ fn collect_impl_members(
             _ => continue,
         };
 
-        // Build descriptors: namespaces + Type(type_name) + member leaf.
-        // Extract the name before moving `leaf` into `descriptors` so no clone is needed.
-        let sym_name = leaf.name().to_owned();
-        let mut descriptors: Vec<Descriptor> = namespaces
-            .iter()
-            .cloned()
-            .map(Descriptor::Namespace)
-            .collect();
-        descriptors.push(Descriptor::Type(type_name.to_owned()));
-        descriptors.push(leaf);
+        push_member_symbol(
+            &member,
+            bytes,
+            file,
+            namespaces,
+            type_name,
+            (kind, leaf),
+            out,
+        );
+    }
+}
 
-        out.push(Symbol {
-            id: SymbolId::global(Language::Rust.as_str(), descriptors),
-            name: sym_name,
-            kind,
-            file: file.to_owned(),
-            line: (member.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: member.start_byte(),
-                end: member.end_byte(),
-            },
-            // Use the same stop-char as the top-level function_item / const_item arms.
-            signature: one_line_signature(node_text(&member, bytes), &['{']),
-        });
+/// Walk a `trait_item` node and emit member symbols for its body.
+///
+/// Covers three node kinds found inside a `declaration_list` (the `body` field
+/// of `trait_item`):
+/// - `function_signature_item` — a required method with no default body
+///   (e.g. `fn hello(&self);`) → [`SymbolKind::Method`].
+/// - `function_item` — a method with a default body
+///   (e.g. `fn greet(&self) { … }`) → [`SymbolKind::Method`].
+/// - `const_item` — an associated constant → [`SymbolKind::Const`].
+///
+/// Visibility is intentionally **not** checked: trait items carry no `pub`
+/// modifier (they are implicitly public whenever the trait is public), and the
+/// caller already gated on `is_fully_pub` for the `trait_item` itself.
+///
+/// Descriptors: `namespaces.map(Namespace) ++ [Type(trait_name), Method/Term(member)]`.
+/// SCIP renders e.g. `…/Greet#hello().` for a method and `…/Greet#MAX.` for a const.
+fn collect_trait_members(
+    trait_node: &Node,
+    bytes: &[u8],
+    file: &str,
+    namespaces: &[String],
+    trait_name: &str,
+    out: &mut Vec<Symbol>,
+) {
+    let Some(body) = trait_node.child_by_field_name("body") else {
+        return;
+    };
+
+    for member in body.children(&mut body.walk()) {
+        let (kind, leaf) = match member.kind() {
+            // Both required methods (`fn hello(&self);`) and default-bodied methods
+            // (`fn greet(&self) { … }`) map to SymbolKind::Method with identical
+            // descriptor structure, so they share one arm.
+            "function_signature_item" | "function_item" => {
+                let Some(name) = child_text(&member, "identifier", bytes) else {
+                    continue;
+                };
+                (
+                    SymbolKind::Method,
+                    Descriptor::Method {
+                        name,
+                        disambiguator: String::new(),
+                    },
+                )
+            }
+            // Associated constant: `const LIMIT: usize = 10;`
+            "const_item" => {
+                let Some(name) = child_text(&member, "identifier", bytes) else {
+                    continue;
+                };
+                (SymbolKind::Const, Descriptor::Term(name))
+            }
+            _ => continue,
+        };
+
+        push_member_symbol(
+            &member,
+            bytes,
+            file,
+            namespaces,
+            trait_name,
+            (kind, leaf),
+            out,
+        );
     }
 }
 

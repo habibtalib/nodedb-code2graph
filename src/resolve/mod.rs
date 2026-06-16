@@ -13,6 +13,7 @@
 //! [`FileFacts`]: crate::graph::FileFacts
 //! [`CodeGraph`]: crate::graph::CodeGraph
 
+pub mod conformance;
 pub mod ffi_bridge;
 mod incremental;
 pub mod layered;
@@ -21,6 +22,7 @@ pub mod scope_graph;
 mod support;
 pub mod symbol_table;
 
+pub use conformance::ConformanceResolver;
 pub use ffi_bridge::FfiBridgeResolver;
 pub use incremental::IncrementalGraph;
 pub use layered::LayeredResolver;

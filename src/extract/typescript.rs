@@ -2,8 +2,10 @@
 
 //! TypeScript extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: top-level **exported** declarations (`export function/class/
-//! interface/type/enum/const`, including `export default function/class`).
+//! Definitions: ALL top-level declarations, tagged with their real [`Visibility`]:
+//! exported declarations (`export function/class/interface/type/enum/const`,
+//! including `export default function/class`) → [`Visibility::Public`]; bare
+//! (non-exported) top-level declarations → [`Visibility::Private`].
 //! Qualified identity follows the file's module path (`src/auth/jwt.ts` →
 //! namespaces `src`,`auth`,`jwt`), so a symbol is `…/jwt/validateToken().`.
 //! References: callee identifiers of `call_expression` nodes.
@@ -127,6 +129,20 @@ fn module_namespaces(file: &str) -> Vec<String> {
     parts
 }
 
+/// Bare top-level declaration node kinds that are emitted with
+/// [`Visibility::Private`] (non-exported, module-scoped).
+const BARE_DECL_KINDS: &[&str] = &[
+    "function_declaration",
+    "generator_function_declaration",
+    "class_declaration",
+    "abstract_class_declaration",
+    "interface_declaration",
+    "type_alias_declaration",
+    "enum_declaration",
+    "lexical_declaration",
+    "variable_declaration",
+];
+
 fn collect_symbols(
     root: &Node,
     bytes: &[u8],
@@ -136,28 +152,67 @@ fn collect_symbols(
 ) -> Vec<Symbol> {
     let mut out = Vec::new();
     for stmt in root.children(&mut root.walk()) {
-        if stmt.kind() != "export_statement" {
-            continue;
-        }
-        // The exported declaration is a direct child of the export statement.
-        for decl in stmt.children(&mut stmt.walk()) {
-            emit_declaration(&decl, &stmt, bytes, file, namespaces, lang, &mut out);
+        match stmt.kind() {
+            "export_statement" => {
+                // Exported declarations are direct children of the export statement.
+                // The span covers the full `export ...` statement node.
+                for decl in stmt.children(&mut stmt.walk()) {
+                    emit_declaration(
+                        DeclSite { decl, span: stmt },
+                        bytes,
+                        file,
+                        namespaces,
+                        lang,
+                        Visibility::Public,
+                        &mut out,
+                    );
+                }
+            }
+            kind if BARE_DECL_KINDS.contains(&kind) => {
+                // Non-exported top-level declaration: the declaration node is
+                // its own span node (there is no enclosing export_statement).
+                emit_declaration(
+                    DeclSite {
+                        decl: stmt,
+                        span: stmt,
+                    },
+                    bytes,
+                    file,
+                    namespaces,
+                    lang,
+                    Visibility::Private,
+                    &mut out,
+                );
+            }
+            _ => {}
         }
     }
     out
 }
 
-/// Append symbol(s) for one declaration node (a `lexical_declaration` may yield
-/// several). `span_node` is the enclosing `export_statement`.
+/// A declaration node together with the node whose span/line locates it. For an
+/// exported declaration `span` is the enclosing `export_statement`; for a bare
+/// declaration `span` is the declaration itself. Named fields (rather than a
+/// same-typed `(Node, Node)` tuple) so the two can't be transposed by accident.
+struct DeclSite<'t> {
+    decl: Node<'t>,
+    span: Node<'t>,
+}
+
+/// Append symbol(s) for one declaration node (a `lexical_declaration` or
+/// `variable_declaration` may yield several). `visibility` reflects whether the
+/// declaration was exported (`Public`) or bare (`Private`).
 fn emit_declaration(
-    decl: &Node,
-    span_node: &Node,
+    site: DeclSite,
     bytes: &[u8],
     file: &str,
     namespaces: &[String],
     lang: Language,
+    visibility: Visibility,
     out: &mut Vec<Symbol>,
 ) {
+    let decl = &site.decl;
+    let span_node = &site.span;
     let push = |out: &mut Vec<Symbol>, name: String, kind: SymbolKind, leaf: Descriptor| {
         let mut descriptors: Vec<Descriptor> = namespaces
             .iter()
@@ -169,7 +224,7 @@ fn emit_declaration(
             id: SymbolId::global(lang.as_str(), descriptors),
             name,
             kind,
-            visibility: Visibility::Public,
+            visibility,
             file: file.to_owned(),
             line: (span_node.start_position().row + 1) as u32,
             span: ByteSpan {
@@ -181,7 +236,7 @@ fn emit_declaration(
     };
 
     match decl.kind() {
-        "function_declaration" => {
+        "function_declaration" | "generator_function_declaration" => {
             if let Some(n) = child_text(decl, "identifier", bytes) {
                 push(
                     out,
@@ -194,7 +249,9 @@ fn emit_declaration(
                 );
             }
         }
-        "class_declaration" => emit_named(decl, bytes, SymbolKind::Class, out, &push),
+        "class_declaration" | "abstract_class_declaration" => {
+            emit_named(decl, bytes, SymbolKind::Class, out, &push)
+        }
         "interface_declaration" => emit_named(decl, bytes, SymbolKind::Interface, out, &push),
         "type_alias_declaration" => emit_named(decl, bytes, SymbolKind::TypeAlias, out, &push),
         "enum_declaration" => {
@@ -203,6 +260,17 @@ fn emit_declaration(
             }
         }
         "lexical_declaration" => {
+            for vd in decl.children(&mut decl.walk()) {
+                if vd.kind() != "variable_declarator" {
+                    continue;
+                }
+                if let Some(n) = child_text(&vd, "identifier", bytes) {
+                    push(out, n.clone(), SymbolKind::Const, Descriptor::Term(n));
+                }
+            }
+        }
+        "variable_declaration" => {
+            // `var` declarations: same structure as `lexical_declaration`.
             for vd in decl.children(&mut decl.walk()) {
                 if vd.kind() != "variable_declarator" {
                     continue;
@@ -802,12 +870,62 @@ function internal() {}
             "codegraph . . . src/auth/jwt/validateToken()."
         );
         assert_eq!(vt.kind, SymbolKind::Function);
+        assert_eq!(vt.visibility, Visibility::Public);
 
-        assert_eq!(by_name("Config").unwrap().kind, SymbolKind::Class);
-        assert_eq!(by_name("Options").unwrap().kind, SymbolKind::Interface);
-        assert_eq!(by_name("MAX").unwrap().kind, SymbolKind::Const);
-        // non-exported declarations are not symbols
-        assert!(by_name("internal").is_none());
+        let cfg = by_name("Config").unwrap();
+        assert_eq!(cfg.kind, SymbolKind::Class);
+        assert_eq!(cfg.visibility, Visibility::Public);
+
+        let opts = by_name("Options").unwrap();
+        assert_eq!(opts.kind, SymbolKind::Interface);
+        assert_eq!(opts.visibility, Visibility::Public);
+
+        let max = by_name("MAX").unwrap();
+        assert_eq!(max.kind, SymbolKind::Const);
+        assert_eq!(max.visibility, Visibility::Public);
+
+        // Non-exported declarations are now emitted with Visibility::Private.
+        let internal = by_name("internal").expect("internal must now be emitted as Private");
+        assert_eq!(internal.kind, SymbolKind::Function);
+        assert_eq!(internal.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn bare_decl_visibility_private() {
+        // Bare (non-exported) top-level declarations → Visibility::Private.
+        let src = "\
+function g() {}
+const X = 1;
+";
+        let facts = TypeScriptExtractor.extract(src, "src/mod.ts").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        let g = by_name("g").expect("bare function g must be emitted");
+        assert_eq!(g.kind, SymbolKind::Function);
+        assert_eq!(g.visibility, Visibility::Private);
+
+        let x = by_name("X").expect("bare const X must be emitted");
+        assert_eq!(x.kind, SymbolKind::Const);
+        assert_eq!(x.visibility, Visibility::Private);
+    }
+
+    #[test]
+    fn exported_decl_visibility_public() {
+        // Exported declarations → Visibility::Public.
+        let src = "\
+export function f() {}
+export const Y = 2;
+";
+        let facts = TypeScriptExtractor.extract(src, "src/mod.ts").unwrap();
+        let by_name = |n: &str| facts.symbols.iter().find(|s| s.name == n).cloned();
+
+        let f = by_name("f").expect("exported function f must be emitted");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.visibility, Visibility::Public);
+
+        let y = by_name("Y").expect("exported const Y must be emitted");
+        assert_eq!(y.kind, SymbolKind::Const);
+        assert_eq!(y.visibility, Visibility::Public);
     }
 
     #[test]

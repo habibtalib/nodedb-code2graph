@@ -2,8 +2,8 @@
 
 //! Go extractor — one tree-sitter pass yielding definitions and references.
 //!
-//! Definitions: top-level **exported** declarations (first character of the
-//! name is uppercase). Covers `func`, methods, `type` (struct/interface/alias),
+//! Definitions: top-level declarations (exported and package-private). Covers
+//! `func`, methods, `type` (struct/interface/alias),
 //! `const`, and `var`. Qualified identity follows the Go convention that a
 //! package occupies exactly one directory, so the file's **directory path** is
 //! the package identity (e.g. `src/auth/session.go` → namespace `["auth"]`);
@@ -164,28 +164,32 @@ fn go_package_name(root: &Node, bytes: &[u8]) -> Option<String> {
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
 
-    let push =
-        |out: &mut Vec<Symbol>, node: &Node, name: String, kind: SymbolKind, leaf: Descriptor| {
-            let mut descriptors: Vec<Descriptor> = namespaces
-                .iter()
-                .cloned()
-                .map(Descriptor::Namespace)
-                .collect();
-            descriptors.push(leaf);
-            out.push(Symbol {
-                id: SymbolId::global(Language::Go.as_str(), descriptors),
-                name,
-                kind,
-                visibility: Visibility::Public,
-                file: file.to_owned(),
-                line: (node.start_position().row + 1) as u32,
-                span: ByteSpan {
-                    start: node.start_byte(),
-                    end: node.end_byte(),
-                },
-                signature: one_line_signature(node_text(node, bytes), &['{']),
-            });
-        };
+    let push = |out: &mut Vec<Symbol>,
+                node: &Node,
+                name: String,
+                kind: SymbolKind,
+                visibility: Visibility,
+                leaf: Descriptor| {
+        let mut descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
+        descriptors.push(leaf);
+        out.push(Symbol {
+            id: SymbolId::global(Language::Go.as_str(), descriptors),
+            name,
+            kind,
+            visibility,
+            file: file.to_owned(),
+            line: (node.start_position().row + 1) as u32,
+            span: ByteSpan {
+                start: node.start_byte(),
+                end: node.end_byte(),
+            },
+            signature: one_line_signature(node_text(node, bytes), &['{']),
+        });
+    };
 
     for child in root.children(&mut root.walk()) {
         match child.kind() {
@@ -193,14 +197,13 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 let Some(name) = field_text(&child, "name", bytes) else {
                     continue;
                 };
-                if !is_exported(&name) {
-                    continue;
-                }
+                let vis = name_visibility(&name);
                 push(
                     &mut out,
                     &child,
                     name.clone(),
                     SymbolKind::Function,
+                    vis,
                     Descriptor::Method {
                         name,
                         disambiguator: String::new(),
@@ -211,14 +214,13 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                 let Some(name) = field_text(&child, "name", bytes) else {
                     continue;
                 };
-                if !is_exported(&name) {
-                    continue;
-                }
+                let vis = name_visibility(&name);
                 push(
                     &mut out,
                     &child,
                     name.clone(),
                     SymbolKind::Method,
+                    vis,
                     Descriptor::Method {
                         name,
                         disambiguator: String::new(),
@@ -232,9 +234,6 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             let Some(name) = field_text(&spec, "name", bytes) else {
                                 continue;
                             };
-                            if !is_exported(&name) {
-                                continue;
-                            }
                             // Inspect the `type` field to determine the concrete kind.
                             let kind = spec.child_by_field_name("type").map_or(
                                 SymbolKind::TypeAlias,
@@ -250,14 +249,19 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             let Some(name) = field_text(&spec, "name", bytes) else {
                                 continue;
                             };
-                            if !is_exported(&name) {
-                                continue;
-                            }
                             (SymbolKind::TypeAlias, name)
                         }
                         _ => continue,
                     };
-                    push(&mut out, &spec, name.clone(), kind, Descriptor::Type(name));
+                    let vis = name_visibility(&name);
+                    push(
+                        &mut out,
+                        &spec,
+                        name.clone(),
+                        kind,
+                        vis,
+                        Descriptor::Type(name),
+                    );
                 }
             }
             "const_declaration" => {
@@ -270,14 +274,13 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             continue;
                         }
                         let name = node_text(&ident, bytes).to_owned();
-                        if !is_exported(&name) {
-                            continue;
-                        }
+                        let vis = name_visibility(&name);
                         push(
                             &mut out,
                             &spec,
                             name.clone(),
                             SymbolKind::Const,
+                            vis,
                             Descriptor::Term(name),
                         );
                     }
@@ -293,14 +296,13 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             continue;
                         }
                         let name = node_text(&ident, bytes).to_owned();
-                        if !is_exported(&name) {
-                            continue;
-                        }
+                        let vis = name_visibility(&name);
                         push(
                             &mut out,
                             &spec,
                             name.clone(),
                             SymbolKind::Static,
+                            vis,
                             Descriptor::Term(name),
                         );
                     }
@@ -823,9 +825,18 @@ fn collect_params(params: &Node, bytes: &[u8], scopes: &[Scope], out: &mut Vec<B
     }
 }
 
-/// True if the identifier is exported (first character is uppercase).
-fn is_exported(name: &str) -> bool {
-    name.chars().next().is_some_and(|c| c.is_uppercase())
+/// Map a Go identifier to its [`Visibility`].
+///
+/// Go's export rule is purely syntactic: a name whose first character is an
+/// uppercase Unicode letter is exported (`Public`); everything else (lowercase,
+/// underscore-prefixed, empty) is package-private (`Internal`). Go has no
+/// concept of `Private` (scope-local) or `Protected` at the package level.
+fn name_visibility(name: &str) -> Visibility {
+    if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+        Visibility::Public
+    } else {
+        Visibility::Internal
+    }
 }
 
 #[cfg(test)]
@@ -849,13 +860,17 @@ func helper() {}
         let vt = by_name("Validate").unwrap();
         assert_eq!(vt.id.to_scip_string(), "codegraph . . . auth/Validate().");
         assert_eq!(vt.kind, SymbolKind::Function);
+        assert_eq!(vt.visibility, Visibility::Public);
 
         assert_eq!(by_name("Config").unwrap().kind, SymbolKind::Struct);
+        assert_eq!(by_name("Config").unwrap().visibility, Visibility::Public);
         assert_eq!(by_name("Reader").unwrap().kind, SymbolKind::Interface);
         assert_eq!(by_name("Max").unwrap().kind, SymbolKind::Const);
 
-        // unexported — must not appear
-        assert!(by_name("helper").is_none());
+        // unexported — now emitted as Internal (package-private)
+        let helper = by_name("helper").expect("helper must now be emitted");
+        assert_eq!(helper.kind, SymbolKind::Function);
+        assert_eq!(helper.visibility, Visibility::Internal);
 
         assert_eq!(facts.lang, "go");
     }
@@ -1438,6 +1453,83 @@ func main() {
                 .filter(|r| r.role == RefRole::TypeRef)
                 .map(|r| (&r.name, r.type_ref_ctx))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Visibility tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn exported_func_has_public_visibility() {
+        // A capitalized function name → Visibility::Public.
+        let src = "package p\nfunc Exported() {}\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "Exported")
+            .expect("Exported must be emitted");
+        assert_eq!(
+            sym.visibility,
+            Visibility::Public,
+            "capitalized func must be Public"
+        );
+    }
+
+    #[test]
+    fn unexported_func_emitted_as_internal() {
+        // A lowercase function name → NOW emitted with Visibility::Internal.
+        let src = "package p\nfunc unexported() {}\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "unexported")
+            .expect("unexported func must now be emitted");
+        assert_eq!(
+            sym.kind,
+            SymbolKind::Function,
+            "unexported func kind must be Function"
+        );
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "lowercase func must be Internal (package-private)"
+        );
+    }
+
+    #[test]
+    fn unexported_type_emitted_as_internal() {
+        // A lowercase type name → emitted with Visibility::Internal.
+        let src = "package p\ntype internalState struct { x int }\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "internalState")
+            .expect("internalState type must be emitted");
+        assert_eq!(sym.kind, SymbolKind::Struct);
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "lowercase type must be Internal"
+        );
+    }
+
+    #[test]
+    fn unexported_const_emitted_as_internal() {
+        // A lowercase const name → emitted with Visibility::Internal.
+        let src = "package p\nconst maxRetries = 3\n";
+        let facts = GoExtractor.extract(src, "src/p.go").unwrap();
+        let sym = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "maxRetries")
+            .expect("maxRetries const must be emitted");
+        assert_eq!(sym.kind, SymbolKind::Const);
+        assert_eq!(
+            sym.visibility,
+            Visibility::Internal,
+            "lowercase const must be Internal"
         );
     }
 

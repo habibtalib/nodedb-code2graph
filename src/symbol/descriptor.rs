@@ -31,7 +31,7 @@ pub enum Descriptor {
     Term(String),
     /// A method or free function (`ident(disambiguator).`). The `disambiguator`
     /// distinguishes overloads and **must** be a SCIP *simple-identifier* (chars
-    /// per [`is_simple_ident_char`]) or empty: SCIP's grammar is
+    /// per `is_simple_ident_char`) or empty: SCIP's grammar is
     /// `method-disambiguator ::= simple-identifier?` with **no escaped form**, so
     /// a non-simple disambiguator cannot be rendered to a parseable SCIP string.
     /// Empty disambiguator is the common case.

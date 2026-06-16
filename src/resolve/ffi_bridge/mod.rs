@@ -6,8 +6,8 @@
 //! `#[no_mangle]` function is callable from C under a stable linker name, and a
 //! PyO3 `#[pyfunction]` is callable from Python. The extractor records each as a
 //! neutral [`FfiExport`] fact (tagged with its [`FfiAbi`]); this resolver bridges
-//! it to call sites in a language that **consumes that ABI**
-//! ([`FfiAbi::consumers`]) — so a C call binds to a C-ABI export, a Python call
+//! it to call sites in a language that **consumes that ABI** (the ABI's consumer
+//! set) — so a C call binds to a C-ABI export, a Python call
 //! to a Python-ABI export, never crossed.
 //!
 //! It is the honest, deterministic subset of cross-language linking: the export
@@ -29,6 +29,7 @@
 //! [`Confidence::NameOnly`]: crate::graph::Confidence::NameOnly
 //! [`Provenance::FfiBridge`]: crate::graph::Provenance::FfiBridge
 //! [`FfiExport`]: crate::graph::FfiExport
+//! [`FfiAbi`]: crate::graph::FfiAbi
 
 mod resolver;
 

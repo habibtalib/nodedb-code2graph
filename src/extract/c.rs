@@ -23,12 +23,12 @@ use crate::graph::types::{
     ScopeId, ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
-use crate::symbol::{Descriptor, SymbolId};
+use crate::symbol::Descriptor;
 
 use super::{
-    Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references, definition_bindings,
-    field_text, innermost_scope, is_static, node_span, node_text, one_line_signature, push_binding,
-    push_ref, push_scope, push_type_ref,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, field_text, innermost_scope, is_static, make_symbol, node_span, node_text,
+    one_line_signature, push_binding, push_ref, push_scope, push_type_ref,
 };
 
 // NOTE: SymbolKind has no Union or Macro variants; unions map to Struct,
@@ -193,13 +193,17 @@ fn find_function_declarator<'tree>(node: &Node<'tree>) -> Option<Node<'tree>> {
 
 fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String]) -> Vec<Symbol> {
     let mut out = Vec::new();
+    let ctx = ExtractCtx {
+        bytes,
+        file,
+        lang: Language::C,
+    };
 
-    // `kv` = (kind, visibility) tuple — keeps arg count below the clippy
-    // `too_many_arguments` threshold while grouping the two tightly-coupled fields.
     let push = |out: &mut Vec<Symbol>,
                 node: &Node,
                 name: String,
-                kv: (SymbolKind, Visibility),
+                kind: SymbolKind,
+                visibility: Visibility,
                 leaf: Descriptor| {
         let mut descriptors: Vec<Descriptor> = namespaces
             .iter()
@@ -207,19 +211,16 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
             .map(Descriptor::Namespace)
             .collect();
         descriptors.push(leaf);
-        out.push(Symbol {
-            id: SymbolId::global(Language::C.as_str(), descriptors),
+        let signature = one_line_signature(node_text(node, ctx.bytes), &['{', ';']);
+        out.push(make_symbol(
+            &ctx,
+            node,
             name,
-            kind: kv.0,
-            visibility: kv.1,
-            file: file.to_owned(),
-            line: (node.start_position().row + 1) as u32,
-            span: ByteSpan {
-                start: node.start_byte(),
-                end: node.end_byte(),
-            },
-            signature: one_line_signature(node_text(node, bytes), &['{', ';']),
-        });
+            kind,
+            visibility,
+            descriptors,
+            signature,
+        ));
     };
 
     for child in root.children(&mut root.walk()) {
@@ -240,7 +241,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    (SymbolKind::Function, vis),
+                    SymbolKind::Function,
+                    vis,
                     Descriptor::Method {
                         name,
                         disambiguator: String::new(),
@@ -263,7 +265,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &spec,
                             agg_name.clone(),
-                            (agg_kind, vis),
+                            agg_kind,
+                            vis,
                             Descriptor::Type(agg_name),
                         );
                     }
@@ -280,7 +283,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &child,
                             name.clone(),
-                            (SymbolKind::Function, vis),
+                            SymbolKind::Function,
+                            vis,
                             Descriptor::Method {
                                 name,
                                 disambiguator: String::new(),
@@ -291,7 +295,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &child,
                             name.clone(),
-                            (SymbolKind::Static, vis),
+                            SymbolKind::Static,
+                            vis,
                             Descriptor::Term(name),
                         );
                     }
@@ -307,7 +312,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                             &mut out,
                             &spec,
                             agg_name.clone(),
-                            (agg_kind, Visibility::Public),
+                            agg_kind,
+                            Visibility::Public,
                             Descriptor::Type(agg_name),
                         );
                     }
@@ -324,7 +330,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    (SymbolKind::TypeAlias, Visibility::Public),
+                    SymbolKind::TypeAlias,
+                    Visibility::Public,
                     Descriptor::Type(name),
                 );
             }
@@ -338,7 +345,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    (SymbolKind::Const, Visibility::Public),
+                    SymbolKind::Const,
+                    Visibility::Public,
                     Descriptor::Macro(name),
                 );
             }
@@ -352,7 +360,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                     &mut out,
                     &child,
                     name.clone(),
-                    (SymbolKind::Function, Visibility::Public),
+                    SymbolKind::Function,
+                    Visibility::Public,
                     Descriptor::Macro(name),
                 );
             }
@@ -366,7 +375,8 @@ fn collect_symbols(root: &Node, bytes: &[u8], file: &str, namespaces: &[String])
                         &mut out,
                         &child,
                         agg_name.clone(),
-                        (agg_kind, Visibility::Public),
+                        agg_kind,
+                        Visibility::Public,
                         Descriptor::Type(agg_name),
                     );
                 }

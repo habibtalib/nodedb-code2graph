@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "code2graph"
+version = "0.0.0"
+description = "Source code to structural graph facts — Python bindings"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "code2graph"

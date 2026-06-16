@@ -1,5 +1,5 @@
 [workspace]
-members = ["eval", "bindings/python"]
+members = ["eval", "bindings/python", "bindings/node"]
 
 [package]
 name = "code2graph"

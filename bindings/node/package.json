@@ -1,0 +1,21 @@
+{
+  "name": "code2graph",
+  "version": "0.0.0",
+  "description": "Source code to structural graph facts — Node.js/Bun bindings",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "code2graph-node",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3"
+  }
+}

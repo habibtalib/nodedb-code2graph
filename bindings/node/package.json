@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nodedb-lab/code2graph.git"
+    "url": "https://github.com/NodeDB-Lab/code2graph.git"
   },
   "main": "index.js",
   "types": "index.d.ts",

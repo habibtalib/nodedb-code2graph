@@ -1,11 +1,11 @@
 {
-  "name": "code2graph-rs",
+  "name": "@nodedb-lab/code2graph",
   "version": "0.0.0",
   "description": "Source code to structural graph facts — Node.js/Bun bindings",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/NodeDB-Lab/code2graph.git"
+    "url": "git+https://github.com/NodeDB-Lab/code2graph.git"
   },
   "main": "index.js",
   "types": "index.d.ts",

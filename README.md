@@ -27,11 +27,11 @@ A purpose-neutral, language-agnostic code-graph extraction library. It turns sou
     <img src="assets/discord-cta.svg" alt="Join the code2graph Discord" width="340">
   </a>
 </p>
-
+ 
 <p>
   <a href="https://crates.io/crates/code2graph"><img src="https://img.shields.io/crates/v/code2graph?logo=rust" alt="crates.io"></a>
   <a href="https://pypi.org/project/code2graph-rs/"><img src="https://img.shields.io/pypi/v/code2graph-rs?logo=pypi&logoColor=white&label=pypi" alt="PyPI"></a>
-  <a href="https://www.npmjs.com/package/code2graph-rs"><img src="https://img.shields.io/npm/v/code2graph-rs?logo=npm" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/@nodedb-lab/code2graph"><img src="https://img.shields.io/npm/v/@nodedb-lab/code2graph?logo=npm" alt="npm"></a>
   <a href="https://docs.rs/code2graph"><img src="https://img.shields.io/docsrs/code2graph?logo=docsdotrs&logoColor=white" alt="docs.rs"></a>
   <a href="https://github.com/nodedb-lab/code2graph/actions/workflows/ci.yml"><img src="https://github.com/nodedb-lab/code2graph/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
@@ -83,11 +83,11 @@ It's **not** for you if you want a turnkey, batteries-included code-intelligence
 
 code2graph ships to three ecosystems from a single source — the Rust crate plus native bindings that emit the same neutral facts as language-native objects:
 
-| Ecosystem  | Package                                                        | Install                     |
-| ---------- | -------------------------------------------------------------- | --------------------------- |
-| Rust       | [`code2graph`](https://crates.io/crates/code2graph)            | `cargo add code2graph`      |
-| Python     | [`code2graph-rs`](https://pypi.org/project/code2graph-rs/)     | `pip install code2graph-rs` |
-| Node / Bun | [`code2graph-rs`](https://www.npmjs.com/package/code2graph-rs) | `npm install code2graph-rs` |
+| Ecosystem  | Package                                                                          | Install                              |
+| ---------- | -------------------------------------------------------------------------------- | ------------------------------------ |
+| Rust       | [`code2graph`](https://crates.io/crates/code2graph)                              | `cargo add code2graph`               |
+| Python     | [`code2graph-rs`](https://pypi.org/project/code2graph-rs/)                       | `pip install code2graph-rs`          |
+| Node / Bun | [`@nodedb-lab/code2graph`](https://www.npmjs.com/package/@nodedb-lab/code2graph) | `npm install @nodedb-lab/code2graph` |
 
 API reference: [docs.rs/code2graph](https://docs.rs/code2graph). Binding sources: [`bindings/python`](bindings/python) (PyO3 / maturin) and [`bindings/node`](bindings/node) (napi-rs).
 

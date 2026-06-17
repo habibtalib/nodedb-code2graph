@@ -17,7 +17,7 @@ The `napi build` command (from `@napi-rs/cli`) compiles the Rust crate and write
 napi-rs automatically converts Rust `snake_case` function names to JS `camelCase` (`build_graph` → `buildGraph`, `language_of` → `languageOf`). TypeScript types are generated as `index.d.ts`.
 
 ```js
-const { extract, buildGraph, languageOf } = require("@nodedb-lab/code2graph");
+import { extract, buildGraph, languageOf } from "@nodedb-lab/code2graph";
 
 const facts = extract("src/lib.rs", "pub fn hello() {}");
 const graph = buildGraph([facts], "name");
@@ -26,5 +26,7 @@ console.log(graph.edges);
 console.log(languageOf("src/main.go")); // "go"
 console.log(languageOf("unknown.xyz")); // null
 ```
+
+The addon is a CommonJS package, so CJS `require("@nodedb-lab/code2graph")` works too — ESM `import` resolves via Node's interop.
 
 The `tier` argument to `buildGraph` is `"name"` (default, Tier A — fast, recall-first, `NameOnly` confidence) or `"scope"` (Tier B — scope-graph path resolution, `Scoped`/`Exact` confidence).

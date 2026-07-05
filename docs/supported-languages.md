@@ -43,7 +43,7 @@ Cross-language **FFI** is a property of language _pairs_, so it lives in its own
 | Language        | Extensions                              | Status | Calls | Imports | Inherit | Type-ref | Read/Write | Entry-pts | Notes                                                                 |
 | --------------- | --------------------------------------- | :----: | :---: | :-----: | :-----: | :------: | :--------: | :-------: | --------------------------------------------------------------------- |
 | Rust            | `.rs`                                   |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     | traits → inherit; FFI producer                                        |
-| TypeScript      | `.ts` `.tsx`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |           |                                                                       |
+| TypeScript      | `.ts` `.tsx`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
 | JavaScript      | `.js` `.jsx` `.mjs` `.cjs`              |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      |           | via the TS engine; not separately oracle-scored                       |
 | Python          | `.py` `.pyi`                            |   ⭐   |   ✓   |    ✓    |    ✓    |    ✓     |     ✓      |     ✓     |                                                                       |
 | Go              | `.go`                                   |   ⭐   |   ✓   |    ✓    |    —    |    ✓     |     ✓      |     ✓     | structural interfaces → no class inheritance                          |
@@ -107,6 +107,11 @@ carrying the raw framework marker as written (e.g. `app.get`, `GetMapping`) — 
 unambiguous syntax only; the consumer decides what counts as attack surface. Per-language status is
 the column above (✓ where a detector ships · blank = open contribution); the detector follows the
 same marker-walk pattern as FFI-export detection.
+
+TypeScript/JavaScript: call-terminal verb matching (Express/Fastify/Koa/Hono `<receiver>.<verb>(path, handler)`,
+named handlers only) and decorator-terminal matching (NestJS `@Get`/`@Post`/`@Put`/`@Delete`/`@Patch`/`@Controller`,
+aggregated onto the enclosing class symbol since this extractor has no per-method symbol yet).
+Inline (anonymous) handlers and `.use()` middleware registration are deliberately not detected.
 
 ## Honest limitations
 

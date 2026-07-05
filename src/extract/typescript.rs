@@ -21,8 +21,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    Binding, BindingKind, ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind,
-    Symbol, SymbolKind, TypeRefContext, Visibility,
+    Binding, BindingKind, ByteSpan, EntryPoint, FileFacts, RefRole, Reference, Scope, ScopeId,
+    ScopeKind, Symbol, SymbolKind, TypeRefContext, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -42,6 +42,86 @@ const CALL_QUERY: &str = r#"
   ]
 )
 "#;
+
+/// Terminal property/identifier names that indicate an HTTP-route call
+/// (Express/Fastify/Koa/Hono `<receiver>.<verb>(path, handler)` shape). Mirrors
+/// Python's `PY_ROUTE_VERBS`, plus `all` (Express/Fastify's "match any HTTP
+/// method" registration — genuinely route-shaped, unlike `.use()`).
+/// Deliberately EXCLUDES `use`: Express/Koa's generic middleware-registration
+/// call (logging, auth, static files — not HTTP routing); including it would
+/// flood `HttpRoute` markers with false positives on every Express/Koa app.
+const TS_ROUTE_VERBS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "head",
+    "options",
+    "trace",
+    "route",
+    "websocket",
+    "ws",
+    "all",
+];
+
+/// Walk the whole tree for Express/Fastify/Koa/Hono-shaped route-registration
+/// calls and, where the handler argument is a bare identifier matching an
+/// already-collected top-level `Symbol`'s name, attach an `EntryPoint::HttpRoute`
+/// marker to that symbol. Inline (arrow/function-expression) handlers are NOT
+/// detected — there is no per-call or per-inline-function `Symbol` in this
+/// extractor to attach the marker to, and fabricating one would violate the
+/// "never guess" contract. This is an honest, documented ceiling, not a gap.
+fn attach_call_entry_points(root: &Node, bytes: &[u8], symbols: &mut [Symbol]) {
+    if root.kind() == "call_expression" {
+        if let Some((terminal, callee_text)) = call_route_match(root, bytes) {
+            if TS_ROUTE_VERBS.contains(&terminal) {
+                if let Some(handler_name) = last_arg_bare_identifier(root, bytes) {
+                    if let Some(sym) = symbols.iter_mut().find(|s| s.name == handler_name) {
+                        sym.entry_points
+                            .push(EntryPoint::HttpRoute(callee_text.to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    for child in root.children(&mut root.walk()) {
+        attach_call_entry_points(&child, bytes, symbols);
+    }
+}
+
+/// If `call` is a `call_expression` whose `function:` field is a
+/// `member_expression` (terminal = its `property:` field text) or a bare
+/// `identifier` (terminal = its own text), return `(terminal, full_callee_text)`.
+fn call_route_match<'a>(call: &Node, bytes: &'a [u8]) -> Option<(&'a str, &'a str)> {
+    let func = call.child_by_field_name("function")?;
+    match func.kind() {
+        "member_expression" => {
+            let prop = func.child_by_field_name("property")?;
+            let terminal = node_text(&prop, bytes);
+            let callee_text = node_text(&func, bytes);
+            Some((terminal, callee_text))
+        }
+        "identifier" => {
+            let text = node_text(&func, bytes);
+            Some((text, text))
+        }
+        _ => None,
+    }
+}
+
+/// Return the text of the LAST argument in `call`'s `arguments:` list, only if
+/// it is a bare `identifier` node (not an arrow/function expression or any
+/// other shape).
+fn last_arg_bare_identifier<'a>(call: &Node, bytes: &'a [u8]) -> Option<&'a str> {
+    let args = call.child_by_field_name("arguments")?;
+    let last = args.named_children(&mut args.walk()).last()?;
+    if last.kind() == "identifier" {
+        Some(node_text(&last, bytes))
+    } else {
+        None
+    }
+}
 
 /// Extracts TypeScript symbols and references.
 pub struct TypeScriptExtractor;
@@ -85,6 +165,7 @@ pub(super) fn extract_ecmascript(source: &str, file: &str, lang: Language) -> Re
     let defs = collect_symbols(&root, &ctx, &namespaces);
     let def_bindings = definition_bindings(&defs);
     let mut symbols = defs;
+    attach_call_entry_points(&root, bytes, &mut symbols);
     let mod_sym = super::module_symbol(lang, &namespaces, file, source.len());
     let module_id = mod_sym.id.to_scip_string();
     symbols.push(mod_sym);
@@ -1316,6 +1397,107 @@ export const Y = 2;
         assert!(
             foo_reads.is_empty(),
             "property 'foo' in member_expression must NOT be a Read ref; got: {foo_reads:?}"
+        );
+    }
+
+    // ── Entry-point detection: call-terminal verb matching ───────────────────
+
+    #[test]
+    fn ts_named_handler_router_get_entry_point() {
+        // router.get('/users', getUsers) next to `function getUsers() {}` →
+        // getUsers's entry_points contains HttpRoute("router.get").
+        let src = "router.get('/users', getUsers);\nfunction getUsers() {}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/routes.ts").unwrap();
+        let get_users = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "getUsers")
+            .expect("expected 'getUsers' symbol");
+        assert!(
+            get_users
+                .entry_points
+                .iter()
+                .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == "router.get")),
+            "expected HttpRoute(\"router.get\"), got {:?}",
+            get_users.entry_points
+        );
+    }
+
+    #[test]
+    fn ts_named_handler_app_post_exported_entry_point() {
+        // app.post('/users', createUser) next to `export function createUser() {}`
+        // → createUser's entry_points contains HttpRoute("app.post").
+        let src = "app.post('/users', createUser);\nexport function createUser() {}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/routes.ts").unwrap();
+        let create_user = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "createUser")
+            .expect("expected 'createUser' symbol");
+        assert!(
+            create_user
+                .entry_points
+                .iter()
+                .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == "app.post")),
+            "expected HttpRoute(\"app.post\"), got {:?}",
+            create_user.entry_points
+        );
+    }
+
+    #[test]
+    fn ts_inline_arrow_handler_produces_no_marker() {
+        // router.get('/users', (req, res) => {}) — inline arrow handler, no
+        // named function anywhere → NO symbol in the file gets an HttpRoute marker.
+        let src = "router.get('/users', (req, res) => {});\n";
+        let facts = TypeScriptExtractor.extract(src, "src/routes.ts").unwrap();
+        assert!(
+            facts.symbols.iter().all(|s| s.entry_points.is_empty()),
+            "inline handler must not produce any HttpRoute marker; symbols: {:?}",
+            facts
+                .symbols
+                .iter()
+                .map(|s| (&s.name, &s.entry_points))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ts_use_middleware_registration_produces_no_marker() {
+        // app.use(logger) next to `function logger() {}` → logger's entry_points
+        // stays empty — `.use()` is deliberately excluded.
+        let src = "app.use(logger);\nfunction logger() {}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/routes.ts").unwrap();
+        let logger = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "logger")
+            .expect("expected 'logger' symbol");
+        assert!(
+            logger.entry_points.is_empty(),
+            "`.use()` must not produce an HttpRoute marker; got {:?}",
+            logger.entry_points
+        );
+    }
+
+    #[test]
+    fn js_named_handler_router_get_entry_point() {
+        // JS inherits it for free via the shared extract_ecmascript path.
+        use crate::extract::Extractor as _;
+        use crate::extract::JavaScriptExtractor;
+        let src = "router.get('/users', getUsers);\nfunction getUsers() {}\n";
+        let facts = JavaScriptExtractor.extract(src, "src/routes.js").unwrap();
+        let get_users = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "getUsers")
+            .expect("expected 'getUsers' symbol");
+        assert!(
+            get_users
+                .entry_points
+                .iter()
+                .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == "router.get")),
+            "expected HttpRoute(\"router.get\") on JS too, got {:?}",
+            get_users.entry_points
         );
     }
 }

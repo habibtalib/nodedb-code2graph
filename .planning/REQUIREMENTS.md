@@ -11,7 +11,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 - [x] **COMPAT-01**: Every candidate grammar crate is empirically gated before extractor work — added as an optional dep, compiled, and passing `abi_versions_are_compatible` in `src/grammar.rs` (candidates: Zig, Julia, R, OCaml, Objective-C, Fortran, Groovy, PowerShell, SystemVerilog, Astro via `tree-sitter-astro-next`, F# via `tree-sitter-fsharp`, plus recheck of Elixir, Erlang, Gleam, Haskell)
 - [x] **COMPAT-02**: Candidates that fail the gate are documented honestly in `docs/supported-languages.md` (crate checked, version, exact tree-sitter requirement found) per CONTRIBUTING §"When a language has no usable grammar"
-- [ ] **COMPAT-03**: CI builds each newly added language as a standalone feature (`--no-default-features --features <lang>`) so feature-flag combinatorics can't silently break
+- [x] **COMPAT-03**: CI builds each newly added language as a standalone feature (`--no-default-features --features <lang>`) so feature-flag combinatorics can't silently break
 
 ### New Language Extractors (LANG)
 
@@ -71,7 +71,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | COMPAT-01 | Phase 1 | Complete |
 | COMPAT-02 | Phase 1 | Complete |
-| COMPAT-03 | Phase 1 | Pending |
+| COMPAT-03 | Phase 1 | Complete |
 | TSADAPT-01 | Phase 1 | Complete |
 | LANG-08 | Phase 2 | Pending |
 | LANG-10 | Phase 2 | Pending |

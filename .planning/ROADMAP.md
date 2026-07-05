@@ -33,7 +33,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 - [x] 01-01-PLAN.md — Prep fixes (`_extractors` import gate, `luau` isolation) + wire and empirically gate the 11 expected-compatible candidates (Zig, Julia, R, OCaml, Objective-C, Fortran, Groovy, PowerShell, SystemVerilog, Astro, F#)
 - [x] 01-02-PLAN.md — Wire and empirically gate the 4 disputed candidates (Elixir, Erlang, Gleam, Haskell); write `01-COMPAT-VERDICTS.md` for all 15; correct `docs/supported-languages.md` (F# unblock, Vue/Apex/Liquid/COBOL precise blocked-reason notes)
-- [ ] 01-03-PLAN.md — Add the `feature-isolation` CI matrix job to `.github/workflows/test.yml`, covering every language feature (existing 22 + whatever candidates from 01-01/01-02 landed)
+- [x] 01-03-PLAN.md — Add the `feature-isolation` CI matrix job to `.github/workflows/test.yml`, covering every language feature (existing 22 + whatever candidates from 01-01/01-02 landed)
 - [x] 01-04-PLAN.md — TS/JS entry-point detection in the shared `extract_ecmascript` path (Express/Fastify/Koa/Hono verb-call matching + NestJS decorator matching, aggregated onto the class symbol)
 
 ### Phase 2: Quick-Win Extractors — Astro & PowerShell

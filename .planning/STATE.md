@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 01-02-PLAN.md
-last_updated: "2026-07-05T10:38:19.915Z"
+status: verifying
+stopped_at: Completed 01-03-PLAN.md
+last_updated: "2026-07-05T10:49:50.684Z"
 last_activity: 2026-07-05
 progress:
   total_phases: 4
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 4
-  completed_plans: 3
+  completed_plans: 4
   percent: 0
 ---
 
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-07-05)
 
 Phase: 01 (foundation-compatibility-gate-ci-hardening-ts-js-depth) — EXECUTING
 Plan: 4 of 4
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-07-05
 
 Progress: [░░░░░░░░░░] 0%
@@ -55,6 +55,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P01 | 8 | 3 tasks | 2 files |
 | Phase 01 P04 | 6 | 3 tasks | 2 files |
 | Phase 01 P02 | 22min | 2 tasks | 4 files |
+| Phase 01 P03 | 10min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -73,6 +74,8 @@ Recent decisions affecting current work:
 - [Phase 01]: Aggregated NestJS class-level and method-level route decorators onto the enclosing class Symbol (no per-method Symbol fabricated), matching Phase 1's new-language-extractor-scale boundary
 - [Phase 01]: Resolved D-03 empirically — Elixir/Erlang/Gleam/Haskell all pass the ABI gate; STACK.md's tree-sitter-language ^0.1 reading was correct, FEATURES.md's dev-dependency reading was the trap
 - [Phase 01]: F# moved 🔴→🟠 in docs/supported-languages.md (confirmed ABI pass); Vue/Salesforce Apex/Liquid/COBOL now carry precise blocked-reason notes instead of vague verify placeholders
+- [Phase 01]: Fixed pre-existing SQL/HCL test-compile isolation bug in symbol_table.rs (unconditional SqlExtractor/HclExtractor imports in 4 test fns) before adding the feature-isolation CI job
+- [Phase 01]: feature-isolation CI job's 37-language matrix is mechanically derived from Cargo.toml's [features] block, not hand-maintained, so it won't drift as later phases add languages
 
 ### Pending Todos
 
@@ -86,7 +89,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-07-05T10:38:19.911Z
-Stopped at: Completed 01-02-PLAN.md
+Last session: 2026-07-05T10:49:50.680Z
+Stopped at: Completed 01-03-PLAN.md
 Resume file: None
 </content>

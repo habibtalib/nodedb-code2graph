@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 01-01-PLAN.md
-last_updated: "2026-07-05T10:22:58.889Z"
+stopped_at: Completed 01-04-PLAN.md
+last_updated: "2026-07-05T10:31:26.274Z"
 last_activity: 2026-07-05
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 4
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-05)
 ## Current Position
 
 Phase: 01 (foundation-compatibility-gate-ci-hardening-ts-js-depth) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-07-05
 
@@ -53,6 +53,7 @@ Progress: [░░░░░░░░░░] 0%
 
 *Updated after each plan completion*
 | Phase 01 P01 | 8 | 3 tasks | 2 files |
+| Phase 01 P04 | 6 | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -68,6 +69,7 @@ Recent decisions affecting current work:
 - [Phase 01]: Fixed pre-existing luau feature-isolation bug (luau now depends on lua) before COMPAT-03's CI job would have caught it red
 - [Phase 01]: OCaml wired to LANGUAGE_OCAML (base .ml grammar only); .mli variant deferred to Phase 4 (LANG-04)
 - [Phase 01]: F# wired to LANGUAGE_FSHARP (crate exports no plain LANGUAGE constant)
+- [Phase 01]: Aggregated NestJS class-level and method-level route decorators onto the enclosing class Symbol (no per-method Symbol fabricated), matching Phase 1's new-language-extractor-scale boundary
 
 ### Pending Todos
 
@@ -82,7 +84,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-07-05T10:22:58.885Z
-Stopped at: Completed 01-01-PLAN.md
+Last session: 2026-07-05T10:31:26.269Z
+Stopped at: Completed 01-04-PLAN.md
 Resume file: None
 </content>

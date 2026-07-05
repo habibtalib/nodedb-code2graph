@@ -32,7 +32,7 @@ Each language that passes COMPAT-01 follows the full CONTRIBUTING recipe: Cargo 
 
 ### TypeScript Adapter Depth (TSADAPT)
 
-- [ ] **TSADAPT-01**: Entry-point detection for TS/JS via the shared `extract_ecmascript` path — call-terminal matching for Express/Fastify/Koa/Hono verb calls (Python `PY_ROUTE_VERBS` precedent) and decorator-terminal matching for NestJS `@Get`/`@Post`/`@Controller` (Java annotation precedent); `Entry-pts` column filled for TS and JS
+- [x] **TSADAPT-01**: Entry-point detection for TS/JS via the shared `extract_ecmascript` path — call-terminal matching for Express/Fastify/Koa/Hono verb calls (Python `PY_ROUTE_VERBS` precedent) and decorator-terminal matching for NestJS `@Get`/`@Post`/`@Controller` (Java annotation precedent); `Entry-pts` column filled for TS and JS
 
 ### Bindings Parity (BIND)
 
@@ -72,7 +72,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | COMPAT-01 | Phase 1 | Complete |
 | COMPAT-02 | Phase 1 | Pending |
 | COMPAT-03 | Phase 1 | Pending |
-| TSADAPT-01 | Phase 1 | Pending |
+| TSADAPT-01 | Phase 1 | Complete |
 | LANG-08 | Phase 2 | Pending |
 | LANG-10 | Phase 2 | Pending |
 | BIND-01 | Phase 2 | Pending |

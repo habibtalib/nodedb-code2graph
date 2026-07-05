@@ -217,6 +217,30 @@ pub fn fsharp() -> Language {
     tree_sitter_fsharp::LANGUAGE_FSHARP.into()
 }
 
+#[cfg(feature = "elixir")]
+/// Returns the tree-sitter grammar for Elixir.
+pub fn elixir() -> Language {
+    tree_sitter_elixir::LANGUAGE.into()
+}
+
+#[cfg(feature = "erlang")]
+/// Returns the tree-sitter grammar for Erlang.
+pub fn erlang() -> Language {
+    tree_sitter_erlang::LANGUAGE.into()
+}
+
+#[cfg(feature = "gleam")]
+/// Returns the tree-sitter grammar for Gleam.
+pub fn gleam() -> Language {
+    tree_sitter_gleam::LANGUAGE.into()
+}
+
+#[cfg(feature = "haskell")]
+/// Returns the tree-sitter grammar for Haskell.
+pub fn haskell() -> Language {
+    tree_sitter_haskell::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -297,5 +321,13 @@ mod tests {
         check("astro", super::astro());
         #[cfg(feature = "fsharp")]
         check("fsharp", super::fsharp());
+        #[cfg(feature = "elixir")]
+        check("elixir", super::elixir());
+        #[cfg(feature = "erlang")]
+        check("erlang", super::erlang());
+        #[cfg(feature = "gleam")]
+        check("gleam", super::gleam());
+        #[cfg(feature = "haskell")]
+        check("haskell", super::haskell());
     }
 }

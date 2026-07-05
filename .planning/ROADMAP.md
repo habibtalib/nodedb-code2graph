@@ -75,7 +75,16 @@ Plans:
   4. `extract()` on a `.fs` file emits F# symbols with real SCIP ids, reusing the OCaml/ML-family template validated in this same phase.
   5. For each of Elixir, Erlang, Gleam, and Haskell that passed Phase 1's `abi_versions_are_compatible` gate, `extract()` emits real symbols/`Calls`/`Imports` on that language's source extension; any that failed the gate remain documented as blocked (crate, version, `tree-sitter` requirement) rather than attempted here.
   6. All languages shipped in this phase independently pass `cargo test --no-default-features --features <lang>`, have matching feature entries in both `bindings/{node,python}/Cargo.toml`, a diff-free `napi build`, at least one `eval/corpus/` case, and a `docs/supported-languages.md` row.
-**Plans**: TBD
+**Plans**: 8 plans
+Plans:
+- [ ] 04-01-PLAN.md — OCaml extractor end-to-end (.ml/.mli, ocaml_interface() grammar wiring, ML-family template)
+- [ ] 04-02-PLAN.md — F# extractor end-to-end (reuses OCaml's ML-family shape, recursive-walk curried application)
+- [ ] 04-03-PLAN.md — Gleam extractor end-to-end (real pub/fn visibility, algebraic types)
+- [ ] 04-04-PLAN.md — Elixir extractor end-to-end (call-node target-text dispatch, arity-disambiguated Methods)
+- [ ] 04-05-PLAN.md — Erlang extractor end-to-end (per-clause grouping via dedup, arity-qualified -export visibility)
+- [ ] 04-06-PLAN.md — Haskell extractor end-to-end (equation grouping, export-list visibility, recursive-walk calls)
+- [ ] 04-07-PLAN.md — Julia extractor end-to-end (long/short-form functions, multiple-dispatch ceiling)
+- [ ] 04-08-PLAN.md — R extractor end-to-end (assignment-based functions, Visibility::Unknown, NSE ceiling; final phase gate)
 
 ## Progress
 
@@ -87,4 +96,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 | 1. Foundation — Compat Gate, CI Hardening & TS/JS Depth | 0/4 | Complete    | 2026-07-05 |
 | 2. Quick-Win Extractors — Astro & PowerShell | 2/2 | Complete    | 2026-07-05 |
 | 3. Established-Template Extractors | 0/TBD | Complete    | 2026-07-05 |
-| 4. Risky & Novel-Design Extractors | 0/TBD | Not started | - |
+| 4. Risky & Novel-Design Extractors | 0/8 | Not started | - |

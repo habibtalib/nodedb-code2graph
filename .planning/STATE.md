@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 01-04-PLAN.md
-last_updated: "2026-07-05T10:31:26.274Z"
+stopped_at: Completed 01-02-PLAN.md
+last_updated: "2026-07-05T10:38:19.915Z"
 last_activity: 2026-07-05
 progress:
   total_phases: 4
   completed_phases: 0
   total_plans: 4
-  completed_plans: 2
+  completed_plans: 3
   percent: 0
 ---
 
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-07-05)
 ## Current Position
 
 Phase: 01 (foundation-compatibility-gate-ci-hardening-ts-js-depth) — EXECUTING
-Plan: 3 of 4
+Plan: 4 of 4
 Status: Ready to execute
 Last activity: 2026-07-05
 
@@ -54,6 +54,7 @@ Progress: [░░░░░░░░░░] 0%
 *Updated after each plan completion*
 | Phase 01 P01 | 8 | 3 tasks | 2 files |
 | Phase 01 P04 | 6 | 3 tasks | 2 files |
+| Phase 01 P02 | 22min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -70,6 +71,8 @@ Recent decisions affecting current work:
 - [Phase 01]: OCaml wired to LANGUAGE_OCAML (base .ml grammar only); .mli variant deferred to Phase 4 (LANG-04)
 - [Phase 01]: F# wired to LANGUAGE_FSHARP (crate exports no plain LANGUAGE constant)
 - [Phase 01]: Aggregated NestJS class-level and method-level route decorators onto the enclosing class Symbol (no per-method Symbol fabricated), matching Phase 1's new-language-extractor-scale boundary
+- [Phase 01]: Resolved D-03 empirically — Elixir/Erlang/Gleam/Haskell all pass the ABI gate; STACK.md's tree-sitter-language ^0.1 reading was correct, FEATURES.md's dev-dependency reading was the trap
+- [Phase 01]: F# moved 🔴→🟠 in docs/supported-languages.md (confirmed ABI pass); Vue/Salesforce Apex/Liquid/COBOL now carry precise blocked-reason notes instead of vague verify placeholders
 
 ### Pending Todos
 
@@ -77,14 +80,13 @@ None yet.
 
 ### Blockers/Concerns
 
-- Phase 1's empirical ABI spike for Elixir/Erlang/Gleam/Haskell resolves a genuine STACK.md vs FEATURES.md research conflict — Phase 4's scope for the BEAM/Haskell family is conditional on that result, not fixed yet.
 - Objective-C's `.h` extension-collision dispatch decision (Phase 3) has no existing codebase precedent — needs explicit resolution during phase planning, not left implicit.
 - Groovy's `.gradle` in/out-of-scope call (Phase 3) needs an explicit decision during phase planning — real-world Gradle DSL corpus variance is substantial.
 - Python binding-parity has no automated drift gate (unlike Node's napi `git diff` check) — every phase touching bindings needs a manual verification step until this infra gap is closed.
 
 ## Session Continuity
 
-Last session: 2026-07-05T10:31:26.269Z
-Stopped at: Completed 01-04-PLAN.md
+Last session: 2026-07-05T10:38:19.911Z
+Stopped at: Completed 01-02-PLAN.md
 Resume file: None
 </content>

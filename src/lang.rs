@@ -31,6 +31,7 @@ pub enum Language {
     Luau,       // .luau
     Pascal,     // .pas, .dpr, .dpk, .lpr
     Svelte,     // .svelte
+    PowerShell, // .ps1, .psm1
 }
 
 impl Language {
@@ -59,6 +60,7 @@ impl Language {
         Language::Luau,
         Language::Pascal,
         Language::Svelte,
+        Language::PowerShell,
     ];
 
     /// This variant's file extensions (without the leading dot); the first entry
@@ -89,6 +91,7 @@ impl Language {
             Language::Luau => &["luau"],
             Language::Pascal => &["pas", "dpr", "dpk", "lpr"],
             Language::Svelte => &["svelte"],
+            Language::PowerShell => &["ps1", "psm1"],
         }
     }
 
@@ -118,6 +121,7 @@ impl Language {
             Language::Luau => "luau",
             Language::Pascal => "pascal",
             Language::Svelte => "svelte",
+            Language::PowerShell => "powershell",
         }
     }
 
@@ -181,7 +185,8 @@ mod tests {
             | Language::Lua
             | Language::Luau
             | Language::Pascal
-            | Language::Svelte => true,
+            | Language::Svelte
+            | Language::PowerShell => true,
         };
         listed && Language::ALL.contains(&l)
     }

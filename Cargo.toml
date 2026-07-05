@@ -44,7 +44,7 @@ csharp = ["dep:tree-sitter-c-sharp", "_extractors"]
 scala = ["dep:tree-sitter-scala", "_extractors"]
 dart = ["dep:tree-sitter-dart", "_extractors"]
 lua = ["dep:tree-sitter-lua", "_extractors"]
-luau = ["dep:tree-sitter-luau", "_extractors"]
+luau = ["dep:tree-sitter-luau", "lua", "_extractors"]
 pascal = ["dep:tree-sitter-pascal", "_extractors"]
 svelte = ["dep:tree-sitter-svelte-ng", "typescript", "_extractors"]
 

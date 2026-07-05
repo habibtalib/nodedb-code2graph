@@ -21,6 +21,8 @@ use super::DartExtractor;
 use super::FortranExtractor;
 #[cfg(feature = "go")]
 use super::GoExtractor;
+#[cfg(feature = "groovy")]
+use super::GroovyExtractor;
 #[cfg(feature = "hcl")]
 use super::HclExtractor;
 #[cfg(feature = "java")]
@@ -139,6 +141,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::SystemVerilog => SystemVerilogExtractor.extract(source, file),
         #[cfg(feature = "fortran")]
         Language::Fortran => FortranExtractor.extract(source, file),
+        #[cfg(feature = "groovy")]
+        Language::Groovy => GroovyExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

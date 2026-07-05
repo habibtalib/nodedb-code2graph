@@ -27,6 +27,8 @@ pub mod dart;
 pub mod fortran;
 #[cfg(feature = "go")]
 pub mod go;
+#[cfg(feature = "groovy")]
+pub mod groovy;
 #[cfg(feature = "hcl")]
 pub mod hcl;
 #[cfg(feature = "java")]
@@ -86,6 +88,8 @@ pub use dart::DartExtractor;
 pub use fortran::FortranExtractor;
 #[cfg(feature = "go")]
 pub use go::GoExtractor;
+#[cfg(feature = "groovy")]
+pub use groovy::GroovyExtractor;
 #[cfg(feature = "hcl")]
 pub use hcl::HclExtractor;
 #[cfg(feature = "java")]

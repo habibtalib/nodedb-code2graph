@@ -1,0 +1,5 @@
+# Same-file calls: `deploy` calls `helper` twice — parenthesized (`method_invocation`)
+# and paren-less with a literal arg (`juxt_function_call`), both defined in app.groovy.
+# Proves both Groovy call shapes resolve via Tier-A same-file matching.
+app.groovy:6 Call app.groovy:1
+app.groovy:7 Call app.groovy:1

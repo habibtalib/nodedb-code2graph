@@ -36,6 +36,7 @@ pub enum Language {
     Zig,           // .zig
     SystemVerilog, // .sv, .svh
     Fortran,       // .f90, .f
+    Groovy,        // .groovy, .gradle
 }
 
 impl Language {
@@ -69,6 +70,7 @@ impl Language {
         Language::Zig,
         Language::SystemVerilog,
         Language::Fortran,
+        Language::Groovy,
     ];
 
     /// This variant's file extensions (without the leading dot); the first entry
@@ -104,6 +106,7 @@ impl Language {
             Language::Zig => &["zig"],
             Language::SystemVerilog => &["sv", "svh"],
             Language::Fortran => &["f90", "f"],
+            Language::Groovy => &["groovy", "gradle"],
         }
     }
 
@@ -138,6 +141,7 @@ impl Language {
             Language::Zig => "zig",
             Language::SystemVerilog => "systemverilog",
             Language::Fortran => "fortran",
+            Language::Groovy => "groovy",
         }
     }
 
@@ -206,7 +210,8 @@ mod tests {
             | Language::Astro
             | Language::Zig
             | Language::SystemVerilog
-            | Language::Fortran => true,
+            | Language::Fortran
+            | Language::Groovy => true,
         };
         listed && Language::ALL.contains(&l)
     }

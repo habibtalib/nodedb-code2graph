@@ -33,6 +33,8 @@ use super::LuauExtractor;
 use super::PascalExtractor;
 #[cfg(feature = "php")]
 use super::PhpExtractor;
+#[cfg(feature = "powershell")]
+use super::PowerShellExtractor;
 #[cfg(feature = "python")]
 use super::PythonExtractor;
 #[cfg(feature = "ruby")]
@@ -119,6 +121,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Pascal => PascalExtractor.extract(source, file),
         #[cfg(feature = "svelte")]
         Language::Svelte => SvelteExtractor.extract(source, file),
+        #[cfg(feature = "powershell")]
+        Language::PowerShell => PowerShellExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

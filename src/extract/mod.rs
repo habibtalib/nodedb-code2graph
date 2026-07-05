@@ -39,6 +39,8 @@ pub mod luau;
 pub mod pascal;
 #[cfg(feature = "php")]
 pub mod php;
+#[cfg(feature = "powershell")]
+pub mod powershell;
 #[cfg(feature = "python")]
 pub mod python;
 #[cfg(feature = "ruby")]
@@ -88,6 +90,8 @@ pub use luau::LuauExtractor;
 pub use pascal::PascalExtractor;
 #[cfg(feature = "php")]
 pub use php::PhpExtractor;
+#[cfg(feature = "powershell")]
+pub use powershell::PowerShellExtractor;
 #[cfg(feature = "python")]
 pub use python::PythonExtractor;
 #[cfg(feature = "ruby")]

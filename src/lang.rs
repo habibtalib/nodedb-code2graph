@@ -32,6 +32,7 @@ pub enum Language {
     Pascal,     // .pas, .dpr, .dpk, .lpr
     Svelte,     // .svelte
     PowerShell, // .ps1, .psm1
+    Astro,      // .astro
 }
 
 impl Language {
@@ -61,6 +62,7 @@ impl Language {
         Language::Pascal,
         Language::Svelte,
         Language::PowerShell,
+        Language::Astro,
     ];
 
     /// This variant's file extensions (without the leading dot); the first entry
@@ -92,6 +94,7 @@ impl Language {
             Language::Pascal => &["pas", "dpr", "dpk", "lpr"],
             Language::Svelte => &["svelte"],
             Language::PowerShell => &["ps1", "psm1"],
+            Language::Astro => &["astro"],
         }
     }
 
@@ -122,6 +125,7 @@ impl Language {
             Language::Pascal => "pascal",
             Language::Svelte => "svelte",
             Language::PowerShell => "powershell",
+            Language::Astro => "astro",
         }
     }
 
@@ -186,7 +190,8 @@ mod tests {
             | Language::Luau
             | Language::Pascal
             | Language::Svelte
-            | Language::PowerShell => true,
+            | Language::PowerShell
+            | Language::Astro => true,
         };
         listed && Language::ALL.contains(&l)
     }

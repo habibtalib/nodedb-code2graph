@@ -37,6 +37,7 @@ pub enum Language {
     SystemVerilog, // .sv, .svh
     Fortran,       // .f90, .f
     Groovy,        // .groovy, .gradle
+    ObjC,          // .m, .mm (D-01: bare .h stays mapped to C)
 }
 
 impl Language {
@@ -71,6 +72,7 @@ impl Language {
         Language::SystemVerilog,
         Language::Fortran,
         Language::Groovy,
+        Language::ObjC,
     ];
 
     /// This variant's file extensions (without the leading dot); the first entry
@@ -107,6 +109,7 @@ impl Language {
             Language::SystemVerilog => &["sv", "svh"],
             Language::Fortran => &["f90", "f"],
             Language::Groovy => &["groovy", "gradle"],
+            Language::ObjC => &["m", "mm"],
         }
     }
 
@@ -142,6 +145,7 @@ impl Language {
             Language::SystemVerilog => "systemverilog",
             Language::Fortran => "fortran",
             Language::Groovy => "groovy",
+            Language::ObjC => "objc",
         }
     }
 
@@ -211,7 +215,8 @@ mod tests {
             | Language::Zig
             | Language::SystemVerilog
             | Language::Fortran
-            | Language::Groovy => true,
+            | Language::Groovy
+            | Language::ObjC => true,
         };
         listed && Language::ALL.contains(&l)
     }

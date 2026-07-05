@@ -41,6 +41,8 @@ pub mod kotlin;
 pub mod lua;
 #[cfg(feature = "luau")]
 pub mod luau;
+#[cfg(feature = "objc")]
+pub mod objc;
 #[cfg(feature = "pascal")]
 pub mod pascal;
 #[cfg(feature = "php")]
@@ -102,6 +104,8 @@ pub use kotlin::KotlinExtractor;
 pub use lua::LuaExtractor;
 #[cfg(feature = "luau")]
 pub use luau::LuauExtractor;
+#[cfg(feature = "objc")]
+pub use objc::ObjCExtractor;
 #[cfg(feature = "pascal")]
 pub use pascal::PascalExtractor;
 #[cfg(feature = "php")]

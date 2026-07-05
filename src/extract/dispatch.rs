@@ -35,6 +35,8 @@ use super::KotlinExtractor;
 use super::LuaExtractor;
 #[cfg(feature = "luau")]
 use super::LuauExtractor;
+#[cfg(feature = "objc")]
+use super::ObjCExtractor;
 #[cfg(feature = "pascal")]
 use super::PascalExtractor;
 #[cfg(feature = "php")]
@@ -143,6 +145,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Fortran => FortranExtractor.extract(source, file),
         #[cfg(feature = "groovy")]
         Language::Groovy => GroovyExtractor.extract(source, file),
+        #[cfg(feature = "objc")]
+        Language::ObjC => ObjCExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

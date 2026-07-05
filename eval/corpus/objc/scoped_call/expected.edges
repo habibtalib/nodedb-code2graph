@@ -1,0 +1,4 @@
+# Same-file message send: `deploy` sends `helper` to self; both methods are
+# defined in Session.m's @implementation. Proves message-send Call detection
+# (selector reassembly + receiver qualifier) resolves via Tier-A same-file matching.
+Session.m:5 Call Session.m:2

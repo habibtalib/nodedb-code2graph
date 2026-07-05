@@ -93,3 +93,31 @@ jobs:
             echo "::error::bindings/node/index.js or index.d.ts is out of date — run 'npm run build' in bindings/node and commit the regenerated files."
             exit 1
           fi
+
+  # Proves every language Cargo feature builds standalone (--no-default-features
+  # plus exactly one language feature). --all-features in the `test` job above
+  # can mask a feature-isolation bug (e.g. the pre-existing `luau` bug fixed in
+  # Phase 1) since every language's deps are present simultaneously there. This
+  # job is the only place that would catch such a break. `matrix.lang` is meant
+  # to track Cargo.toml's `[features]` block 1:1 — every entry except
+  # default/manifest/serde/_extractors — regenerate it from Cargo.toml (see
+  # CONTRIBUTING.md) whenever a language feature is added or removed.
+  feature-isolation:
+    name: Feature isolation (${{ matrix.lang }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lang: [rust, python, typescript, go, java, c, cpp, ruby, php, shell, swift,
+               kotlin, solidity, sql, hcl, csharp, scala, dart, lua, luau, pascal, svelte,
+               zig, julia, r, ocaml, objc, fortran, groovy, powershell, systemverilog,
+               astro, fsharp, elixir, erlang, gleam, haskell]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: isolation-${{ matrix.lang }}
+      - name: Build ${{ matrix.lang }} in isolation
+        run: cargo check --no-default-features --features ${{ matrix.lang }}

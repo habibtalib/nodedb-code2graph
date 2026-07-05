@@ -13,6 +13,8 @@ mod dispatch;
 #[cfg(feature = "_extractors")]
 mod support;
 
+#[cfg(feature = "astro")]
+pub mod astro;
 #[cfg(feature = "c")]
 pub mod c;
 #[cfg(feature = "cpp")]
@@ -64,6 +66,8 @@ pub mod typescript;
 
 pub use dispatch::{Extractor, extract_file, extract_path};
 
+#[cfg(feature = "astro")]
+pub use astro::AstroExtractor;
 #[cfg(feature = "c")]
 pub use c::CExtractor;
 #[cfg(feature = "cpp")]

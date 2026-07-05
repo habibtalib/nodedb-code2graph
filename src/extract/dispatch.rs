@@ -7,6 +7,8 @@ use crate::error::{CodegraphError, Result};
 use crate::graph::FileFacts;
 use crate::lang::Language;
 
+#[cfg(feature = "astro")]
+use super::AstroExtractor;
 #[cfg(feature = "c")]
 use super::CExtractor;
 #[cfg(feature = "csharp")]
@@ -123,6 +125,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Svelte => SvelteExtractor.extract(source, file),
         #[cfg(feature = "powershell")]
         Language::PowerShell => PowerShellExtractor.extract(source, file),
+        #[cfg(feature = "astro")]
+        Language::Astro => AstroExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

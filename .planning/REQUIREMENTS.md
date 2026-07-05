@@ -69,13 +69,30 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (filled by roadmap) | | |
+| COMPAT-01 | Phase 1 | Pending |
+| COMPAT-02 | Phase 1 | Pending |
+| COMPAT-03 | Phase 1 | Pending |
+| TSADAPT-01 | Phase 1 | Pending |
+| LANG-08 | Phase 2 | Pending |
+| LANG-10 | Phase 2 | Pending |
+| BIND-01 | Phase 2 | Pending |
+| BIND-02 | Phase 2 | Pending |
+| LANG-01 | Phase 3 | Pending |
+| LANG-05 | Phase 3 | Pending |
+| LANG-06 | Phase 3 | Pending |
+| LANG-07 | Phase 3 | Pending |
+| LANG-09 | Phase 3 | Pending |
+| LANG-02 | Phase 4 | Pending |
+| LANG-03 | Phase 4 | Pending |
+| LANG-04 | Phase 4 | Pending |
+| LANG-11 | Phase 4 | Pending |
+| LANG-12 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 18 total
-- Mapped to phases: 0
-- Unmapped: 18 ⚠️ (pending roadmap)
+- Mapped to phases: 18
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-07-05*
-*Last updated: 2026-07-05 after initialization*
+*Last updated: 2026-07-05 after roadmap creation*

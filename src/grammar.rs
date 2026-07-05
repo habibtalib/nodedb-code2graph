@@ -147,6 +147,45 @@ pub fn svelte() -> Language {
     tree_sitter_svelte_ng::LANGUAGE.into()
 }
 
+#[cfg(feature = "zig")]
+/// Returns the tree-sitter grammar for Zig.
+pub fn zig() -> Language {
+    tree_sitter_zig::LANGUAGE.into()
+}
+
+#[cfg(feature = "julia")]
+/// Returns the tree-sitter grammar for Julia.
+pub fn julia() -> Language {
+    tree_sitter_julia::LANGUAGE.into()
+}
+
+#[cfg(feature = "r")]
+/// Returns the tree-sitter grammar for R.
+pub fn r() -> Language {
+    tree_sitter_r::LANGUAGE.into()
+}
+
+#[cfg(feature = "ocaml")]
+/// Returns the tree-sitter grammar for OCaml (`.ml` implementation files).
+/// The crate also exposes `LANGUAGE_OCAML_INTERFACE` (.mli) and
+/// `LANGUAGE_OCAML_TYPE`, not wired here — Phase 1 gates the base grammar
+/// only; `.mli` handling is Phase 4's concern (LANG-04).
+pub fn ocaml() -> Language {
+    tree_sitter_ocaml::LANGUAGE_OCAML.into()
+}
+
+#[cfg(feature = "objc")]
+/// Returns the tree-sitter grammar for Objective-C.
+pub fn objc() -> Language {
+    tree_sitter_objc::LANGUAGE.into()
+}
+
+#[cfg(feature = "fortran")]
+/// Returns the tree-sitter grammar for Fortran.
+pub fn fortran() -> Language {
+    tree_sitter_fortran::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -205,5 +244,17 @@ mod tests {
         check("luau", super::luau());
         #[cfg(feature = "pascal")]
         check("pascal", super::pascal());
+        #[cfg(feature = "zig")]
+        check("zig", super::zig());
+        #[cfg(feature = "julia")]
+        check("julia", super::julia());
+        #[cfg(feature = "r")]
+        check("r", super::r());
+        #[cfg(feature = "ocaml")]
+        check("ocaml", super::ocaml());
+        #[cfg(feature = "objc")]
+        check("objc", super::objc());
+        #[cfg(feature = "fortran")]
+        check("fortran", super::fortran());
     }
 }

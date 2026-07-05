@@ -601,6 +601,7 @@ mod tests {
     /// Intra-SQL: a query file referencing a table defined in a schema file
     /// resolves to a TypeRef edge pointing at the table's SCIP symbol, Scoped
     /// (unique global candidate → Win-1).
+    #[cfg(feature = "sql")]
     #[test]
     fn intra_sql_typeref_edge_from_query_to_table() {
         use crate::extract::SqlExtractor;
@@ -655,6 +656,7 @@ mod tests {
     /// Code→SQL: a Rust file referencing the type name `users` resolves to the
     /// SQL `users` table definition.  Confidence is Scoped when `users` is the
     /// only global candidate (Win-1).
+    #[cfg(all(feature = "sql", feature = "rust"))]
     #[test]
     fn code_to_sql_typeref_edge_rust_to_table() {
         use crate::extract::SqlExtractor;
@@ -724,6 +726,7 @@ mod tests {
     /// The traversal emits a TypeRef ref (name `main`, qualifier `aws_subnet`).
     /// With `aws_subnet/main#` as the sole global candidate for name `main`,
     /// Win-1 fires → Confidence::Scoped.
+    #[cfg(feature = "hcl")]
     #[test]
     fn intra_hcl_typeref_edge_from_instance_to_subnet() {
         use crate::extract::HclExtractor;
@@ -792,6 +795,7 @@ resource "aws_instance" "web" { subnet_id = aws_subnet.main.id }
     /// `resource "aws_instance" "web" { x = module.vpc.id }`.
     /// Traversal → name `vpc`, qualifier `module`; `module/vpc#` is the sole
     /// candidate → Win-1 → Scoped.
+    #[cfg(feature = "hcl")]
     #[test]
     fn intra_hcl_typeref_edge_from_resource_to_module() {
         use crate::extract::HclExtractor;

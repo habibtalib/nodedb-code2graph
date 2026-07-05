@@ -65,13 +65,13 @@ Cross-language **FFI** is a property of language _pairs_, so it lives in its own
 | Svelte          | `.svelte`                               |   🟢   |   ⤴   |    ⤴    |    ⤴    |    ⤴     |     ⤴      |           | `<script>` blocks via the TS engine                                   |
 | SQL             | `.sql`                                  |   🟣   |   —   |    —    |    —    |    ✓     |     —      |     —     | `Table`/`View`/`Column` symbols; `FROM`/`JOIN` refs                   |
 | HCL / Terraform | `.tf` `.hcl` `.tfvars`                  |   🟣   |   —   |    —    |    —    |    ✓     |     —      |     —     | `Resource`/module symbols; resource refs                              |
-| Elixir          | `.ex` `.exs`                            |   🟠   |       |         |         |          |            |           | tree-sitter-elixir; `def`/`defp` = clean visibility; macros = ceiling |
-| Erlang          | `.erl` `.hrl`                           |   🟠   |       |         |         |          |            |           | tree-sitter-erlang (WhatsApp); `-export` = visibility                 |
-| Gleam           | `.gleam`                                |   🟠   |       |         |         |          |            |           | BEAM family; tree-sitter-gleam                                        |
+| Elixir          | `.ex` `.exs`                            |   🟠   |       |         |         |          |            |           | tree-sitter-elixir 0.3.5 — ABI-verified compatible; `def`/`defp` = clean visibility; macros = ceiling |
+| Erlang          | `.erl` `.hrl`                           |   🟠   |       |         |         |          |            |           | tree-sitter-erlang 0.19.0 (WhatsApp) — ABI-verified compatible; `-export` = visibility |
+| Gleam           | `.gleam`                                |   🟠   |       |         |         |          |            |           | BEAM family; tree-sitter-gleam 1.0.0 — ABI-verified compatible        |
 | Zig             | `.zig`                                  |   🟠   |       |         |         |          |            |           | tree-sitter-zig                                                       |
 | Julia           | `.jl`                                   |   🟠   |       |         |         |          |            |           | tree-sitter-julia                                                     |
 | R               | `.r` `.R`                               |   🟠   |       |         |         |          |            |           | tree-sitter-r                                                         |
-| Haskell         | `.hs`                                   |   🟠   |       |         |         |          |            |           | tree-sitter-haskell                                                   |
+| Haskell         | `.hs`                                   |   🟠   |       |         |         |          |            |           | tree-sitter-haskell 0.23.1 — ABI-verified compatible                  |
 | OCaml           | `.ml` `.mli`                            |   🟠   |       |         |         |          |            |           | tree-sitter-ocaml                                                     |
 | Objective-C     | `.m` `.mm`                              |   🟠   |       |         |         |          |            |           | exposes C ABI; pairs with Swift                                       |
 | Fortran         | `.f90` `.f`                             |   🟠   |       |         |         |          |            |           | tree-sitter-fortran                                                   |
@@ -79,11 +79,11 @@ Cross-language **FFI** is a property of language _pairs_, so it lives in its own
 | PowerShell      | `.ps1` `.psm1`                          |   🟠   |       |         |         |          |            |           | grammar exists — verify compat                                        |
 | SystemVerilog   | `.sv` `.svh`                            |   🟠   |       |         |         |          |            |           | hardware; tree-sitter-verilog                                         |
 | Astro           | `.astro`                                |   🟠   |       |         |         |          |            |           | SFC — embedded-script pattern (like Svelte)                           |
-| Vue             | `.vue`                                  |   🔴   |       |         |         |          |            |           | SFC; no maintained grammar compatible with our pinned tree-sitter     |
-| Liquid          | `.liquid`                               |   🔴   |       |         |         |          |            |           | no compatible grammar                                                 |
-| F#              | `.fs` `.fsi`                            |   🔴   |       |         |         |          |            |           | grammar availability/compat to verify                                 |
-| Salesforce Apex | `.cls` `.trigger`                       |   🔴   |       |         |         |          |            |           | grammar availability/compat to verify                                 |
-| COBOL           | `.cob` `.cbl`                           |   🔴   |       |         |         |          |            |           | grammar maturity to verify                                            |
+| F#              | `.fs` `.fsi`                            |   🟠   |       |         |         |          |            |           | tree-sitter-fsharp (ionide) — ABI-verified compatible; extractor lands in Phase 4 (LANG-11) |
+| Vue             | `.vue`                                  |   🔴   |       |         |         |          |            |           | SFC; tree-sitter-vue pins `tree-sitter ~0.20` as a normal dependency — old incompatible `Language` type, unmaintained since 2022 |
+| Liquid          | `.liquid`                               |   🔴   |       |         |         |          |            |           | no crate exists on crates.io under `tree-sitter-liquid` or any known variant (verified 2026-07-05) |
+| Salesforce Apex | `.cls` `.trigger`                       |   🔴   |       |         |         |          |            |           | tree-sitter-apex pins `tree-sitter ~0.20` as a normal dependency — old incompatible `Language` type, unmaintained |
+| COBOL           | `.cob` `.cbl`                           |   🔴   |       |         |         |          |            |           | only crate `tree-sitter-cobol 0.1.0` declares zero dependencies and no repository — not a functioning grammar integration, not merely an old version |
 
 Supported = the ⭐/🟢/🟣 rows; 🟠 planned / 🔴 blocked are not a queue — anything with a compatible
 grammar follows the same recipe. **Blank cells on supported rows are real gaps** — exactly where a

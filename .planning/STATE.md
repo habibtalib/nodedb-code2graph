@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 02-01-PLAN.md
-last_updated: "2026-07-05T12:02:47.888Z"
+status: verifying
+stopped_at: Completed 02-02-PLAN.md
+last_updated: "2026-07-05T12:12:49.485Z"
 last_activity: 2026-07-05
 progress:
   total_phases: 4
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 6
-  completed_plans: 5
+  completed_plans: 6
   percent: 83
 ---
 
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-05)
 
 **Core value:** Honest, deterministic structural facts for as many real-world languages as have compatible grammars — extraction depth, never "the file parses."
-**Current focus:** Phase 02 — quick-win-extractors-astro-powershell
+**Current focus:** Phase 02 — quick-win-extractors-astro-powershell (complete; Phase 3 not yet planned)
 
 ## Current Position
 
-Phase: 02 (quick-win-extractors-astro-powershell) — EXECUTING
-Plan: 2 of 2
-Status: Ready to execute
+Phase: 02 (quick-win-extractors-astro-powershell) — COMPLETE
+Plan: 2 of 2 (both plans executed)
+Status: Phase complete — ready for verification / transition to Phase 3
 Last activity: 2026-07-05
 
 Progress: [████████░░] 83%
@@ -57,6 +57,7 @@ Progress: [████████░░] 83%
 | Phase 01 P02 | 22min | 2 tasks | 4 files |
 | Phase 01 P03 | 10min | 2 tasks | 2 files |
 | Phase 02 P01 | 25min | 3 tasks | 11 files |
+| Phase 02 P02 | 20min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -79,6 +80,8 @@ Recent decisions affecting current work:
 - [Phase 01]: feature-isolation CI job's 37-language matrix is mechanically derived from Cargo.toml's [features] block, not hand-maintained, so it won't drift as later phases add languages
 - [Phase 02]: Grouped IMPORT_ARG_QUERY matches by command-node byte offset (the query captures one arg per match, not all args together) to correctly classify 'using module X'
 - [Phase 02]: PowerShell Read/Write detection uses a full ancestor-chain walk, not immediate-parent, since the grammar wraps every sub-expression in a full precedence-operator chain
+- [Phase 02]: Factored Astro's frontmatter+script_element merge into one shared merge_block() helper rather than duplicating svelte.rs's inline loop, since Astro has two structurally different embedded-block kinds sharing one merge shape
+- [Phase 02]: Astro frontmatter always extracted as Language::TypeScript (no lang attribute exists on the frontmatter node); <script> tags still use Svelte's verbatim-ported detect_script_lang
 
 ### Pending Todos
 
@@ -93,7 +96,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-07-05T12:00:37.740Z
-Stopped at: Completed 02-01-PLAN.md
+Last session: 2026-07-05T12:12:49.483Z
+Stopped at: Completed 02-02-PLAN.md
 Resume file: None
 </content>

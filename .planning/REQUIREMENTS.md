@@ -26,7 +26,7 @@ Each language that passes COMPAT-01 follows the full CONTRIBUTING recipe: Cargo 
 - [ ] **LANG-07**: Groovy extractor (template: Java/Kotlin; `.gradle` scoping decided explicitly)
 - [x] **LANG-08**: PowerShell extractor (template: Shell)
 - [ ] **LANG-09**: SystemVerilog extractor (template: C)
-- [ ] **LANG-10**: Astro extractor via embedded-SFC pattern (template: Svelte; `astro` feature transitively enables `typescript`)
+- [x] **LANG-10**: Astro extractor via embedded-SFC pattern (template: Svelte; `astro` feature transitively enables `typescript`)
 - [ ] **LANG-11**: F# extractor via `tree-sitter-fsharp` (ionide) — newly unblocked; move out of blocked list
 - [ ] **LANG-12**: Elixir, Erlang, Gleam, Haskell — implement those that pass the COMPAT-01 recheck; document any that fail (STACK vs FEATURES research disagreement resolved empirically)
 
@@ -74,7 +74,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | COMPAT-03 | Phase 1 | Complete |
 | TSADAPT-01 | Phase 1 | Complete |
 | LANG-08 | Phase 2 | Complete |
-| LANG-10 | Phase 2 | Pending |
+| LANG-10 | Phase 2 | Complete |
 | BIND-01 | Phase 2 | Complete |
 | BIND-02 | Phase 2 | Complete |
 | LANG-01 | Phase 3 | Pending |

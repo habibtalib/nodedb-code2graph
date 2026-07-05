@@ -55,16 +55,19 @@ impl Extractor for AstroExtractor {
                 path: file.to_owned(),
             })?;
 
-        let _tree = parser
+        let tree = parser
             .parse(source.as_bytes(), None)
             .ok_or_else(|| CodegraphError::Parse {
                 path: file.to_owned(),
             })?;
 
-        // RED stub: intentionally does not discover frontmatter/script blocks
-        // yet — Task 2 GREEN fills this in. Still emits a document-spanning
-        // Module symbol + root scope so a purely-markup document doesn't panic.
-        let namespaces = module_namespaces(file);
+        let root = tree.root_node();
+        let bytes = source.as_bytes();
+
+        // Collect all script_element nodes anywhere in the document.
+        let mut script_nodes = Vec::new();
+        collect_script_elements(&root, &mut script_nodes);
+
         let mut merged = FileFacts {
             file: file.to_owned(),
             lang: "astro".to_owned(),
@@ -74,7 +77,12 @@ impl Extractor for AstroExtractor {
             bindings: Vec::new(),
             ffi_exports: Vec::new(),
         };
-        push_scope(
+
+        // A single document-spanning root scope. Each embedded block's former
+        // root scope is re-parented under this so the merged file has exactly
+        // one root (`parent == None`) — mirroring svelte.rs and every other
+        // language's one-module-per-file shape.
+        let doc_root: ScopeId = push_scope(
             &mut merged.scopes,
             None,
             ByteSpan {
@@ -83,25 +91,119 @@ impl Extractor for AstroExtractor {
             },
             ScopeKind::Module,
         );
-        merged
-            .symbols
-            .push(module_symbol(Language::Astro, &namespaces, file, source.len()));
+
+        // Frontmatter is always TypeScript — Astro compiles it unconditionally
+        // as TS, and the frontmatter node carries no `start_tag`/attributes at
+        // all (no `lang` to detect, unlike `<script>` tags below). At most one
+        // frontmatter node exists per document, entirely absent when there's
+        // no fenced `---`...`---` block (Pitfall 3 — never assume it's there).
+        if let Some(frontmatter) = find_frontmatter(&root) {
+            if let Some(js_block) = frontmatter_js_block(&frontmatter) {
+                merge_block(
+                    &mut merged,
+                    doc_root,
+                    js_block,
+                    Language::TypeScript,
+                    file,
+                    bytes,
+                )?;
+            }
+        }
+
+        for script_el in script_nodes {
+            // Find the raw_text child — skip empty script blocks.
+            let raw_text = match find_raw_text(&script_el) {
+                Some(n) => n,
+                None => continue,
+            };
+            let inner_lang = detect_script_lang(&script_el, bytes);
+            merge_block(&mut merged, doc_root, raw_text, inner_lang, file, bytes)?;
+        }
+
+        // Exactly one module symbol spanning the whole document — its SCIP id
+        // is identical regardless of how many embedded blocks contributed.
+        let namespaces = module_namespaces(file);
+        merged.symbols.push(module_symbol(
+            Language::Astro,
+            &namespaces,
+            file,
+            source.len(),
+        ));
+
         Ok(merged)
     }
+}
+
+/// Extract, offset-shift, and merge one embedded block (the frontmatter's
+/// `frontmatter_js_block` or a `<script>`'s `raw_text`) whose inner source
+/// spans `text_node`'s byte range, into `merged`. Mirrors `svelte.rs::extract`'s
+/// per-block merge steps: `extract_ecmascript` → `shift_offsets` → shift scope
+/// indices by `scope_base` → re-parent the block's former root scope under
+/// `doc_root` → drop the block's own Module symbol (a single document Module
+/// symbol is synthesized once, after every block has merged).
+fn merge_block(
+    merged: &mut FileFacts,
+    doc_root: ScopeId,
+    text_node: Node<'_>,
+    inner_lang: Language,
+    file: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let delta = text_node.start_byte();
+    let inner_source = std::str::from_utf8(&bytes[text_node.byte_range()]).unwrap_or_default();
+
+    let mut block_facts = extract_ecmascript(inner_source, file, inner_lang)?;
+    shift_offsets(&mut block_facts, delta, file, "astro", bytes);
+
+    // Merge: fix up ScopeId indices before extending. `scope_base` is >= 1 for
+    // every block (the doc root occupies index 0), so the shifts apply
+    // uniformly.
+    let scope_base: ScopeId = merged.scopes.len();
+    for b in &mut block_facts.bindings {
+        b.scope += scope_base;
+    }
+    for r in &mut block_facts.references {
+        if let Some(s) = r.scope.as_mut() {
+            *s += scope_base;
+        }
+    }
+    for sc in &mut block_facts.scopes {
+        if let Some(p) = sc.parent.as_mut() {
+            *p += scope_base;
+        }
+    }
+    // Re-parent the block's former root scope (local index 0, parent None,
+    // untouched by the Some(p) shift above) under the document root.
+    if let Some(first) = block_facts.scopes.first_mut() {
+        first.parent = Some(doc_root);
+    }
+
+    // Drop the per-block module symbol — the single document module symbol is
+    // synthesized once, after every block has merged.
+    merged.symbols.extend(
+        block_facts
+            .symbols
+            .into_iter()
+            .filter(|s| s.kind != SymbolKind::Module),
+    );
+    merged.references.extend(block_facts.references);
+    merged.scopes.extend(block_facts.scopes);
+    merged.bindings.extend(block_facts.bindings);
+    // ffi_exports: Astro frontmatter/scripts don't emit FFI exports.
+
+    Ok(())
 }
 
 /// Direct child of `document` with kind `frontmatter`, if present. Astro
 /// documents have AT MOST ONE frontmatter node, entirely absent when there's
 /// no fenced frontmatter block (Pitfall 3 — treat as `Option`, never
 /// `.unwrap()`).
-#[allow(dead_code)]
 fn find_frontmatter<'a>(root: &Node<'a>) -> Option<Node<'a>> {
     root.children(&mut root.walk())
         .find(|n| n.kind() == "frontmatter")
 }
 
 /// The single `frontmatter_js_block` raw-text child of a `frontmatter` node.
-#[allow(dead_code)]
 fn frontmatter_js_block<'a>(frontmatter: &Node<'a>) -> Option<Node<'a>> {
     frontmatter
         .children(&mut frontmatter.walk())
@@ -110,7 +212,6 @@ fn frontmatter_js_block<'a>(frontmatter: &Node<'a>) -> Option<Node<'a>> {
 
 /// Walk the tree recursively and collect every `script_element` node. Ported
 /// verbatim from `svelte.rs` (confirmed identical node-kind literal).
-#[allow(dead_code)]
 fn collect_script_elements<'a>(node: &Node<'a>, out: &mut Vec<Node<'a>>) {
     if node.kind() == "script_element" {
         out.push(*node);
@@ -124,7 +225,6 @@ fn collect_script_elements<'a>(node: &Node<'a>, out: &mut Vec<Node<'a>>) {
 
 /// Return the `raw_text` child of a `script_element`, if one exists. Ported
 /// verbatim from `svelte.rs`.
-#[allow(dead_code)]
 fn find_raw_text<'a>(script_el: &Node<'a>) -> Option<Node<'a>> {
     let mut cursor = script_el.walk();
     script_el
@@ -136,7 +236,6 @@ fn find_raw_text<'a>(script_el: &Node<'a>) -> Option<Node<'a>> {
 /// present on the script element. Falls back to [`Language::JavaScript`].
 /// Ported verbatim from `svelte.rs` (confirmed identical attribute-node
 /// shape by direct AST dump).
-#[allow(dead_code)]
 fn detect_script_lang(script_el: &Node<'_>, bytes: &[u8]) -> Language {
     let mut cursor = script_el.walk();
     for child in script_el.children(&mut cursor) {

@@ -26,7 +26,7 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeKind, Symbol, SymbolKind, Visibility,
+    ByteSpan, FileFacts, RefRole, Reference, ScopeKind, Symbol, SymbolKind, Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
@@ -86,11 +86,55 @@ impl Extractor for PowerShellExtractor {
             lang: Language::PowerShell,
         };
 
-        // Stub for RED: no symbols/references/imports collected yet.
+        let defs = collect_symbols(&root, &ctx, &namespaces);
+        let def_bindings = definition_bindings(&defs);
+        let mut symbols = defs;
         let mod_sym = super::module_symbol(Language::PowerShell, &namespaces, file, source.len());
-        let symbols = vec![mod_sym];
-        let references: Vec<Reference> = Vec::new();
+        let module_id = mod_sym.id.to_scip_string();
+        symbols.push(mod_sym);
 
+        // Import classification runs first so its byte offsets can be used to
+        // filter the generic cmdlet-call query below (Pitfall 2 double-count guard).
+        let mut references = Vec::new();
+        let mut import_bytes: HashSet<usize> = HashSet::new();
+        collect_imports(
+            &root,
+            &ts_language,
+            ctx.bytes,
+            ctx.file,
+            &module_id,
+            &mut references,
+            &mut import_bytes,
+        )?;
+
+        let cmdlet_calls = collect_call_references(
+            &root,
+            &ts_language,
+            CMDLET_CALL_QUERY,
+            Language::PowerShell,
+            ctx.bytes,
+            ctx.file,
+        )?;
+        references.extend(
+            cmdlet_calls
+                .into_iter()
+                .filter(|r| !import_bytes.contains(&r.occ.byte)),
+        );
+
+        let member_calls = collect_call_references(
+            &root,
+            &ts_language,
+            MEMBER_CALL_QUERY,
+            Language::PowerShell,
+            ctx.bytes,
+            ctx.file,
+        )?;
+        references.extend(member_calls);
+
+        collect_inheritance(&root, ctx.bytes, ctx.file, &mut references);
+
+        // Minimal scope tree for this task: scopes[0] = Module spanning the
+        // whole file. Task 3 replaces this with real Function scopes.
         let mut scopes = Vec::new();
         push_scope(
             &mut scopes,
@@ -101,9 +145,10 @@ impl Extractor for PowerShellExtractor {
             },
             ScopeKind::Module,
         );
-
-        let mut references = references;
         attach_reference_scopes(&mut references, &scopes);
+
+        let mut bindings = def_bindings;
+        bindings.extend(import_bindings(&references, &scopes));
 
         Ok(FileFacts {
             file: file.to_owned(),
@@ -111,7 +156,7 @@ impl Extractor for PowerShellExtractor {
             symbols,
             references,
             scopes,
-            bindings: Vec::new(),
+            bindings,
             ffi_exports: Vec::new(),
         })
     }
@@ -122,7 +167,10 @@ impl Extractor for PowerShellExtractor {
 /// Strips a `.ps1`/`.psm1` extension; strips a leading `src/`, `bin/`, or
 /// `scripts/` prefix (each tried in order); then splits on `/`.
 fn powershell_namespaces(file: &str) -> Vec<String> {
-    let p = file.strip_suffix(".ps1").or_else(|| file.strip_suffix(".psm1")).unwrap_or(file);
+    let p = file
+        .strip_suffix(".ps1")
+        .or_else(|| file.strip_suffix(".psm1"))
+        .unwrap_or(file);
     let p = p
         .strip_prefix("src/")
         .or_else(|| p.strip_prefix("bin/"))
@@ -134,6 +182,267 @@ fn powershell_namespaces(file: &str) -> Vec<String> {
         .collect()
 }
 
+// ── Definitions: function/filter + class/method ─────────────────────────────
+
+fn collect_symbols(root: &Node, ctx: &ExtractCtx<'_>, namespaces: &[String]) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    collect_symbols_dfs(root, ctx, namespaces, &mut out);
+    out
+}
+
+/// DFS emitting Function symbols for `function_statement` nodes (covers both
+/// `function` and `filter` — same node kind) and Class/Method symbols for
+/// `class_statement` nodes. PowerShell allows nested function definitions, so
+/// the walk continues into `function_statement` bodies; `class_statement`
+/// handles its own method children directly (via [`collect_class`]) and does
+/// not recurse further, matching the manual-walk approach required by
+/// Pitfall/gotcha 2 (no combined query with an optional capture).
+fn collect_symbols_dfs(
+    node: &Node,
+    ctx: &ExtractCtx<'_>,
+    namespaces: &[String],
+    out: &mut Vec<Symbol>,
+) {
+    match node.kind() {
+        "function_statement" => {
+            // NOTE: `function_name` is a positional child, NOT a named field —
+            // `field_text(node, "name", ...)` (bash's convention) does not port.
+            if let Some(name) = super::child_text(node, "function_name", ctx.bytes) {
+                let mut descriptors: Vec<Descriptor> = namespaces
+                    .iter()
+                    .cloned()
+                    .map(Descriptor::Namespace)
+                    .collect();
+                descriptors.push(Descriptor::Method {
+                    name: name.clone(),
+                    disambiguator: String::new(),
+                });
+                let signature = one_line_signature(node_text(node, ctx.bytes), &['{']);
+                out.push(make_symbol(
+                    ctx,
+                    node,
+                    name,
+                    SymbolKind::Function,
+                    Visibility::Unknown,
+                    descriptors,
+                    signature,
+                ));
+            }
+        }
+        "class_statement" => {
+            collect_class(node, ctx, namespaces, out);
+            return; // class body handled by collect_class; don't double-walk it.
+        }
+        _ => {}
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_symbols_dfs(&child, ctx, namespaces, out);
+    }
+}
+
+/// Emit a Class symbol for `class_statement` plus a Method symbol for each
+/// `class_method_definition` child. The class name is the FIRST `simple_name`
+/// child (no field); a base-class reference (if present) is handled
+/// separately by [`collect_inheritance`] to avoid the verified duplicate-match
+/// query gotcha (02-RESEARCH.md Pattern 2).
+fn collect_class(node: &Node, ctx: &ExtractCtx<'_>, namespaces: &[String], out: &mut Vec<Symbol>) {
+    let Some(class_name_node) = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "simple_name")
+    else {
+        return;
+    };
+    let class_name = node_text(&class_name_node, ctx.bytes).to_owned();
+
+    let mut class_descriptors: Vec<Descriptor> = namespaces
+        .iter()
+        .cloned()
+        .map(Descriptor::Namespace)
+        .collect();
+    class_descriptors.push(Descriptor::Type(class_name.clone()));
+    let class_signature = one_line_signature(node_text(node, ctx.bytes), &['{']);
+    out.push(make_symbol(
+        ctx,
+        node,
+        class_name.clone(),
+        SymbolKind::Class,
+        Visibility::Unknown,
+        class_descriptors,
+        class_signature,
+    ));
+
+    for child in node.children(&mut node.walk()) {
+        if child.kind() != "class_method_definition" {
+            continue;
+        }
+        let Some(method_name_node) = child
+            .children(&mut child.walk())
+            .find(|c| c.kind() == "simple_name")
+        else {
+            continue;
+        };
+        let method_name = node_text(&method_name_node, ctx.bytes).to_owned();
+        let mut method_descriptors: Vec<Descriptor> = namespaces
+            .iter()
+            .cloned()
+            .map(Descriptor::Namespace)
+            .collect();
+        method_descriptors.push(Descriptor::Type(class_name.clone()));
+        method_descriptors.push(Descriptor::Method {
+            name: method_name.clone(),
+            disambiguator: String::new(),
+        });
+        let method_signature = one_line_signature(node_text(&child, ctx.bytes), &['{']);
+        out.push(make_symbol(
+            ctx,
+            &child,
+            method_name,
+            SymbolKind::Method,
+            Visibility::Unknown,
+            method_descriptors,
+            method_signature,
+        ));
+    }
+}
+
+// ── Inheritance (manual walk — NOT a query, see Pattern 2 gotcha) ───────────
+
+/// Walk the tree and emit an `IsImplementation` reference for a class's base
+/// type: `class_statement`'s SECOND `simple_name` child (only present when a
+/// `:` base-class token is present). Mirrors `csharp.rs::collect_inheritance`'s
+/// `push_ref` shape but with PowerShell's manual node-walk (a single combined
+/// query with an optional capture produces spurious duplicate matches —
+/// verified in 02-RESEARCH.md).
+fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "class_statement" {
+        let mut walker = node.walk();
+        let mut simple_names = node.children(&mut walker).filter(|c| c.kind() == "simple_name");
+        let _class_name = simple_names.next();
+        if let Some(base_name_node) = simple_names.next() {
+            let base_name = node_text(&base_name_node, bytes);
+            push_ref(
+                out,
+                base_name,
+                &base_name_node,
+                file,
+                RefRole::IsImplementation,
+            );
+        }
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+// ── Imports: Import-Module / using module / dot-sourcing ────────────────────
+
+/// Classify all three PowerShell import forms, all of which parse to generic
+/// `command` nodes (the grammar has no dedicated import node — see
+/// 02-RESEARCH.md Pattern 4). Populates `import_bytes` with the `start_byte()`
+/// of every `command_name` node classified as `Import-Module`/`using module`,
+/// so the caller can exclude the matching cmdlet-call-query match (Pitfall 2).
+fn collect_imports(
+    root: &Node,
+    ts_lang: &TsLanguage,
+    bytes: &[u8],
+    file: &str,
+    module_id: &str,
+    out: &mut Vec<Reference>,
+    import_bytes: &mut HashSet<usize>,
+) -> Result<()> {
+    let arg_query =
+        Query::new(ts_lang, IMPORT_ARG_QUERY).map_err(|e| CodegraphError::Query {
+            lang: Language::PowerShell.as_str().to_owned(),
+            msg: e.to_string(),
+        })?;
+    let cmd_idx = arg_query
+        .capture_index_for_name("cmd")
+        .ok_or_else(|| CodegraphError::Query {
+            lang: Language::PowerShell.as_str().to_owned(),
+            msg: "missing @cmd capture".to_owned(),
+        })?;
+    let arg_idx = arg_query
+        .capture_index_for_name("arg")
+        .ok_or_else(|| CodegraphError::Query {
+            lang: Language::PowerShell.as_str().to_owned(),
+            msg: "missing @arg capture".to_owned(),
+        })?;
+
+    // The query's `(generic_token) @arg` pattern matches once PER generic_token
+    // sibling (a quantifier-style repeat), so a command with N arguments produces
+    // N separate matches, each pairing the same `command_name` node with exactly
+    // one `@arg` — NOT one match with all N args together. Group by the command
+    // node's byte offset (stable across its repeated matches) to reassemble the
+    // full, ordered argument list per command.
+    let mut by_command: Vec<(Node, Vec<Node>)> = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&arg_query, *root, bytes);
+    while let Some(m) = matches.next() {
+        let Some(cmd_cap) = m.captures.iter().find(|c| c.index == cmd_idx) else {
+            continue;
+        };
+        let Some(arg_cap) = m.captures.iter().find(|c| c.index == arg_idx) else {
+            continue;
+        };
+        match by_command
+            .iter_mut()
+            .find(|(cmd, _)| cmd.start_byte() == cmd_cap.node.start_byte())
+        {
+            Some((_, args)) => args.push(arg_cap.node),
+            None => by_command.push((cmd_cap.node, vec![arg_cap.node])),
+        }
+    }
+
+    for (cmd_node, args) in &by_command {
+        let cmd_text = node_text(cmd_node, bytes);
+
+        if cmd_text.eq_ignore_ascii_case("Import-Module") {
+            if let Some(first) = args.first() {
+                let name = node_text(first, bytes).to_owned();
+                push_import_ref(out, &name, first, file, module_id, &name);
+                import_bytes.insert(cmd_node.start_byte());
+            }
+        } else if cmd_text.eq_ignore_ascii_case("using") {
+            if let Some(first) = args.first() {
+                if node_text(first, bytes).eq_ignore_ascii_case("module") {
+                    if let Some(second) = args.get(1) {
+                        let name = node_text(second, bytes).to_owned();
+                        push_import_ref(out, &name, second, file, module_id, &name);
+                        import_bytes.insert(cmd_node.start_byte());
+                    }
+                }
+            }
+        }
+    }
+
+    let dot_query =
+        Query::new(ts_lang, DOT_SOURCE_QUERY).map_err(|e| CodegraphError::Query {
+            lang: Language::PowerShell.as_str().to_owned(),
+            msg: e.to_string(),
+        })?;
+    let path_idx =
+        dot_query
+            .capture_index_for_name("path")
+            .ok_or_else(|| CodegraphError::Query {
+                lang: Language::PowerShell.as_str().to_owned(),
+                msg: "missing @path capture".to_owned(),
+            })?;
+
+    let mut dot_cursor = QueryCursor::new();
+    let mut dot_matches = dot_cursor.matches(&dot_query, *root, bytes);
+    while let Some(m) = dot_matches.next() {
+        for cap in m.captures.iter().filter(|c| c.index == path_idx) {
+            let name = node_text(&cap.node, bytes).to_owned();
+            push_import_ref(out, &name, &cap.node, file, module_id, &name);
+            // Dot-sourcing's wrapped `command_name_expr(command_name)` shape does
+            // NOT match CMDLET_CALL_QUERY's bare `(command_name)` field pattern,
+            // so no double-count guard entry is needed here (verified in research).
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,7 +451,9 @@ mod tests {
     #[test]
     fn extracts_function_statement() {
         let src = "function Get-Helper { return $true }\n";
-        let facts = PowerShellExtractor.extract(src, "scripts/deploy.ps1").unwrap();
+        let facts = PowerShellExtractor
+            .extract(src, "scripts/deploy.ps1")
+            .unwrap();
         let helper = facts
             .symbols
             .iter()
@@ -159,14 +470,18 @@ mod tests {
     #[test]
     fn extracts_filter_statement() {
         let src = "filter Get-Bar { $_ }\n";
-        let facts = PowerShellExtractor.extract(src, "scripts/deploy.ps1").unwrap();
+        let facts = PowerShellExtractor
+            .extract(src, "scripts/deploy.ps1")
+            .unwrap();
         assert!(facts.symbols.iter().any(|s| s.name == "Get-Bar"));
     }
 
     #[test]
     fn extracts_class_and_method() {
         let src = "class Animal { [string]$Name Speak() { return \"hi\" } }\n";
-        let facts = PowerShellExtractor.extract(src, "scripts/models.ps1").unwrap();
+        let facts = PowerShellExtractor
+            .extract(src, "scripts/models.ps1")
+            .unwrap();
         let animal = facts
             .symbols
             .iter()
@@ -190,7 +505,9 @@ mod tests {
     #[test]
     fn class_inheritance_emits_is_implementation() {
         let src = "class Dog : Animal { Speak() { } }\n";
-        let facts = PowerShellExtractor.extract(src, "scripts/models.ps1").unwrap();
+        let facts = PowerShellExtractor
+            .extract(src, "scripts/models.ps1")
+            .unwrap();
         assert!(
             facts
                 .references
@@ -231,10 +548,7 @@ mod tests {
             .iter()
             .find(|r| r.role == RefRole::Call && r.name == "ReadAllText")
             .expect("expected a Call reference 'ReadAllText'");
-        assert_eq!(
-            static_call.qualifier.as_deref(),
-            Some("[System.IO.File]")
-        );
+        assert_eq!(static_call.qualifier.as_deref(), Some("[System.IO.File]"));
     }
 
     #[test]

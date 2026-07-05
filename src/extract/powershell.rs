@@ -26,15 +26,16 @@ use tree_sitter::{Language as TsLanguage, Node, Parser, Query, QueryCursor, Stre
 
 use crate::error::{CodegraphError, Result};
 use crate::graph::types::{
-    ByteSpan, FileFacts, RefRole, Reference, ScopeKind, Symbol, SymbolKind, Visibility,
+    ByteSpan, FileFacts, RefRole, Reference, Scope, ScopeId, ScopeKind, Symbol, SymbolKind,
+    Visibility,
 };
 use crate::lang::Language;
 use crate::symbol::Descriptor;
 
 use super::{
-    ExtractCtx, Extractor, attach_reference_scopes, collect_call_references, definition_bindings,
-    import_bindings, make_symbol, node_text, one_line_signature, push_import_ref, push_ref,
-    push_scope,
+    ExtractCtx, Extractor, MIN_REF_LEN, attach_reference_scopes, collect_call_references,
+    definition_bindings, import_bindings, make_symbol, node_span, node_text, one_line_signature,
+    push_import_ref, push_ref, push_scope,
 };
 
 /// Cmdlet-style call query — parenless, space-separated commands
@@ -132,19 +133,9 @@ impl Extractor for PowerShellExtractor {
         references.extend(member_calls);
 
         collect_inheritance(&root, ctx.bytes, ctx.file, &mut references);
+        collect_read_write_references(&root, ctx.bytes, ctx.file, &mut references);
 
-        // Minimal scope tree for this task: scopes[0] = Module spanning the
-        // whole file. Task 3 replaces this with real Function scopes.
-        let mut scopes = Vec::new();
-        push_scope(
-            &mut scopes,
-            None,
-            ByteSpan {
-                start: 0,
-                end: source.len(),
-            },
-            ScopeKind::Module,
-        );
+        let scopes = collect_scopes(&root, source.len());
         attach_reference_scopes(&mut references, &scopes);
 
         let mut bindings = def_bindings;
@@ -316,7 +307,9 @@ fn collect_class(node: &Node, ctx: &ExtractCtx<'_>, namespaces: &[String], out: 
 fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
     if node.kind() == "class_statement" {
         let mut walker = node.walk();
-        let mut simple_names = node.children(&mut walker).filter(|c| c.kind() == "simple_name");
+        let mut simple_names = node
+            .children(&mut walker)
+            .filter(|c| c.kind() == "simple_name");
         let _class_name = simple_names.next();
         if let Some(base_name_node) = simple_names.next() {
             let base_name = node_text(&base_name_node, bytes);
@@ -331,6 +324,105 @@ fn collect_inheritance(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Refe
     }
     for child in node.children(&mut node.walk()) {
         collect_inheritance(&child, bytes, file, out);
+    }
+}
+
+// ── Edge richness: Read / Write ─────────────────────────────────────────────
+
+/// Returns `true` when `node` has an ancestor of kind `kind` (searched via the
+/// full parent chain — PowerShell's grammar wraps every sub-expression in a
+/// full operator-precedence chain, so a `variable` leaf's *immediate* parent
+/// is always an intermediate wrapper like `unary_expression`, never
+/// `left_assignment_expression`/`script_parameter` directly; the ancestor
+/// check is required to see past that wrapping).
+fn has_ancestor_kind(node: &Node, kind: &str) -> bool {
+    let mut cur = node.parent();
+    while let Some(p) = cur {
+        if p.kind() == kind {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+/// Recursively walk `node` and emit [`RefRole::Write`] for every `variable`
+/// node nested under a `left_assignment_expression` (the LHS of an
+/// `assignment_expression`), and [`RefRole::Read`] for every other bare
+/// `variable` node — except one nested under `script_parameter`, which is a
+/// parameter *declaration*, not a read (Pitfall 4). Applies [`MIN_REF_LEN`] to
+/// the name with its `$` sigil stripped.
+fn collect_read_write_references(node: &Node, bytes: &[u8], file: &str, out: &mut Vec<Reference>) {
+    if node.kind() == "variable" {
+        if has_ancestor_kind(node, "script_parameter") {
+            return; // parameter declaration binding, not a read or write.
+        }
+        let name = node_text(node, bytes).trim_start_matches('$');
+        if name.len() < MIN_REF_LEN {
+            return;
+        }
+        let role = if has_ancestor_kind(node, "left_assignment_expression") {
+            RefRole::Write
+        } else {
+            RefRole::Read
+        };
+        push_ref(out, name, node, file, role);
+        // `variable` has no meaningful children; return early.
+        return;
+    }
+    for child in node.children(&mut node.walk()) {
+        collect_read_write_references(&child, bytes, file, out);
+    }
+}
+
+// ── Scope tree (Tier-B) ──────────────────────────────────────────────────────
+
+/// Build the lexical scope tree for one PowerShell file.
+///
+/// `scopes[0]` is always the file-root `Module` scope spanning `[0,
+/// source_len)`. `function_statement` and `class_method_definition` nodes each
+/// open a `Function` scope spanning their own node span; `class_statement`
+/// itself does NOT open a new scope (no v1 Class scope) — its children are
+/// visited under the enclosing scope so nested `class_method_definition`
+/// nodes still open their own Function scopes.
+fn collect_scopes(root: &Node, source_len: usize) -> Vec<Scope> {
+    let mut scopes = Vec::new();
+    push_scope(
+        &mut scopes,
+        None,
+        ByteSpan {
+            start: 0,
+            end: source_len,
+        },
+        ScopeKind::Module,
+    );
+    for child in root.children(&mut root.walk()) {
+        scope_dfs(&child, 0, &mut scopes);
+    }
+    scopes
+}
+
+/// DFS opening `Function` scopes for `function_statement` and
+/// `class_method_definition` nodes; all other node kinds (including
+/// `class_statement`) simply recurse without opening a new scope.
+fn scope_dfs(node: &Node, parent_id: ScopeId, scopes: &mut Vec<Scope>) {
+    if matches!(
+        node.kind(),
+        "function_statement" | "class_method_definition"
+    ) {
+        let fn_id = push_scope(
+            scopes,
+            Some(parent_id),
+            node_span(node),
+            ScopeKind::Function,
+        );
+        for child in node.children(&mut node.walk()) {
+            scope_dfs(&child, fn_id, scopes);
+        }
+    } else {
+        for child in node.children(&mut node.walk()) {
+            scope_dfs(&child, parent_id, scopes);
+        }
     }
 }
 
@@ -350,11 +442,10 @@ fn collect_imports(
     out: &mut Vec<Reference>,
     import_bytes: &mut HashSet<usize>,
 ) -> Result<()> {
-    let arg_query =
-        Query::new(ts_lang, IMPORT_ARG_QUERY).map_err(|e| CodegraphError::Query {
-            lang: Language::PowerShell.as_str().to_owned(),
-            msg: e.to_string(),
-        })?;
+    let arg_query = Query::new(ts_lang, IMPORT_ARG_QUERY).map_err(|e| CodegraphError::Query {
+        lang: Language::PowerShell.as_str().to_owned(),
+        msg: e.to_string(),
+    })?;
     let cmd_idx = arg_query
         .capture_index_for_name("cmd")
         .ok_or_else(|| CodegraphError::Query {
@@ -415,11 +506,10 @@ fn collect_imports(
         }
     }
 
-    let dot_query =
-        Query::new(ts_lang, DOT_SOURCE_QUERY).map_err(|e| CodegraphError::Query {
-            lang: Language::PowerShell.as_str().to_owned(),
-            msg: e.to_string(),
-        })?;
+    let dot_query = Query::new(ts_lang, DOT_SOURCE_QUERY).map_err(|e| CodegraphError::Query {
+        lang: Language::PowerShell.as_str().to_owned(),
+        msg: e.to_string(),
+    })?;
     let path_idx =
         dot_query
             .capture_index_for_name("path")
@@ -603,5 +693,83 @@ mod tests {
             !facts.references.iter().any(|r| r.role == RefRole::Call),
             "dot-sourcing must not also emit a spurious Call reference"
         );
+    }
+
+    // ── Edge richness: Read / Write ──────────────────────────────────────────
+
+    #[test]
+    fn assignment_write_and_read() {
+        // `$conf = 1; $result = $conf` → Write "conf", Read "conf".
+        let src = "function setup {\n  $conf = 1\n  $result = $conf\n}\n";
+        let facts = PowerShellExtractor
+            .extract(src, "scripts/setup.ps1")
+            .unwrap();
+
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Write && r.name == "conf"),
+            "expected a Write ref for 'conf', got: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            facts
+                .references
+                .iter()
+                .any(|r| r.role == RefRole::Read && r.name == "conf"),
+            "expected a Read ref for 'conf', got: {:?}",
+            facts
+                .references
+                .iter()
+                .map(|r| (&r.name, r.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn param_declaration_is_not_read_or_write() {
+        // `param([string]$Name)` — $Name is a parameter binding, not a Read/Write.
+        let src = "function Get-Foo {\n  param([string]$Name)\n  return $Name\n}\n";
+        let facts = PowerShellExtractor.extract(src, "scripts/foo.ps1").unwrap();
+
+        // The `return $Name` usage IS a Read (a bare variable reference outside
+        // `script_parameter`); only the param-declaration occurrence is excluded.
+        let name_refs: Vec<_> = facts
+            .references
+            .iter()
+            .filter(|r| r.name == "Name")
+            .collect();
+        assert_eq!(
+            name_refs.len(),
+            1,
+            "expected exactly one Read ref for 'Name' (from `return $Name`), got {:?}",
+            name_refs
+        );
+        assert_eq!(name_refs[0].role, RefRole::Read);
+    }
+
+    #[test]
+    fn function_statement_opens_function_scope() {
+        let src = "function Get-Helper {\n  $conf = 1\n}\n";
+        let facts = PowerShellExtractor
+            .extract(src, "scripts/deploy.ps1")
+            .unwrap();
+
+        assert_eq!(
+            facts.scopes[0].kind,
+            crate::graph::types::ScopeKind::Module,
+            "scopes[0] must be Module"
+        );
+        let fn_scope = facts
+            .scopes
+            .iter()
+            .find(|s| s.kind == crate::graph::types::ScopeKind::Function)
+            .expect("expected a Function scope");
+        assert_eq!(fn_scope.parent, Some(0));
     }
 }

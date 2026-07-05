@@ -1,0 +1,3 @@
+# Same-file call: `Deploy-App` calls `Get-Helper`, both defined in deploy.ps1.
+# Proves cmdlet-style (parenless) call detection resolves via Tier-A same-file matching.
+deploy.ps1:6 Call deploy.ps1:1

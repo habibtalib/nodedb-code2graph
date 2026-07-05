@@ -46,7 +46,10 @@ Plans:
   3. `cargo test` passes with `--no-default-features --features powershell` and `--no-default-features --features astro` independently.
   4. `bindings/node/Cargo.toml` and `bindings/python/Cargo.toml` both list the `powershell` and `astro` features in the same change that adds each language; `npx napi build --release --platform` produces a no-op diff against the committed `index.js`/`index.d.ts`.
   5. Both languages have at least one `eval/corpus/` case and a sync-test-guarded row in `docs/supported-languages.md`.
-**Plans**: TBD
+**Plans**: 2 plans
+Plans:
+- [ ] 02-01-PLAN.md — PowerShell extractor end-to-end (enum, extractor, tests, corpus, docs, bindings)
+- [ ] 02-02-PLAN.md — Astro extractor end-to-end via embedded-SFC pattern (enum, extractor, tests, corpus, docs, bindings)
 
 ### Phase 3: Established-Template Extractors
 **Goal**: Ship five new language extractors — Zig, Objective-C, Fortran, Groovy, SystemVerilog — each mapped to a solid existing in-repo template (C/Rust, C+Swift, Pascal/Go, Java/Kotlin, C respectively), with the explicit scope decisions each one raises (`.h` dispatch, `.gradle` inclusion) resolved and documented rather than assumed.

@@ -1,0 +1,5 @@
+# Same-file call inside Astro frontmatter: `run` calls `helper`, both defined in the frontmatter
+# block. Proves the embedded-SFC pattern's offset remap: extract_ecmascript resolves the call
+# against the frontmatter's own byte range, then shift_offsets remaps both def and ref lines back
+# into the full .astro document before the resolver ever sees them.
+Component.astro:6 Call Component.astro:2

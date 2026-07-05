@@ -12,7 +12,7 @@ This milestone expands code2graph's supported-language set from 24 to as many of
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Foundation — Compatibility Gate, CI Hardening & TS/JS Depth** - Empirically verify every candidate grammar, harden CI against feature-flag isolation breaks, and fill the existing TS/JS entry-point gap
+- [x] **Phase 1: Foundation — Compatibility Gate, CI Hardening & TS/JS Depth** - Empirically verify every candidate grammar, harden CI against feature-flag isolation breaks, and fill the existing TS/JS entry-point gap (completed 2026-07-05)
 - [ ] **Phase 2: Quick-Win Extractors — Astro & PowerShell** - Ship the two lowest-risk new languages and prove the full recipe + bindings-parity practice end-to-end
 - [ ] **Phase 3: Established-Template Extractors** - Ship Zig, Objective-C, Fortran, Groovy, and SystemVerilog, each mapped to a solid existing in-repo template
 - [ ] **Phase 4: Risky & Novel-Design Extractors** - Ship Julia, R, OCaml, F#, and whichever of the BEAM/Haskell family passed Phase 1's empirical gate
@@ -81,7 +81,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation — Compat Gate, CI Hardening & TS/JS Depth | 0/4 | Not started | - |
+| 1. Foundation — Compat Gate, CI Hardening & TS/JS Depth | 0/4 | Complete    | 2026-07-05 |
 | 2. Quick-Win Extractors — Astro & PowerShell | 0/TBD | Not started | - |
 | 3. Established-Template Extractors | 0/TBD | Not started | - |
 | 4. Risky & Novel-Design Extractors | 0/TBD | Not started | - |

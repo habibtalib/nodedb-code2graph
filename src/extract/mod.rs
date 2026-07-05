@@ -63,6 +63,8 @@ pub mod svelte;
 pub mod swift;
 #[cfg(feature = "typescript")]
 pub mod typescript;
+#[cfg(feature = "zig")]
+pub mod zig;
 
 pub use dispatch::{Extractor, extract_file, extract_path};
 
@@ -116,6 +118,8 @@ pub use svelte::SvelteExtractor;
 pub use swift::SwiftExtractor;
 #[cfg(feature = "typescript")]
 pub use typescript::TypeScriptExtractor;
+#[cfg(feature = "zig")]
+pub use zig::ZigExtractor;
 
 #[cfg(feature = "_extractors")]
 #[allow(unused_imports)]

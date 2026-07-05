@@ -57,6 +57,8 @@ use super::SvelteExtractor;
 use super::SwiftExtractor;
 #[cfg(feature = "typescript")]
 use super::TypeScriptExtractor;
+#[cfg(feature = "zig")]
+use super::ZigExtractor;
 
 /// A per-language source-to-facts extractor.
 pub trait Extractor {
@@ -127,6 +129,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::PowerShell => PowerShellExtractor.extract(source, file),
         #[cfg(feature = "astro")]
         Language::Astro => AstroExtractor.extract(source, file),
+        #[cfg(feature = "zig")]
+        Language::Zig => ZigExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

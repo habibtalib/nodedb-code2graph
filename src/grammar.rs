@@ -186,6 +186,37 @@ pub fn fortran() -> Language {
     tree_sitter_fortran::LANGUAGE.into()
 }
 
+#[cfg(feature = "groovy")]
+/// Returns the tree-sitter grammar for Groovy.
+pub fn groovy() -> Language {
+    tree_sitter_groovy::LANGUAGE.into()
+}
+
+#[cfg(feature = "powershell")]
+/// Returns the tree-sitter grammar for PowerShell.
+pub fn powershell() -> Language {
+    tree_sitter_powershell::LANGUAGE.into()
+}
+
+#[cfg(feature = "systemverilog")]
+/// Returns the tree-sitter grammar for SystemVerilog.
+pub fn systemverilog() -> Language {
+    tree_sitter_systemverilog::LANGUAGE.into()
+}
+
+#[cfg(feature = "astro")]
+/// Returns the tree-sitter grammar for Astro single-file components
+/// (via the independently-maintained `tree-sitter-astro-next`).
+pub fn astro() -> Language {
+    tree_sitter_astro_next::LANGUAGE.into()
+}
+
+#[cfg(feature = "fsharp")]
+/// Returns the tree-sitter grammar for F# (ionide `tree-sitter-fsharp`).
+pub fn fsharp() -> Language {
+    tree_sitter_fsharp::LANGUAGE_FSHARP.into()
+}
+
 #[cfg(test)]
 mod tests {
     use tree_sitter::{LANGUAGE_VERSION, MIN_COMPATIBLE_LANGUAGE_VERSION};
@@ -256,5 +287,15 @@ mod tests {
         check("objc", super::objc());
         #[cfg(feature = "fortran")]
         check("fortran", super::fortran());
+        #[cfg(feature = "groovy")]
+        check("groovy", super::groovy());
+        #[cfg(feature = "powershell")]
+        check("powershell", super::powershell());
+        #[cfg(feature = "systemverilog")]
+        check("systemverilog", super::systemverilog());
+        #[cfg(feature = "astro")]
+        check("astro", super::astro());
+        #[cfg(feature = "fsharp")]
+        check("fsharp", super::fsharp());
     }
 }

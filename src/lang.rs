@@ -9,31 +9,32 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
-    TypeScript, // .ts, .tsx
-    JavaScript, // .js, .jsx, .mjs, .cjs
-    Python,     // .py, .pyi
-    Go,         // .go
-    Shell,      // .sh, .bash, .zsh
-    C,          // .c, .h
-    Cpp,        // .cc, .cpp, .cxx, .hh, .hpp, .hxx
-    Java,       // .java
-    Ruby,       // .rb
-    Php,        // .php
-    Swift,      // .swift
-    Kotlin,     // .kt, .kts
-    Solidity,   // .sol
-    Sql,        // .sql
-    Hcl,        // .tf, .hcl, .tfvars
-    CSharp,     // .cs
-    Scala,      // .scala, .sc
-    Dart,       // .dart
-    Lua,        // .lua
-    Luau,       // .luau
-    Pascal,     // .pas, .dpr, .dpk, .lpr
-    Svelte,     // .svelte
-    PowerShell, // .ps1, .psm1
-    Astro,      // .astro
-    Zig,        // .zig
+    TypeScript,    // .ts, .tsx
+    JavaScript,    // .js, .jsx, .mjs, .cjs
+    Python,        // .py, .pyi
+    Go,            // .go
+    Shell,         // .sh, .bash, .zsh
+    C,             // .c, .h
+    Cpp,           // .cc, .cpp, .cxx, .hh, .hpp, .hxx
+    Java,          // .java
+    Ruby,          // .rb
+    Php,           // .php
+    Swift,         // .swift
+    Kotlin,        // .kt, .kts
+    Solidity,      // .sol
+    Sql,           // .sql
+    Hcl,           // .tf, .hcl, .tfvars
+    CSharp,        // .cs
+    Scala,         // .scala, .sc
+    Dart,          // .dart
+    Lua,           // .lua
+    Luau,          // .luau
+    Pascal,        // .pas, .dpr, .dpk, .lpr
+    Svelte,        // .svelte
+    PowerShell,    // .ps1, .psm1
+    Astro,         // .astro
+    Zig,           // .zig
+    SystemVerilog, // .sv, .svh
 }
 
 impl Language {
@@ -65,6 +66,7 @@ impl Language {
         Language::PowerShell,
         Language::Astro,
         Language::Zig,
+        Language::SystemVerilog,
     ];
 
     /// This variant's file extensions (without the leading dot); the first entry
@@ -98,6 +100,7 @@ impl Language {
             Language::PowerShell => &["ps1", "psm1"],
             Language::Astro => &["astro"],
             Language::Zig => &["zig"],
+            Language::SystemVerilog => &["sv", "svh"],
         }
     }
 
@@ -130,6 +133,7 @@ impl Language {
             Language::PowerShell => "powershell",
             Language::Astro => "astro",
             Language::Zig => "zig",
+            Language::SystemVerilog => "systemverilog",
         }
     }
 
@@ -196,7 +200,8 @@ mod tests {
             | Language::Svelte
             | Language::PowerShell
             | Language::Astro
-            | Language::Zig => true,
+            | Language::Zig
+            | Language::SystemVerilog => true,
         };
         listed && Language::ALL.contains(&l)
     }

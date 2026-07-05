@@ -55,6 +55,8 @@ use super::SqlExtractor;
 use super::SvelteExtractor;
 #[cfg(feature = "swift")]
 use super::SwiftExtractor;
+#[cfg(feature = "systemverilog")]
+use super::SystemVerilogExtractor;
 #[cfg(feature = "typescript")]
 use super::TypeScriptExtractor;
 #[cfg(feature = "zig")]
@@ -131,6 +133,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Astro => AstroExtractor.extract(source, file),
         #[cfg(feature = "zig")]
         Language::Zig => ZigExtractor.extract(source, file),
+        #[cfg(feature = "systemverilog")]
+        Language::SystemVerilog => SystemVerilogExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

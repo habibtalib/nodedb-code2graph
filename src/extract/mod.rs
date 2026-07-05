@@ -61,6 +61,8 @@ pub mod sql;
 pub mod svelte;
 #[cfg(feature = "swift")]
 pub mod swift;
+#[cfg(feature = "systemverilog")]
+pub mod systemverilog;
 #[cfg(feature = "typescript")]
 pub mod typescript;
 #[cfg(feature = "zig")]
@@ -116,6 +118,8 @@ pub use sql::SqlExtractor;
 pub use svelte::SvelteExtractor;
 #[cfg(feature = "swift")]
 pub use swift::SwiftExtractor;
+#[cfg(feature = "systemverilog")]
+pub use systemverilog::SystemVerilogExtractor;
 #[cfg(feature = "typescript")]
 pub use typescript::TypeScriptExtractor;
 #[cfg(feature = "zig")]

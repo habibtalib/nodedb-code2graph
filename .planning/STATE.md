@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: planning
-stopped_at: Phase 1 context gathered
-last_updated: "2026-07-05T05:32:33.534Z"
-last_activity: 2026-07-05 — Roadmap created, 18/18 v1 requirements mapped across 4 phases
+status: executing
+stopped_at: Completed 01-01-PLAN.md
+last_updated: "2026-07-05T10:22:58.889Z"
+last_activity: 2026-07-05
 progress:
   total_phases: 4
   completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  total_plans: 4
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-05)
 
 **Core value:** Honest, deterministic structural facts for as many real-world languages as have compatible grammars — extraction depth, never "the file parses."
-**Current focus:** Phase 1 — Foundation (Compatibility Gate, CI Hardening & TS/JS Depth)
+**Current focus:** Phase 01 — foundation-compatibility-gate-ci-hardening-ts-js-depth
 
 ## Current Position
 
-Phase: 1 of 4 (Foundation — Compatibility Gate, CI Hardening & TS/JS Depth)
-Plan: Not yet planned
-Status: Ready to plan
-Last activity: 2026-07-05 — Roadmap created, 18/18 v1 requirements mapped across 4 phases
+Phase: 01 (foundation-compatibility-gate-ci-hardening-ts-js-depth) — EXECUTING
+Plan: 2 of 4
+Status: Ready to execute
+Last activity: 2026-07-05
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -52,6 +52,7 @@ Progress: [░░░░░░░░░░] 0%
 - Trend: -
 
 *Updated after each plan completion*
+| Phase 01 P01 | 8 | 3 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -63,6 +64,10 @@ Recent decisions affecting current work:
 - Roadmap: Gate every candidate language on verified grammar compat (Phase 1) before any extractor work is planned.
 - Roadmap: Bindings parity (BIND-01/02) treated as a repeating practice starting in Phase 2, not a trailing phase — every subsequent language phase must include the same bindings-parity + napi-diff check in its Definition of Done.
 - Roadmap: Coarse granularity — 11-step research ordering consolidated into 4 phases (Foundation, Quick-Win, Established-Template, Risky/Novel-Design).
+- [Phase 01]: Fixed src/grammar.rs's _extractors-gated Language import to be unconditional so grammar-only candidate features can compile standalone
+- [Phase 01]: Fixed pre-existing luau feature-isolation bug (luau now depends on lua) before COMPAT-03's CI job would have caught it red
+- [Phase 01]: OCaml wired to LANGUAGE_OCAML (base .ml grammar only); .mli variant deferred to Phase 4 (LANG-04)
+- [Phase 01]: F# wired to LANGUAGE_FSHARP (crate exports no plain LANGUAGE constant)
 
 ### Pending Todos
 
@@ -77,7 +82,7 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-07-05T05:32:33.531Z
-Stopped at: Phase 1 context gathered
-Resume file: .planning/phases/01-foundation-compatibility-gate-ci-hardening-ts-js-depth/01-CONTEXT.md
+Last session: 2026-07-05T10:22:58.885Z
+Stopped at: Completed 01-01-PLAN.md
+Resume file: None
 </content>

@@ -48,7 +48,7 @@ Plans:
   5. Both languages have at least one `eval/corpus/` case and a sync-test-guarded row in `docs/supported-languages.md`.
 **Plans**: 2 plans
 Plans:
-- [ ] 02-01-PLAN.md — PowerShell extractor end-to-end (enum, extractor, tests, corpus, docs, bindings)
+- [x] 02-01-PLAN.md — PowerShell extractor end-to-end (enum, extractor, tests, corpus, docs, bindings)
 - [ ] 02-02-PLAN.md — Astro extractor end-to-end via embedded-SFC pattern (enum, extractor, tests, corpus, docs, bindings)
 
 ### Phase 3: Established-Template Extractors

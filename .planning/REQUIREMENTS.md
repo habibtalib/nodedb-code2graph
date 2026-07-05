@@ -24,7 +24,7 @@ Each language that passes COMPAT-01 follows the full CONTRIBUTING recipe: Cargo 
 - [ ] **LANG-05**: Objective-C extractor (template: C + Swift; `.h` collision with C dispatch resolved by explicit documented decision)
 - [ ] **LANG-06**: Fortran extractor (template: Pascal/Go)
 - [ ] **LANG-07**: Groovy extractor (template: Java/Kotlin; `.gradle` scoping decided explicitly)
-- [ ] **LANG-08**: PowerShell extractor (template: Shell)
+- [x] **LANG-08**: PowerShell extractor (template: Shell)
 - [ ] **LANG-09**: SystemVerilog extractor (template: C)
 - [ ] **LANG-10**: Astro extractor via embedded-SFC pattern (template: Svelte; `astro` feature transitively enables `typescript`)
 - [ ] **LANG-11**: F# extractor via `tree-sitter-fsharp` (ionide) — newly unblocked; move out of blocked list
@@ -36,8 +36,8 @@ Each language that passes COMPAT-01 follows the full CONTRIBUTING recipe: Cargo 
 
 ### Bindings Parity (BIND)
 
-- [ ] **BIND-01**: Every new language feature string added to `bindings/node/Cargo.toml` and `bindings/python/Cargo.toml` explicit feature lists in the same change that adds the language (the one unguarded integration point)
-- [ ] **BIND-02**: Committed napi artifacts (`index.js`/`index.d.ts`) regenerated and verified drift-free (`npx napi build --release --platform`, expected no-op diff) before each language phase completes
+- [x] **BIND-01**: Every new language feature string added to `bindings/node/Cargo.toml` and `bindings/python/Cargo.toml` explicit feature lists in the same change that adds the language (the one unguarded integration point)
+- [x] **BIND-02**: Committed napi artifacts (`index.js`/`index.d.ts`) regenerated and verified drift-free (`npx napi build --release --platform`, expected no-op diff) before each language phase completes
 
 ## v2 Requirements
 
@@ -73,10 +73,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | COMPAT-02 | Phase 1 | Complete |
 | COMPAT-03 | Phase 1 | Complete |
 | TSADAPT-01 | Phase 1 | Complete |
-| LANG-08 | Phase 2 | Pending |
+| LANG-08 | Phase 2 | Complete |
 | LANG-10 | Phase 2 | Pending |
-| BIND-01 | Phase 2 | Pending |
-| BIND-02 | Phase 2 | Pending |
+| BIND-01 | Phase 2 | Complete |
+| BIND-02 | Phase 2 | Complete |
 | LANG-01 | Phase 3 | Pending |
 | LANG-05 | Phase 3 | Pending |
 | LANG-06 | Phase 3 | Pending |

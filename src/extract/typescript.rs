@@ -123,6 +123,41 @@ fn last_arg_bare_identifier<'a>(call: &Node, bytes: &'a [u8]) -> Option<&'a str>
     }
 }
 
+/// NestJS decorator simple-names (PascalCase, distinct from `TS_ROUTE_VERBS`'s
+/// lowercase call-form) that mark an HTTP-route entry point. `Controller` is
+/// class-level; the rest are method-level. Mirrors Java's
+/// `JAVA_ROUTE_ANNOTATIONS` terminal-name match, applied to TS decorator syntax.
+const TS_ROUTE_DECORATORS: &[&str] = &["Get", "Post", "Put", "Delete", "Patch", "Controller"];
+
+/// Collect `TS_ROUTE_DECORATORS` matches from `node`'s direct `decorator`
+/// children. A `decorator` node wraps either a bare `identifier` (`@Controller`)
+/// or a `call_expression` whose `function:` is the identifier (`@Get(':id')`);
+/// either way the identifier's text is the candidate name.
+fn route_decorators_on(node: &Node, bytes: &[u8]) -> Vec<EntryPoint> {
+    let mut markers = Vec::new();
+    for child in node.children(&mut node.walk()) {
+        if child.kind() != "decorator" {
+            continue;
+        }
+        let ident = child
+            .children(&mut child.walk())
+            .find_map(|c| match c.kind() {
+                "identifier" => Some(c),
+                "call_expression" => c
+                    .child_by_field_name("function")
+                    .filter(|f| f.kind() == "identifier"),
+                _ => None,
+            });
+        if let Some(ident) = ident {
+            let name = node_text(&ident, bytes);
+            if TS_ROUTE_DECORATORS.contains(&name) {
+                markers.push(EntryPoint::HttpRoute(name.to_owned()));
+            }
+        }
+    }
+    markers
+}
+
 /// Extracts TypeScript symbols and references.
 pub struct TypeScriptExtractor;
 
@@ -241,6 +276,24 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                         &mut out,
                     );
                 }
+                // NestJS route decorators: class-level `@Controller` lives on the
+                // export_statement's own `decorator:` field; method-level
+                // `@Get`/`@Post`/... live as direct children of the class_body.
+                // Both aggregate onto the class's just-pushed Symbol — there is
+                // no per-method Symbol in this extractor to attach them to.
+                if let Some(class_decl) = stmt.children(&mut stmt.walk()).find(|c| {
+                    matches!(c.kind(), "class_declaration" | "abstract_class_declaration")
+                }) {
+                    let mut markers = route_decorators_on(&stmt, ctx.bytes);
+                    if let Some(body) = class_decl.child_by_field_name("body") {
+                        markers.extend(route_decorators_on(&body, ctx.bytes));
+                    }
+                    if !markers.is_empty() {
+                        if let Some(sym) = out.last_mut() {
+                            sym.entry_points.extend(markers);
+                        }
+                    }
+                }
             }
             kind if BARE_DECL_KINDS.contains(&kind) => {
                 // Non-exported top-level declaration: the declaration node is
@@ -255,6 +308,19 @@ fn collect_symbols(root: &Node, ctx: &ExtractCtx, namespaces: &[String]) -> Vec<
                     Visibility::Private,
                     &mut out,
                 );
+                // TS also permits decorators on non-exported classes: the
+                // decorator lives directly on the `class_declaration` node itself.
+                if matches!(kind, "class_declaration" | "abstract_class_declaration") {
+                    let mut markers = route_decorators_on(&stmt, ctx.bytes);
+                    if let Some(body) = stmt.child_by_field_name("body") {
+                        markers.extend(route_decorators_on(&body, ctx.bytes));
+                    }
+                    if !markers.is_empty() {
+                        if let Some(sym) = out.last_mut() {
+                            sym.entry_points.extend(markers);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -1498,6 +1564,98 @@ export const Y = 2;
                 .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == "router.get")),
             "expected HttpRoute(\"router.get\") on JS too, got {:?}",
             get_users.entry_points
+        );
+    }
+
+    // ── Entry-point detection: NestJS decorator matching ─────────────────────
+
+    #[test]
+    fn ts_controller_class_decorator_entry_point() {
+        // @Controller('users') export class UsersController { findOne() {} } →
+        // the UsersController class Symbol.entry_points contains HttpRoute("Controller").
+        let src = "@Controller('users')\nexport class UsersController {\n  findOne() {}\n}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/users.ts").unwrap();
+        let ctrl = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "UsersController")
+            .expect("expected 'UsersController' symbol");
+        assert!(
+            ctrl.entry_points
+                .iter()
+                .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == "Controller")),
+            "expected HttpRoute(\"Controller\"), got {:?}",
+            ctrl.entry_points
+        );
+    }
+
+    #[test]
+    fn ts_method_level_get_decorator_aggregates_onto_class() {
+        // export class UsersController { @Get(':id') findOne() {} } (method-level
+        // only, no class-level decorator) → the class Symbol.entry_points
+        // contains HttpRoute("Get").
+        let src = "export class UsersController {\n  @Get(':id') findOne() {}\n}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/users.ts").unwrap();
+        let ctrl = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "UsersController")
+            .expect("expected 'UsersController' symbol");
+        assert!(
+            ctrl.entry_points
+                .iter()
+                .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == "Get")),
+            "expected HttpRoute(\"Get\") aggregated onto the class, got {:?}",
+            ctrl.entry_points
+        );
+    }
+
+    #[test]
+    fn ts_class_and_method_decorators_all_aggregate_onto_class() {
+        // @Controller('users') export class UsersController { @Get(':id') findOne()
+        // {} @Post() create() {} } → the class Symbol.entry_points contains all
+        // three: Controller, Get, Post. Exactly 2 symbols total (class + module),
+        // NOT 4 — no per-method Symbol is fabricated.
+        let src = "@Controller('users')\nexport class UsersController {\n  @Get(':id') findOne() {}\n  @Post() create() {}\n}\n";
+        let facts = TypeScriptExtractor.extract(src, "src/users.ts").unwrap();
+        assert_eq!(
+            facts.symbols.len(),
+            2,
+            "expected exactly 2 symbols (class + module), got {:?}",
+            facts.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        let ctrl = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "UsersController")
+            .expect("expected 'UsersController' symbol");
+        for expected in ["Controller", "Get", "Post"] {
+            assert!(
+                ctrl.entry_points
+                    .iter()
+                    .any(|ep| matches!(ep, EntryPoint::HttpRoute(m) if m == expected)),
+                "expected HttpRoute({expected:?}) in {:?}",
+                ctrl.entry_points
+            );
+        }
+    }
+
+    #[test]
+    fn ts_non_route_decorator_produces_no_marker() {
+        // @Injectable() on a class produces no HttpRoute marker.
+        let src = "@Injectable()\nexport class UsersService {}\n";
+        let facts = TypeScriptExtractor
+            .extract(src, "src/users.service.ts")
+            .unwrap();
+        let svc = facts
+            .symbols
+            .iter()
+            .find(|s| s.name == "UsersService")
+            .expect("expected 'UsersService' symbol");
+        assert!(
+            svc.entry_points.is_empty(),
+            "@Injectable() must not produce an HttpRoute marker; got {:?}",
+            svc.entry_points
         );
     }
 }

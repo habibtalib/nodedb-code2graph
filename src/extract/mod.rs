@@ -23,6 +23,8 @@ pub mod cpp;
 pub mod csharp;
 #[cfg(feature = "dart")]
 pub mod dart;
+#[cfg(feature = "fortran")]
+pub mod fortran;
 #[cfg(feature = "go")]
 pub mod go;
 #[cfg(feature = "hcl")]
@@ -80,6 +82,8 @@ pub use cpp::CppExtractor;
 pub use csharp::CSharpExtractor;
 #[cfg(feature = "dart")]
 pub use dart::DartExtractor;
+#[cfg(feature = "fortran")]
+pub use fortran::FortranExtractor;
 #[cfg(feature = "go")]
 pub use go::GoExtractor;
 #[cfg(feature = "hcl")]

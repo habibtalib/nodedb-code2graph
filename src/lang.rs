@@ -35,6 +35,7 @@ pub enum Language {
     Astro,         // .astro
     Zig,           // .zig
     SystemVerilog, // .sv, .svh
+    Fortran,       // .f90, .f
 }
 
 impl Language {
@@ -67,6 +68,7 @@ impl Language {
         Language::Astro,
         Language::Zig,
         Language::SystemVerilog,
+        Language::Fortran,
     ];
 
     /// This variant's file extensions (without the leading dot); the first entry
@@ -101,6 +103,7 @@ impl Language {
             Language::Astro => &["astro"],
             Language::Zig => &["zig"],
             Language::SystemVerilog => &["sv", "svh"],
+            Language::Fortran => &["f90", "f"],
         }
     }
 
@@ -134,6 +137,7 @@ impl Language {
             Language::Astro => "astro",
             Language::Zig => "zig",
             Language::SystemVerilog => "systemverilog",
+            Language::Fortran => "fortran",
         }
     }
 
@@ -201,7 +205,8 @@ mod tests {
             | Language::PowerShell
             | Language::Astro
             | Language::Zig
-            | Language::SystemVerilog => true,
+            | Language::SystemVerilog
+            | Language::Fortran => true,
         };
         listed && Language::ALL.contains(&l)
     }

@@ -17,6 +17,8 @@ use super::CSharpExtractor;
 use super::CppExtractor;
 #[cfg(feature = "dart")]
 use super::DartExtractor;
+#[cfg(feature = "fortran")]
+use super::FortranExtractor;
 #[cfg(feature = "go")]
 use super::GoExtractor;
 #[cfg(feature = "hcl")]
@@ -135,6 +137,8 @@ pub fn extract_file(lang: Language, source: &str, file: &str) -> Result<FileFact
         Language::Zig => ZigExtractor.extract(source, file),
         #[cfg(feature = "systemverilog")]
         Language::SystemVerilog => SystemVerilogExtractor.extract(source, file),
+        #[cfg(feature = "fortran")]
+        Language::Fortran => FortranExtractor.extract(source, file),
         _ => Err(CodegraphError::UnsupportedLanguage(format!(
             "{} (grammar feature disabled)",
             lang.as_str()

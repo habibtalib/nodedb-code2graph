@@ -1,0 +1,4 @@
+# Same-file call: `compute` calls `get_base`, both module procedures in math.f90.
+# Proves Fortran function-invocation (call_expression) detection resolves via
+# Tier-A same-file matching.
+math.f90:10 Call math.f90:3
